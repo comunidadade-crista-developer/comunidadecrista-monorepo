@@ -1,0 +1,29 @@
+{
+  "name": "@comunidade/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --max-warnings 0",
+    "test": "echo 'no tests yet' && exit 0",
+    "test:ci": "echo 'no tests yet' && exit 0"
+  },
+  "dependencies": {
+    "@comunidade/shared": "workspace:*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@comunidade/config": "workspace:*",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.16.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.3"
+  }
+}
