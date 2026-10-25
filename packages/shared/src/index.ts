@@ -1,4 +1,5 @@
 import { z } from 'zod';
+export * from './auth.js';
 
 export const APP_NAME = 'Comunidade Cristã' as const;
 export const APP_AUTHOR = 'Gekko Dreamers' as const;
