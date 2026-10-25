@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { sql } from 'drizzle-orm';
 import type { Pool } from 'pg';
 import { createDb, type Database } from '../../src/db/client.js';
@@ -9,7 +10,11 @@ let instance: Instance | null = null;
 export async function getTestDb(): Promise<Database> {
   if (!instance) {
     const url = process.env.DATABASE_URL;
-    if (!url) throw new Error('DATABASE_URL não definido para testes');
+    if (!url) {
+      throw new Error(
+        'DATABASE_URL não definido. Cria apps/api/.env (copia de .env.example) ou define a variável no ambiente.',
+      );
+    }
     await runMigrations(url);
     instance = createDb(url);
   }

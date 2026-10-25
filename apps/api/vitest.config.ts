@@ -4,11 +4,13 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    setupFiles: ['./test/setup.ts'],
     testTimeout: 15_000,
     hookTimeout: 15_000,
     pool: 'forks',
     poolOptions: {
       forks: { singleFork: true },
     },
+    fileParallelism: false,
   },
 });
