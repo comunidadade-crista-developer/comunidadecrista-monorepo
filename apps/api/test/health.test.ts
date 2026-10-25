@@ -8,8 +8,6 @@ const baseEnv: Env = loadEnv({
   NODE_ENV: 'test',
   LOG_LEVEL: 'fatal',
   APP_VERSION: 'test',
-  DATABASE_URL: process.env.DATABASE_URL,
-  REDIS_URL: process.env.REDIS_URL,
 });
 
 describe('GET /health', () => {
@@ -44,7 +42,7 @@ describe('GET /health', () => {
   });
 });
 
-describe('GET /health/deep', () => {
+describe('GET /health/deep — com serviços configurados', () => {
   let app: Awaited<ReturnType<typeof buildServer>>;
 
   beforeAll(async () => {

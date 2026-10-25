@@ -24,7 +24,6 @@ export async function buildServer({ env }: BuildServerOptions): Promise<FastifyI
           }
         : { level: env.LOG_LEVEL },
     trustProxy: true,
-    disableRequestLogging: env.NODE_ENV === 'test',
   }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);
