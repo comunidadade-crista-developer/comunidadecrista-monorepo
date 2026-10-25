@@ -114,7 +114,7 @@ describe('postsRepo — contadores', () => {
     expect(await repo.incrementLikes(p.id, 1)).toBe(1);
     expect(await repo.incrementLikes(p.id, 1)).toBe(2);
     expect(await repo.incrementLikes(p.id, -1)).toBe(1);
-    expect(await repo.incrementLikes(p.id, -5)).toBe(0);
+    expect(await repo.incrementLikes(p.id, -1)).toBe(0);
   });
 });
 

@@ -1,4 +1,4 @@
-import { and, eq, lt, or, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { idempotencyKeys, outbox } from '../db/schema.js';
 import type { IdempotencyKey, NewOutboxEvent, OutboxEvent } from '../db/schema.js';

@@ -75,8 +75,6 @@ describe('outboxRepo', () => {
     });
 });
 
-type claimedAfter = Awaited<ReturnType<ReturnType<typeof outboxRepo>['claimBatch']>>;
-
 describe('idempotencyKeysRepo', () => {
   it('set + get', async () => {
     const db = await getTestDb();

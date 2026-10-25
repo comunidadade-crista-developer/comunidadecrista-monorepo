@@ -4,7 +4,7 @@ import { requireAdmin, requireAuth } from '../../src/auth/middleware.js';
 import { loadEnv } from '../../src/env.js';
 import { closeTestDb, getTestDb, truncateAll } from '../helpers/db.js';
 import { makeUser, makeUserWithPassword } from '../helpers/factories.js';
-import Fastify from 'fastify';
+import Fastify, { type FastifyRequest } from 'fastify';
 
 const env = loadEnv({ NODE_ENV: 'test', LOG_LEVEL: 'fatal', APP_VERSION: 'test' });
 
@@ -17,9 +17,9 @@ describe('middleware requireAuth + requireAdmin', () => {
     jwt = await createJwtService(env);
     const db = await getTestDb();
     app = Fastify();
-    app.get('/protected', { preHandler: requireAuth(jwt) }, async (req) => ({
-      userId: req.user!.id,
-    }));
+    app.get('/protected', { preHandler: requireAuth(jwt) }, async (req: FastifyRequest) => ({
+       userId: req.user!.id,
+     }));
     app.get('/admin', { preHandler: [requireAuth(jwt), requireAdmin(db)] }, async () => ({
       ok: true,
     }));

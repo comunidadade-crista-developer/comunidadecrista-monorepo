@@ -1,17 +1,18 @@
 import {
+  ErrorResponse,
   LoginRequest,
-  LoginResponse,
   LogoutRequest,
   MeResponse,
   RecoverResetRequest,
-  RecoverResetResponse,
   RecoverVerifyRequest,
-  RecoverVerifyResponse,
-  RefreshRequest,
-  RefreshResponse,
   RegisterRequest,
+} from '@comunidade/shared';
+import type {
+  LoginResponse,
+  RecoverResetResponse,
+  RecoverVerifyResponse,
+  RefreshResponse,
   RegisterResponse,
-  type ErrorResponse,
 } from '@comunidade/shared';
 import type { FastifyInstance } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -52,10 +53,10 @@ export async function authRoutes(
 
   const refreshTtlMs = env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 
-  f.post<{ Body: typeof RegisterRequest }>(
-    '/auth/register',
+  f.post(
+   '/auth/register',
     { schema: { body: RegisterRequest } },
-    async (request, reply) => {
+    async (request, reply) => { 
       const rl = await limiters.checkRegister(request.ip);
       if (!rl.allowed) {
         return reply
@@ -117,7 +118,7 @@ export async function authRoutes(
     },
   );
 
-  f.post<{ Body: typeof LoginRequest }>(
+  f.post(
     '/auth/login',
     { schema: { body: LoginRequest } },
     async (request, reply) => {
@@ -163,9 +164,9 @@ export async function authRoutes(
     },
   );
 
-  f.post<{ Body: typeof RefreshRequest }>(
-    '/auth/refresh',
-    { schema: { body: RefreshRequest } },
+  f.post(
+    '/auth/logout',
+    { schema: { body: LogoutRequest } },
     async (request, reply) => {
       const oldHash = hashRefreshToken(request.body.refreshToken);
       const newToken = generateRefreshToken();
@@ -205,7 +206,7 @@ export async function authRoutes(
     },
   );
 
-  f.post<{ Body: typeof LogoutRequest }>(
+  f.post(
     '/auth/logout',
     { schema: { body: LogoutRequest } },
     async (request, reply) => {
@@ -220,7 +221,7 @@ export async function authRoutes(
 
   f.get(
     '/auth/me',
-    { preHandler: authPre, schema: { response: { 200: MeResponse } } },
+    { preHandler: authPre, schema: { response: { 200: MeResponse, 401: ErrorResponse } } },
     async (request, reply) => {
       const user = await users.findById(request.user!.id);
       if (!user) return reply.code(401).send({ error: 'invalid_token' });
@@ -236,7 +237,7 @@ export async function authRoutes(
     },
   );
 
-  f.post<{ Body: typeof RecoverVerifyRequest }>(
+  f.post(
     '/auth/recover/verify',
     { schema: { body: RecoverVerifyRequest } },
     async (request, reply) => {
@@ -286,7 +287,7 @@ export async function authRoutes(
     },
   );
 
-  f.post<{ Body: typeof RecoverResetRequest }>(
+  f.post(
     '/auth/recover/reset',
     { schema: { body: RecoverResetRequest } },
     async (request, reply) => {
@@ -317,5 +318,3 @@ export async function authRoutes(
     },
   );
 }
-
-export type { ErrorResponse };
