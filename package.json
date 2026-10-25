@@ -19,7 +19,8 @@
     "format:check": "prettier --check .",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f"
+    "docker:logs": "docker compose logs -f",
+    "db:setup": "pnpm --filter @comunidade/api db:migrate && pnpm --filter @comunidade/api db:seed"
   },
   "devDependencies": {
     "prettier": "^3.4.0",
