@@ -1,0 +1,11 @@
+[
+  {
+    "slug": "o-nascimento-de-jesus",
+    "title": "O Nascimento de Jesus",
+    "gospelReference": "Mateus 2",
+    "summary": "O nascimento de Jesus em Belém, cumprindo as profecias do Antigo Testamento sobre o Messias prometido.",
+    "otReferences": ["Isaías 7:14", "Isaías 9:6-7", "Miquéias 5:2"],
+    "ntReferences": ["Mateus 1:18-25", "Mateus 2:1-12", "Lucas 2:1-20"],
+    "orderIndex": 1
+  }
+]
