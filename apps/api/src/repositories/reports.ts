@@ -1,7 +1,7 @@
-import { and, desc, eq } from 'drizzle-orm';
-import type { Database } from '../db/client.js';
-import { moderationLog, reports } from '../db/schema.js';
-import type { ModerationLogEntry, NewReport, Report } from '../db/schema.js';
+import { and, desc, eq } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { moderationLog, reports } from "../db/schema.js";
+import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
 
 export function reportsRepo(db: Database) {
   return {
@@ -25,7 +25,7 @@ export function reportsRepo(db: Database) {
           and(
             eq(reports.postId, postId),
             eq(reports.reporterId, reporterId),
-            eq(reports.status, 'open'),
+            eq(reports.status, "open"),
           ),
         )
         .limit(1);
@@ -36,7 +36,7 @@ export function reportsRepo(db: Database) {
       const rows = await db
         .select({ id: reports.id })
         .from(reports)
-        .where(and(eq(reports.postId, postId), eq(reports.status, 'open')));
+        .where(and(eq(reports.postId, postId), eq(reports.status, "open")));
       return rows.length;
     },
 
@@ -58,20 +58,22 @@ export function reportsRepo(db: Database) {
 
     async resolveAllForPost(
       postId: string,
-      status: 'resolved_kept' | 'resolved_removed',
+      status: "resolved_kept" | "resolved_removed",
       resolvedBy: string,
     ): Promise<void> {
       await db
         .update(reports)
         .set({ status, resolvedAt: new Date(), resolvedBy })
-        .where(and(eq(reports.postId, postId), eq(reports.status, 'open')));
+        .where(and(eq(reports.postId, postId), eq(reports.status, "open")));
     },
   };
 }
 
 export function moderationLogRepo(db: Database) {
   return {
-    async create(data: typeof moderationLog.$inferInsert): Promise<ModerationLogEntry> {
+    async create(
+      data: typeof moderationLog.$inferInsert,
+    ): Promise<ModerationLogEntry> {
       const [row] = await db.insert(moderationLog).values(data).returning();
       return row!;
     },

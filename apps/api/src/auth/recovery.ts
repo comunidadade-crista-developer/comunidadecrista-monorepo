@@ -1,12 +1,12 @@
-import { randomBytes } from 'node:crypto';
-import type { PasswordService } from './password.js';
+import { randomBytes } from "node:crypto";
+import type { PasswordService } from "./password.js";
 
-const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 function base32Encode(bytes: Buffer): string {
   let bits = 0;
   let value = 0;
-  let out = '';
+  let out = "";
   for (const byte of bytes) {
     value = (value << 8) | byte;
     bits += 8;
@@ -27,12 +27,12 @@ export interface GeneratedRecoveryCode {
 export function generateRecoveryCode(): GeneratedRecoveryCode {
   const bytes = randomBytes(10); // 80 bits
   const canonical = base32Encode(bytes);
-  const formatted = canonical.match(/.{1,4}/g)!.join('-');
+  const formatted = canonical.match(/.{1,4}/g)!.join("-");
   return { formatted, canonical };
 }
 
 export function normalizeRecoveryCode(code: string): string {
-  return code.replace(/[\s-]/g, '').toUpperCase();
+  return code.replace(/[\s-]/g, "").toUpperCase();
 }
 
 export interface RecoveryService {
@@ -41,14 +41,19 @@ export interface RecoveryService {
   verifyCode(storedHash: string, code: string): Promise<boolean>;
 }
 
-export function createRecoveryService(passwordService: PasswordService): RecoveryService {
+export function createRecoveryService(
+  passwordService: PasswordService,
+): RecoveryService {
   return {
     generate: generateRecoveryCode,
     async hashCode(code) {
       return passwordService.hashAnswer(normalizeRecoveryCode(code));
     },
     async verifyCode(storedHash, code) {
-      return passwordService.verifyAnswer(storedHash, normalizeRecoveryCode(code));
+      return passwordService.verifyAnswer(
+        storedHash,
+        normalizeRecoveryCode(code),
+      );
     },
   };
 }

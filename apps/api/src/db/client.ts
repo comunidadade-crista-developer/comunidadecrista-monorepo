@@ -1,6 +1,6 @@
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { Pool } from 'pg';
-import * as schema from './schema.js';
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import * as schema from "./schema.js";
 
 export function createDb(connectionString: string) {
   const pool = new Pool({
@@ -13,4 +13,4 @@ export function createDb(connectionString: string) {
   return { db, pool };
 }
 
-export type Database = ReturnType<typeof createDb>['db'];
+export type Database = ReturnType<typeof createDb>["db"];

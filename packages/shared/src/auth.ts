@@ -1,23 +1,26 @@
-import { z } from 'zod';
+import { z } from "zod";
 
 export const Username = z
   .string()
-  .min(3, 'nome de utilizador tem de ter pelo menos 3 caracteres')
-  .max(30, 'nome de utilizador tem no máximo 30 caracteres')
-  .regex(/^[a-zA-Z0-9._-]+$/, 'apenas letras, números, ponto, underscore e hífen');
+  .min(3, "nome de utilizador tem de ter pelo menos 3 caracteres")
+  .max(30, "nome de utilizador tem no máximo 30 caracteres")
+  .regex(
+    /^[a-zA-Z0-9._-]+$/,
+    "apenas letras, números, ponto, underscore e hífen",
+  );
 
 export const Password = z
   .string()
-  .min(6, 'palavra-passe tem de ter pelo menos 6 caracteres')
-  .max(20, 'palavra-passe tem no máximo 20 caracteres');
+  .min(6, "palavra-passe tem de ter pelo menos 6 caracteres")
+  .max(20, "palavra-passe tem no máximo 20 caracteres");
 
 export const SecurityAnswer = z.string().min(1).max(100);
-export const NumberAnswer = z.string().regex(/^\d{1,3}$/, 'número de 0 a 999');
+export const NumberAnswer = z.string().regex(/^\d{1,3}$/, "número de 0 a 999");
 
 export const UserPublic = z.object({
   id: z.string().uuid(),
   username: z.string(),
-  role: z.enum(['user', 'admin']),
+  role: z.enum(["user", "admin"]),
 });
 
 export const RegisterRequest = z
@@ -30,8 +33,8 @@ export const RegisterRequest = z
     securityQ3: SecurityAnswer,
   })
   .refine((d) => d.password === d.passwordConfirmation, {
-    message: 'as palavras-passe não coincidem',
-    path: ['passwordConfirmation'],
+    message: "as palavras-passe não coincidem",
+    path: ["passwordConfirmation"],
   });
 export type RegisterRequest = z.infer<typeof RegisterRequest>;
 
@@ -54,6 +57,11 @@ export const LoginResponse = z.object({
   user: UserPublic,
   accessToken: z.string(),
   refreshToken: z.string(),
+  // Alguém pediu recuperação por perguntas e o pedido foi cancelado por este login.
+  pendingRecoveryCancelled: z.boolean().optional(),
+  // Só no 1.º login depois de uma recuperação por perguntas ter produzido efeito.
+  recoveryCode: z.string().optional(),
+  recoveryCodeWarning: z.string().optional(),
 });
 export type LoginResponse = z.infer<typeof LoginResponse>;
 
@@ -73,14 +81,14 @@ export const MeResponse = z.object({
 });
 export type MeResponse = z.infer<typeof MeResponse>;
 
-export const RecoverVerifyRequest = z.discriminatedUnion('mode', [
+export const RecoverVerifyRequest = z.discriminatedUnion("mode", [
   z.object({
-    mode: z.literal('code'),
+    mode: z.literal("code"),
     username: Username,
     code: z.string().min(1).max(30),
   }),
   z.object({
-    mode: z.literal('questions'),
+    mode: z.literal("questions"),
     username: Username,
     answer1: SecurityAnswer,
     answer2: NumberAnswer,
@@ -102,14 +110,18 @@ export const RecoverResetRequest = z
     newPasswordConfirmation: Password,
   })
   .refine((d) => d.newPassword === d.newPasswordConfirmation, {
-    message: 'as palavras-passe não coincidem',
-    path: ['newPasswordConfirmation'],
+    message: "as palavras-passe não coincidem",
+    path: ["newPasswordConfirmation"],
   });
 export type RecoverResetRequest = z.infer<typeof RecoverResetRequest>;
 
 export const RecoverResetResponse = z.object({
-  recoveryCode: z.string(),
-  recoveryCodeWarning: z.string(),
+  // 'completed': palavra-passe mudada já (via código). 'pending': só produz efeito em effectiveAt
+  // (via perguntas) e não é emitido código novo.
+  status: z.enum(["completed", "pending"]),
+  recoveryCode: z.string().optional(),
+  recoveryCodeWarning: z.string().optional(),
+  effectiveAt: z.string().datetime().optional(),
 });
 export type RecoverResetResponse = z.infer<typeof RecoverResetResponse>;
 
