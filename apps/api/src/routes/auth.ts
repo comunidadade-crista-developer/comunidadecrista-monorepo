@@ -59,7 +59,7 @@ export async function authRoutes(
    '/auth/register',
     { schema: { body: RegisterRequest } },
     async (request, reply) => { 
-      const rl = await limiters.checkRegister(request.ip);
+      const rl = await limiters.checkRegister(request.clientIp);
       if (!rl.allowed) {
         return reply
           .code(429)
@@ -129,7 +129,7 @@ export async function authRoutes(
     { schema: { body: LoginRequest } },
     async (request, reply) => {
       const body = request.body;
-      const rl = await limiters.checkLogin(request.ip, body.username);
+      const rl = await limiters.checkLogin(request.clientIp, body.username);
       if (!rl.allowed) {
         return reply
           .code(429)
@@ -187,7 +187,7 @@ export async function authRoutes(
       }
       if (result.status === 'reuse_detected') {
         request.log.warn(
-          { familyId: result.familyId, ip: request.ip },
+          { familyId: result.familyId },
           'refresh token reuse detected — family revoked',
         );
         return reply.code(401).send({ error: 'token_reuse' });
@@ -244,7 +244,7 @@ export async function authRoutes(
     { schema: { body: RecoverVerifyRequest } },
     async (request, reply) => {
       const body = request.body;
-      const rl = await limiters.checkRecover(request.ip, body.username);
+      const rl = await limiters.checkRecover(request.clientIp, body.username);
       if (!rl.allowed) {
         return reply
           .code(429)
