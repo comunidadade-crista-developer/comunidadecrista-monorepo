@@ -47,9 +47,6 @@ export function createRateLimiters(
   env: Env,
   log?: RateLimitLogger,
 ): RateLimiters {
-  // IP e username nunca vão em claro para o Redis (Upstash): só um HMAC truncado, que
-  // permite contar tentativas mas não recuperar o IP. Sem IP_HASH_SECRET (só dev/test) o
-  // segredo é efémero por processo.
   const secret = env.IP_HASH_SECRET ?? randomBytes(32).toString("hex");
   const anon = (...parts: string[]): string =>
     createHmac("sha256", secret)

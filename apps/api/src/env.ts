@@ -7,7 +7,6 @@ const booleanFromEnv = z
   .optional()
   .transform((v) => v === true || v === "true");
 
-// Segredos opcionais: string vazia (ex.: "CF_ORIGIN_SECRET=" no .env) conta como ausente.
 const optionalSecret = z.preprocess(
   (v) => (v === "" ? undefined : v),
   z.string().min(32, "tem de ter pelo menos 32 caracteres").optional(),
@@ -127,6 +126,30 @@ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
       code: z.ZodIssueCode.custom,
       path: ["IP_HASH_SECRET"],
       message: "obrigatório em produção",
+    });
+  }
+});
+
+const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
+  if (env.EDGE_MODE === 'cloudflare' && !env.CF_ORIGIN_SECRET) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CF_ORIGIN_SECRET'],
+      message: 'obrigatório quando EDGE_MODE=cloudflare',
+    });
+  }
+  if (env.EDGE_MODE === 'cloudflare' && env.TRUST_PROXY) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['TRUST_PROXY'],
+      message: 'não combinar TRUST_PROXY com EDGE_MODE=cloudflare',
+    });
+  }
+  if (env.NODE_ENV === 'production' && !env.IP_HASH_SECRET) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['IP_HASH_SECRET'],
+      message: 'obrigatório em produção',
     });
   }
 });

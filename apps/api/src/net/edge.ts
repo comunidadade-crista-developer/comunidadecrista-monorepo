@@ -3,14 +3,8 @@ import { isIP } from "node:net";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Env } from "../env.js";
 
-/**
- * Cabeçalho injectado pela Cloudflare (Transform Rule) com um segredo partilhado.
- * É a única prova de que o pedido passou pela nossa Cloudflare: o Render não permite
- * mTLS na origem, e a URL *.onrender.com continua acessível directamente.
- */
 export const ORIGIN_AUTH_HEADER = "x-origin-auth";
 
-/** Caminhos que o Render/monitorização chamam sem passar pela Cloudflare. Só o /health leve. */
 const EDGE_EXEMPT_PATHS = new Set(["/health"]);
 
 declare module "fastify" {

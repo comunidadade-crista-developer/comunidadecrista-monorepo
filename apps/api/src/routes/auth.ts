@@ -146,10 +146,6 @@ export async function authRoutes(
         body.password,
       );
 
-      // Pedido de recuperação por perguntas pendente: a nova palavra-passe também é aceite,
-      // mas só depois do prazo. Numa falha corre-se sempre uma 2.ª verificação (contra o hash
-      // pendente ou a sentinela), para o tempo de resposta não revelar se há pedido pendente
-      // nem se o utilizador existe.
       const pending = user ? await resets.getPending(user.id) : null;
       const pendingOk = currentOk
         ? false

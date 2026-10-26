@@ -10,11 +10,6 @@ export function createRedis(url: string | undefined): Redis | null {
   });
 }
 
-/**
- * Com enableOfflineQueue=false, qualquer comando enviado antes da ligação estar pronta falha
- * de imediato — e o rate limit falha em aberto. Esperar aqui evita essa janela no arranque
- * (cold start do Render). Devolve false se não ligar a tempo; o servidor arranca na mesma.
- */
 export function waitUntilReady(
   redis: Redis,
   timeoutMs = 3000,

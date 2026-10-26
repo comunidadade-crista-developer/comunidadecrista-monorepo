@@ -57,9 +57,6 @@ function pathOnly(url: string | undefined): string | undefined {
 }
 
 export async function buildServer({ env, logStream }: BuildServerOptions) {
-  // Proxy genérico (sem Cloudflare). Função em vez de número: a forma numérica foi
-  // desactivada no Fastify >= 5.12.1 (CVE-2026-16732). Com EDGE_MODE=cloudflare o IP vem
-  // de CF-Connecting-IP (ver net/edge.ts) e o trustProxy fica desligado.
   const trustProxy =
     env.EDGE_MODE === "none" && env.TRUST_PROXY
       ? (_addr: string, hop: number) => hop < env.TRUST_PROXY_HOPS
