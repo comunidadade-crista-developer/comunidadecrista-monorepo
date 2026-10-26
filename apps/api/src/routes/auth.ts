@@ -1,19 +1,21 @@
-import {
-  ErrorResponse,
-  LoginRequest,
-  LogoutRequest,
-  MeResponse,
-  RecoverResetRequest,
-  RecoverVerifyRequest,
-  RegisterRequest,
-} from '@comunidade/shared';
-import type {
-  LoginResponse,
-  RecoverResetResponse,
-  RecoverVerifyResponse,
-  RefreshResponse,
-  RegisterResponse,
-} from '@comunidade/shared';
+ import {
+   ErrorResponse,
+   LoginRequest,
+   LogoutRequest,
+   MeResponse,
+   RefreshRequest,
+   RecoverResetRequest,
+   RecoverVerifyRequest,
+   RegisterRequest,
+ } from '@comunidade/shared';
+ import type {
+   LoginResponse,
+   RecoverResetResponse,
+   RecoverVerifyResponse,
+   RefreshResponse,
+   RegisterResponse,
+ } from '@comunidade/shared';
+import { isUniqueViolation } from '../errors.js';
 import type { FastifyInstance } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { uuidv7 } from 'uuidv7';
@@ -92,9 +94,13 @@ export async function authRoutes(
           securityQ3Hash: q3,
           avatarSeed: `seed-${uuidv7()}`,
         });
-      } catch {
-        return reply.code(409).send({ error: 'username_taken' });
-      }
+       } catch (err) {
+        if (isUniqueViolation(err)) {
+          return reply.code(409).send({ error: 'username_taken' });
+        }
+        request.log.error({ err }, 'register: unexpected insert error');
+        throw err;
+       }
 
       const familyId = uuidv7();
       const refreshToken = generateRefreshToken();
@@ -132,16 +138,12 @@ export async function authRoutes(
       }
 
       const user = await users.findByUsername(body.username);
-      // Verifica hash mesmo se user não existe para uniformizar timing
-      const fallbackHash =
-        '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$0000000000000000000000000000000000000000000';
-      const passwordOk = user
-        ? await password.verifyPassword(user.passwordHash, body.password)
-        : await password.verifyPassword(fallbackHash, body.password).catch(() => false);
+      const hashToCheck = user?.passwordHash ?? (await password.getSentinelHash());
+      const passwordOk = await password.verifyPassword(hashToCheck, body.password);
 
-      if (!user || !passwordOk) {
-        return reply.code(401).send({ error: 'invalid_credentials' });
-      }
+       if (!user || !passwordOk) {
+         return reply.code(401).send({ error: 'invalid_credentials' });
+       }
 
       const familyId = uuidv7();
       const refreshToken = generateRefreshToken();
@@ -165,8 +167,8 @@ export async function authRoutes(
   );
 
   f.post(
-    '/auth/logout',
-    { schema: { body: LogoutRequest } },
+    '/auth/refresh',
+    { schema: { body: RefreshRequest } },
     async (request, reply) => {
       const oldHash = hashRefreshToken(request.body.refreshToken);
       const newToken = generateRefreshToken();
@@ -250,10 +252,7 @@ export async function authRoutes(
           .send({ error: 'rate_limited' });
       }
 
-      const user = await users.findByUsername(body.username);
-      // Tempo uniforme: mesmo que o user não exista, validamos algo
-      const dummyHash =
-        '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$0000000000000000000000000000000000000000000';
+    const user = await users.findByUsername(body.username);
 
       let ok = false;
       if (user) {
@@ -270,13 +269,15 @@ export async function authRoutes(
           ok = a && b && c;
         }
       } else {
-        // Consistência de tempo
-        await password.verifyPassword(dummyHash, 'noop').catch(() => {});
+        const hashToCheck = await password.getSentinelHash();
+        const dummyInput =
+          body.mode === 'code' ? body.code : body.answer1;
+        await password.verifyPassword(hashToCheck, dummyInput);
       }
 
       if (!ok || !user) {
-        return reply.code(401).send({ error: 'invalid_recovery' });
-      }
+         return reply.code(401).send({ error: 'invalid_recovery' });
+       }
 
       const recoverySession = await jwt.signRecoverySession(user.id);
       const response: RecoverVerifyResponse = {

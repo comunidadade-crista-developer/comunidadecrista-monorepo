@@ -39,3 +39,12 @@ Documentar aqui quando implementado.
 - **API fora**: verificar dashboard Render; ver logs; confirmar Neon e Upstash operacionais.
 - **Cold start prolongado**: verificar cron-job.org; confirmar que `/health` responde em < 1s quando acordado.
 - **Rate limit a disparar em produção**: confirmar Upstash `@upstash/ratelimit` (E2).
+
+## Trust proxy
+
+Em produção no Render, `TRUST_PROXY=true` **é obrigatório** — sem isto, `request.ip`
+é sempre `127.0.0.1` e o rate limit por IP torna-se num rate limit global,
+bloqueando todos os utilizadores após 5 logins falhados.
+
+O servidor detecta automaticamente `RENDER=true` e liga trust proxy = 1 hop.
+Fora do Render (Fly, VPS, etc.), definir `TRUST_PROXY=true` explicitamente.

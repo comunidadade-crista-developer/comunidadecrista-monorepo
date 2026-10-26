@@ -9,7 +9,7 @@ const EnvSchema = z.object({
   APP_VERSION: z.string().default('dev'),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
   TRUST_PROXY: z
-    .string()
+    .union([z.string(), z.boolean()])
     .optional()
     .transform((v) => v === 'true'),
 

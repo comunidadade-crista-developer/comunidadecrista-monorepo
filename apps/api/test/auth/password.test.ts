@@ -33,4 +33,21 @@ describe('password service', () => {
     expect(await svc.verifyAnswer(h, 'AZUL')).toBe(true);
     expect(await svc.verifyAnswer(h, 'verde')).toBe(false);
   });
+
+  it('getSentinelHash devolve hash argon2id válido', async () => {
+    const h = await svc.getSentinelHash();
+    expect(h).toMatch(/^\$argon2id\$/);
+  });
+
+  it('getSentinelHash é estável (memoizado)', async () => {
+    const a = await svc.getSentinelHash();
+    const b = await svc.getSentinelHash();
+    expect(a).toBe(b);
+  });
+
+  it('verifyPassword contra a sentinela rejeita qualquer input', async () => {
+    const h = await svc.getSentinelHash();
+    expect(await svc.verifyPassword(h, 'qualquer')).toBe(false);
+    expect(await svc.verifyPassword(h, 'outra')).toBe(false);
+  });
 });
