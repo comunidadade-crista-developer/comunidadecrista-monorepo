@@ -18,7 +18,8 @@ import { createRateLimiters } from './auth/rate-limit.js';
 import { createRecoveryService } from './auth/recovery.js';
 import { createDb } from './db/client.js';
 import type { Env } from './env.js';
-import { createRedis } from './redis.js';
+import { createEdgeGuard } from './net/edge.js';
+import { createRedis, waitUntilReady } from './redis.js';
 import { authRoutes } from './routes/auth.js';
 import { healthRoutes } from './routes/health.js';
 
@@ -32,40 +33,90 @@ export type AppInstance = FastifyInstance<
 
 export interface BuildServerOptions {
   env: Env;
+  /** Destino alternativo dos logs (testes). */
+  logStream?: NodeJS.WritableStream;
 }
 
-export async function buildServer({ env }: BuildServerOptions) {
-  const isOnRender = process.env.RENDER === 'true';
- const trustProxyValue: boolean | ((addr: string, hop: number) => boolean) =
-  env.TRUST_PROXY || isOnRender
-    ? (addr: string, hop: number) => {
-        const trusted = hop < 1;
-        console.log('[trustProxy]', { addr, hop, trusted });
-        return trusted;
-      }
-    : false;
+// Privacidade: os logs nunca levam IP, cabeçalhos nem query string. O Fastify, por omissão,
+// regista remoteAddress/remotePort em cada pedido — aqui o serializer `req` substitui-o.
+const LOG_REDACT_PATHS = [
+  'req.headers.authorization',
+  'req.headers.cookie',
+  'req.headers["x-origin-auth"]',
+  'req.headers["x-forwarded-for"]',
+  'req.headers["cf-connecting-ip"]',
+  'req.headers["true-client-ip"]',
+  'req.remoteAddress',
+  'req.remotePort',
+];
 
-   const app = Fastify({
-     logger:
-       env.NODE_ENV === 'development'
-         ? {
-             level: env.LOG_LEVEL,
-             transport: { target: 'pino-pretty', options: { translateTime: 'SYS:standard' } },
-           }
-         : { level: env.LOG_LEVEL },
-    trustProxy: trustProxyValue,
-   }).withTypeProvider<ZodTypeProvider>();
+function pathOnly(url: string | undefined): string | undefined {
+  if (!url) return url;
+  const i = url.indexOf('?');
+  return i === -1 ? url : url.slice(0, i);
+}
+
+export async function buildServer({ env, logStream }: BuildServerOptions) {
+  // Proxy genérico (sem Cloudflare). Função em vez de número: a forma numérica foi
+  // desactivada no Fastify >= 5.12.1 (CVE-2026-16732). Com EDGE_MODE=cloudflare o IP vem
+  // de CF-Connecting-IP (ver net/edge.ts) e o trustProxy fica desligado.
+  const trustProxy =
+    env.EDGE_MODE === 'none' && env.TRUST_PROXY
+      ? (_addr: string, hop: number) => hop < env.TRUST_PROXY_HOPS
+      : false;
+
+  const app = Fastify({
+    logger: {
+      level: env.LOG_LEVEL,
+      redact: { paths: LOG_REDACT_PATHS, remove: true },
+      serializers: {
+        req: (req: { method?: string; url?: string }) => ({
+          method: req.method,
+          url: pathOnly(req.url),
+        }),
+        res: (res: { statusCode?: number }) => ({ statusCode: res.statusCode }),
+      },
+      ...(logStream
+        ? { stream: logStream }
+        : env.NODE_ENV === 'development'
+          ? {
+              transport: {
+                target: 'pino-pretty',
+                options: { translateTime: 'SYS:standard' },
+              },
+            }
+          : {}),
+    },
+    trustProxy,
+  }).withTypeProvider<ZodTypeProvider>();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
+
+  // Tem de correr antes do rate limit global, que usa request.clientIp.
+  app.decorateRequest('clientIp', '');
+  app.addHook('onRequest', createEdgeGuard(env).onRequest);
+
+  // Respostas da API nunca devem ser guardadas em cache (Cloudflare, browsers, proxies).
+  app.addHook('onSend', async (_request, reply, payload) => {
+    reply.header('Cache-Control', 'no-store');
+    return payload;
+  });
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
     origin: env.CORS_ORIGIN.split(',').map((s) => s.trim()),
     credentials: true,
   });
-  await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: '1 minute',
+    keyGenerator: (request) => request.clientIp,
+  });
 
   const redis = createRedis(env.REDIS_URL);
+  if (redis && !(await waitUntilReady(redis))) {
+    app.log.warn('Redis indisponível no arranque — rate limit pode falhar em aberto.');
+  }
   if (redis) {
     app.addHook('onClose', async () => {
       await redis.quit().catch(() => {});

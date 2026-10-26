@@ -13,7 +13,7 @@
 2. Runtime: Node 24.
 3. Build command: `pnpm install --frozen-lockfile && pnpm --filter @comunidade/api build`
 4. Start command: `node apps/api/dist/index.js`
-5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`.
+5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
 6. Plano: Free.
 
 ### Frontend (Cloudflare Pages)
@@ -40,11 +40,74 @@ Documentar aqui quando implementado.
 - **Cold start prolongado**: verificar cron-job.org; confirmar que `/health` responde em < 1s quando acordado.
 - **Rate limit a disparar em produção**: confirmar Upstash `@upstash/ratelimit` (E2).
 
-## Trust proxy
+## IP do cliente, proxy e Cloudflare
 
-Em produção no Render, `TRUST_PROXY=true` **é obrigatório** — sem isto, `request.ip`
-é sempre `127.0.0.1` e o rate limit por IP torna-se num rate limit global,
-bloqueando todos os utilizadores após 5 logins falhados.
+A API **nunca** guarda nem regista IPs. O IP só existe em memória, durante o pedido, para o
+rate limit; nas chaves do Redis entra apenas um HMAC truncado (`IP_HASH_SECRET`).
 
-O servidor detecta automaticamente `RENDER=true` e liga trust proxy = 1 hop.
-Fora do Render (Fly, VPS, etc.), definir `TRUST_PROXY=true` explicitamente.
+O IP do cliente é resolvido em `request.clientIp` (`src/net/edge.ts`). Usar sempre este campo,
+nunca `request.ip` nem `X-Forwarded-For`.
+
+### Modos
+
+| Cenário | Configuração |
+|---|---|
+| Dev local | `EDGE_MODE=none`, `TRUST_PROXY=false` → `clientIp` = IP da ligação |
+| Produção com Cloudflare à frente (recomendado) | `EDGE_MODE=cloudflare`, `CF_ORIGIN_SECRET`, `IP_HASH_SECRET`; `TRUST_PROXY` desligado |
+| Outro proxy (VPS, Fly) sem Cloudflare | `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=<n>` |
+
+A cadeia de proxies do Render não está documentada (o número de saltos pode mudar), por isso a
+detecção automática de `RENDER=true` foi removida. Com Cloudflare, o IP vem de
+`CF-Connecting-IP`, aceite **só** se o pedido trouxer o segredo `X-Origin-Auth`.
+
+### Preparar a Cloudflare (por ordem)
+
+1. **DNS**: adicionar o domínio à Cloudflare (nameservers). Remover registos `AAAA` do host da API
+   (o Render não suporta IPv6).
+2. **Render → Custom Domains**: adicionar `api.<dominio>`. Na Cloudflare, criar `CNAME api →
+   <servico>.onrender.com` com **DNS only** (nuvem cinzenta) e esperar o certificado ficar
+   *Verified/Issued* no Render.
+3. **SSL/TLS → Overview**: modo **Full (strict)**. O guia do Render indica *Full*; (strict)
+   deve funcionar porque o certificado do Render é público — se falhar, voltar a *Full*.
+4. Passar o CNAME a **Proxied** (nuvem laranja).
+5. **Segredo de origem**: gerar com `openssl rand -base64 48`. Cloudflare → *Rules → Transform
+   Rules → Modify Request Header* → regra para `hostname equals api.<dominio>`:
+   *Set static* `X-Origin-Auth` = o segredo.
+6. **Render → Environment**: `EDGE_MODE=cloudflare`, `CF_ORIGIN_SECRET=<segredo>`,
+   `IP_HASH_SECRET=<outro segredo, openssl rand -base64 48>`, `CORS_ORIGIN=<dominio do frontend>`.
+7. **Verificar** (ver abaixo) antes de apontar o frontend para a API.
+8. **cron-job.org**: passar a chamar `https://api.<dominio>/health` (via Cloudflare).
+   `/health` responde também sem segredo, para o health check do Render.
+9. **Definições recomendadas na Cloudflare**:
+   - SSL/TLS → Edge Certificates: *Always Use HTTPS*, TLS mínimo 1.2.
+   - Rules → Cache Rules: *Bypass cache* para `api.<dominio>` (a API também envia `no-store`).
+   - Security → WAF → Rate limiting: 1 regra (plano gratuito) para `/auth/*`, como camada
+     extra antes de chegar ao Render.
+   - Security → Bots → *Bot Fight Mode* ligado.
+   - Desligar *Web Analytics* / *Browser Insights* (privacidade).
+
+### Verificação
+
+```bash
+# 1) Directo ao Render (sem passar pela Cloudflare): tudo 403 excepto /health
+curl -i https://<servico>.onrender.com/auth/me      # esperado: 403 {"error":"forbidden"}
+curl -i https://<servico>.onrender.com/health       # esperado: 200
+
+# 2) Via Cloudflare: passa
+curl -i https://api.<dominio>/health                # esperado: 200
+curl -i https://api.<dominio>/auth/me               # esperado: 401 (sem token), não 403
+```
+
+Se o passo 2 der 403, a Transform Rule não está a injectar `X-Origin-Auth`.
+
+### Rotação do segredo de origem (sem downtime)
+
+1. Render: `CF_ORIGIN_SECRET_PREVIOUS=<segredo actual>` e `CF_ORIGIN_SECRET=<novo>`; redeploy.
+2. Cloudflare: actualizar o valor da Transform Rule para o novo segredo.
+3. Confirmar que o tráfego normal funciona; depois remover `CF_ORIGIN_SECRET_PREVIOUS`.
+
+### Privacidade — o que a Cloudflare e o Render vêem
+
+Cloudflare e Render processam IPs nos seus próprios sistemas, fora do nosso controlo. A
+política de privacidade deve dizê-lo; "não guardamos IP" refere-se à nossa base de dados,
+aos nossos logs e ao nosso Redis.
