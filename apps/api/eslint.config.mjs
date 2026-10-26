@@ -1,3 +1,3 @@
-import base from '@comunidade/config/eslint';
+import base from "@comunidade/config/eslint";
 
 export default base;

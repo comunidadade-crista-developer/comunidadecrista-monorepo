@@ -1,13 +1,18 @@
-import { and, eq, isNull } from 'drizzle-orm';
-import type { Database } from '../db/client.js';
-import { refreshTokens, users } from '../db/schema.js';
-import type { NewRefreshToken, NewUser, RefreshToken, User } from '../db/schema.js';
+import { and, eq, isNull } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { refreshTokens, users } from "../db/schema.js";
+import type {
+  NewRefreshToken,
+  NewUser,
+  RefreshToken,
+  User,
+} from "../db/schema.js";
 
 export type RotateResult =
-  | { status: 'ok'; newTokenId: string; userId: string; familyId: string }
-  | { status: 'not_found' }
-  | { status: 'reuse_detected'; familyId: string }
-  | { status: 'expired' };
+  | { status: "ok"; newTokenId: string; userId: string; familyId: string }
+  | { status: "not_found" }
+  | { status: "reuse_detected"; familyId: string }
+  | { status: "expired" };
 
 export function usersRepo(db: Database) {
   return {
@@ -50,7 +55,10 @@ export function usersRepo(db: Database) {
         .where(eq(users.id, id));
     },
 
-    async updateRecoveryCodeHash(id: string, hash: string | null): Promise<void> {
+    async updateRecoveryCodeHash(
+      id: string,
+      hash: string | null,
+    ): Promise<void> {
       await db
         .update(users)
         .set({ recoveryCodeHash: hash, updatedAt: new Date() })
@@ -65,7 +73,10 @@ export function usersRepo(db: Database) {
     },
 
     async touchLastLogin(id: string): Promise<void> {
-      await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, id));
+      await db
+        .update(users)
+        .set({ lastLoginAt: new Date() })
+        .where(eq(users.id, id));
     },
   };
 }
@@ -81,7 +92,12 @@ export function refreshTokensRepo(db: Database) {
       const [row] = await db
         .select()
         .from(refreshTokens)
-        .where(and(eq(refreshTokens.tokenHash, tokenHash), isNull(refreshTokens.revokedAt)))
+        .where(
+          and(
+            eq(refreshTokens.tokenHash, tokenHash),
+            isNull(refreshTokens.revokedAt),
+          ),
+        )
         .limit(1);
       return row ?? null;
     },
@@ -96,21 +112,26 @@ export function refreshTokensRepo(db: Database) {
           .select()
           .from(refreshTokens)
           .where(eq(refreshTokens.tokenHash, oldHash))
-          .for('update')
+          .for("update")
           .limit(1);
 
-        if (!row) return { status: 'not_found' as const };
+        if (!row) return { status: "not_found" as const };
 
         if (row.revokedAt) {
           await tx
             .update(refreshTokens)
             .set({ revokedAt: new Date() })
-            .where(and(eq(refreshTokens.familyId, row.familyId), isNull(refreshTokens.revokedAt)));
-          return { status: 'reuse_detected' as const, familyId: row.familyId };
+            .where(
+              and(
+                eq(refreshTokens.familyId, row.familyId),
+                isNull(refreshTokens.revokedAt),
+              ),
+            );
+          return { status: "reuse_detected" as const, familyId: row.familyId };
         }
 
         if (row.expiresAt < new Date()) {
-          return { status: 'expired' as const };
+          return { status: "expired" as const };
         }
 
         await tx
@@ -129,7 +150,7 @@ export function refreshTokensRepo(db: Database) {
           .returning();
 
         return {
-          status: 'ok' as const,
+          status: "ok" as const,
           newTokenId: created!.id,
           userId: row.userId,
           familyId: row.familyId,
@@ -148,14 +169,24 @@ export function refreshTokensRepo(db: Database) {
       await db
         .update(refreshTokens)
         .set({ revokedAt: new Date() })
-        .where(and(eq(refreshTokens.familyId, familyId), isNull(refreshTokens.revokedAt)));
+        .where(
+          and(
+            eq(refreshTokens.familyId, familyId),
+            isNull(refreshTokens.revokedAt),
+          ),
+        );
     },
 
     async revokeAllForUser(userId: string): Promise<void> {
       await db
         .update(refreshTokens)
         .set({ revokedAt: new Date() })
-        .where(and(eq(refreshTokens.userId, userId), isNull(refreshTokens.revokedAt)));
+        .where(
+          and(
+            eq(refreshTokens.userId, userId),
+            isNull(refreshTokens.revokedAt),
+          ),
+        );
     },
   };
-}   
+}

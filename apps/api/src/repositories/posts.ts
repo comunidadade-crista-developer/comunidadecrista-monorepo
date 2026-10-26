@@ -1,12 +1,12 @@
-import { and, count, desc, eq, sql } from 'drizzle-orm';
-import type { Database } from '../db/client.js';
-import { postLikes, posts } from '../db/schema.js';
-import type { NewPost, Post } from '../db/schema.js';
+import { and, count, desc, eq, sql } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { postLikes, posts } from "../db/schema.js";
+import type { NewPost, Post } from "../db/schema.js";
 
-export type FeedFilter = 'recent' | 'top' | 'liked';
+export type FeedFilter = "recent" | "top" | "liked";
 
 export interface ListOptions {
-  category?: 'entendimento' | 'ensinamento' | 'letra_cancao';
+  category?: "entendimento" | "ensinamento" | "letra_cancao";
   filter?: FeedFilter;
   cursor?: string;
   limit?: number;
@@ -22,7 +22,7 @@ export function postsRepo(db: Database) {
   return {
     async create(data: NewPost): Promise<Post> {
       const now = new Date();
-      const publishedAt = data.status === 'published' ? now : null;
+      const publishedAt = data.status === "published" ? now : null;
       const [row] = await db
         .insert(posts)
         .values({ ...data, publishedAt })
@@ -31,7 +31,11 @@ export function postsRepo(db: Database) {
     },
 
     async findById(id: string): Promise<Post | null> {
-      const [row] = await db.select().from(posts).where(eq(posts.id, id)).limit(1);
+      const [row] = await db
+        .select()
+        .from(posts)
+        .where(eq(posts.id, id))
+        .limit(1);
       return row ?? null;
     },
 
@@ -40,11 +44,17 @@ export function postsRepo(db: Database) {
     },
 
     async list(opts: ListOptions = {}): Promise<ListResult> {
-      const { category, filter = 'recent', cursor, limit = 20, viewerId } = opts;
-      const conditions = [eq(posts.status, 'published')];
+      const {
+        category,
+        filter = "recent",
+        cursor,
+        limit = 20,
+        viewerId,
+      } = opts;
+      const conditions = [eq(posts.status, "published")];
       if (category) conditions.push(eq(posts.category, category));
 
-      if (filter === 'recent') {
+      if (filter === "recent") {
         if (cursor) {
           const cursorDate = new Date(cursor);
           conditions.push(sql`${posts.createdAt} < ${cursorDate}`);
@@ -59,11 +69,13 @@ export function postsRepo(db: Database) {
         const items = hasMore ? rows.slice(0, limit) : rows;
         return {
           items,
-          nextCursor: hasMore ? items[items.length - 1]!.createdAt.toISOString() : null,
+          nextCursor: hasMore
+            ? items[items.length - 1]!.createdAt.toISOString()
+            : null,
         };
       }
 
-      if (filter === 'top') {
+      if (filter === "top") {
         const rows = await db
           .select()
           .from(posts)
@@ -94,7 +106,7 @@ export function postsRepo(db: Database) {
         .limit(limit);
     },
 
-    async setStatus(id: string, status: Post['status']): Promise<Post | null> {
+    async setStatus(id: string, status: Post["status"]): Promise<Post | null> {
       const [row] = await db
         .update(posts)
         .set({ status })
@@ -115,7 +127,9 @@ export function postsRepo(db: Database) {
     async incrementReports(postId: string, delta: 1 | -1): Promise<number> {
       const [row] = await db
         .update(posts)
-        .set({ reportsCount: sql`GREATEST(${posts.reportsCount} + ${delta}, 0)` })
+        .set({
+          reportsCount: sql`GREATEST(${posts.reportsCount} + ${delta}, 0)`,
+        })
         .where(eq(posts.id, postId))
         .returning({ reportsCount: posts.reportsCount });
       return row?.reportsCount ?? 0;

@@ -1,7 +1,11 @@
-import { eq, sql } from 'drizzle-orm';
-import type { Database } from '../db/client.js';
-import { idempotencyKeys, outbox } from '../db/schema.js';
-import type { IdempotencyKey, NewOutboxEvent, OutboxEvent } from '../db/schema.js';
+import { eq, sql } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { idempotencyKeys, outbox } from "../db/schema.js";
+import type {
+  IdempotencyKey,
+  NewOutboxEvent,
+  OutboxEvent,
+} from "../db/schema.js";
 
 export function outboxRepo(db: Database) {
   return {
@@ -31,16 +35,20 @@ export function outboxRepo(db: Database) {
     async markDone(id: string): Promise<void> {
       await db
         .update(outbox)
-        .set({ status: 'done', processedAt: new Date() })
+        .set({ status: "done", processedAt: new Date() })
         .where(eq(outbox.id, id));
     },
 
-    async markFailed(id: string, attempts: number, delayMs: number): Promise<void> {
+    async markFailed(
+      id: string,
+      attempts: number,
+      delayMs: number,
+    ): Promise<void> {
       const next = new Date(Date.now() + delayMs);
       await db
         .update(outbox)
         .set({
-          status: attempts >= 6 ? 'failed' : 'pending',
+          status: attempts >= 6 ? "failed" : "pending",
           nextAttemptAt: next,
         })
         .where(eq(outbox.id, id));

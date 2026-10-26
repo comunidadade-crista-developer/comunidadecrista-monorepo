@@ -50,11 +50,11 @@ nunca `request.ip` nem `X-Forwarded-For`.
 
 ### Modos
 
-| Cenário | Configuração |
-|---|---|
-| Dev local | `EDGE_MODE=none`, `TRUST_PROXY=false` → `clientIp` = IP da ligação |
+| Cenário                                        | Configuração                                                                          |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Dev local                                      | `EDGE_MODE=none`, `TRUST_PROXY=false` → `clientIp` = IP da ligação                    |
 | Produção com Cloudflare à frente (recomendado) | `EDGE_MODE=cloudflare`, `CF_ORIGIN_SECRET`, `IP_HASH_SECRET`; `TRUST_PROXY` desligado |
-| Outro proxy (VPS, Fly) sem Cloudflare | `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=<n>` |
+| Outro proxy (VPS, Fly) sem Cloudflare          | `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=<n>`                          |
 
 A cadeia de proxies do Render não está documentada (o número de saltos pode mudar), por isso a
 detecção automática de `RENDER=true` foi removida. Com Cloudflare, o IP vem de
@@ -65,26 +65,26 @@ detecção automática de `RENDER=true` foi removida. Com Cloudflare, o IP vem d
 1. **DNS**: adicionar o domínio à Cloudflare (nameservers). Remover registos `AAAA` do host da API
    (o Render não suporta IPv6).
 2. **Render → Custom Domains**: adicionar `api.<dominio>`. Na Cloudflare, criar `CNAME api →
-   <servico>.onrender.com` com **DNS only** (nuvem cinzenta) e esperar o certificado ficar
-   *Verified/Issued* no Render.
-3. **SSL/TLS → Overview**: modo **Full (strict)**. O guia do Render indica *Full*; (strict)
-   deve funcionar porque o certificado do Render é público — se falhar, voltar a *Full*.
+<servico>.onrender.com` com **DNS only** (nuvem cinzenta) e esperar o certificado ficar
+   _Verified/Issued_ no Render.
+3. **SSL/TLS → Overview**: modo **Full (strict)**. O guia do Render indica _Full_; (strict)
+   deve funcionar porque o certificado do Render é público — se falhar, voltar a _Full_.
 4. Passar o CNAME a **Proxied** (nuvem laranja).
-5. **Segredo de origem**: gerar com `openssl rand -base64 48`. Cloudflare → *Rules → Transform
-   Rules → Modify Request Header* → regra para `hostname equals api.<dominio>`:
-   *Set static* `X-Origin-Auth` = o segredo.
+5. **Segredo de origem**: gerar com `openssl rand -base64 48`. Cloudflare → _Rules → Transform
+   Rules → Modify Request Header_ → regra para `hostname equals api.<dominio>`:
+   _Set static_ `X-Origin-Auth` = o segredo.
 6. **Render → Environment**: `EDGE_MODE=cloudflare`, `CF_ORIGIN_SECRET=<segredo>`,
    `IP_HASH_SECRET=<outro segredo, openssl rand -base64 48>`, `CORS_ORIGIN=<dominio do frontend>`.
 7. **Verificar** (ver abaixo) antes de apontar o frontend para a API.
 8. **cron-job.org**: passar a chamar `https://api.<dominio>/health` (via Cloudflare).
    `/health` responde também sem segredo, para o health check do Render.
 9. **Definições recomendadas na Cloudflare**:
-   - SSL/TLS → Edge Certificates: *Always Use HTTPS*, TLS mínimo 1.2.
-   - Rules → Cache Rules: *Bypass cache* para `api.<dominio>` (a API também envia `no-store`).
+   - SSL/TLS → Edge Certificates: _Always Use HTTPS_, TLS mínimo 1.2.
+   - Rules → Cache Rules: _Bypass cache_ para `api.<dominio>` (a API também envia `no-store`).
    - Security → WAF → Rate limiting: 1 regra (plano gratuito) para `/auth/*`, como camada
      extra antes de chegar ao Render.
-   - Security → Bots → *Bot Fight Mode* ligado.
-   - Desligar *Web Analytics* / *Browser Insights* (privacidade).
+   - Security → Bots → _Bot Fight Mode_ ligado.
+   - Desligar _Web Analytics_ / _Browser Insights_ (privacidade).
 
 ### Verificação
 

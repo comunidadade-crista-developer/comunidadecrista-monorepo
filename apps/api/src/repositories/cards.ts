@@ -1,7 +1,7 @@
-import { asc, eq, inArray } from 'drizzle-orm';
-import type { Database } from '../db/client.js';
-import { gospelCards } from '../db/schema.js';
-import type { GospelCard, NewGospelCard } from '../db/schema.js';
+import { asc, eq, inArray } from "drizzle-orm";
+import type { Database } from "../db/client.js";
+import { gospelCards } from "../db/schema.js";
+import type { GospelCard, NewGospelCard } from "../db/schema.js";
 
 export function cardsRepo(db: Database) {
   return {
@@ -19,8 +19,11 @@ export function cardsRepo(db: Database) {
     },
 
     async findBySlugs(slugs: string[]): Promise<GospelCard[]> {
-        if (slugs.length === 0) return [];
-        return db.select().from(gospelCards).where(inArray(gospelCards.slug, slugs));
+      if (slugs.length === 0) return [];
+      return db
+        .select()
+        .from(gospelCards)
+        .where(inArray(gospelCards.slug, slugs));
     },
 
     async create(data: NewGospelCard): Promise<GospelCard> {

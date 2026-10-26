@@ -60,21 +60,21 @@ C4Container
 
 ## 3. Stack decidida
 
-| Camada | Escolha |
-|---|---|
-| Frontend | React 18 + Vite + TypeScript; PWA via `vite-plugin-pwa` (Workbox) |
-| Estado / dados locais | TanStack Query + Dexie (IndexedDB) |
-| UI | Tailwind CSS + Radix primitives + Lucide icons |
-| Backend | Node 20 + Fastify + TypeScript |
-| Base de dados | PostgreSQL (Neon free) via `pg` + drizzle-orm |
-| Cache | Upstash Redis (`@upstash/redis`) |
-| Autenticação | JWT (EdDSA) + refresh rotativo + argon2id (`@node-rs/argon2`) |
-| Validação | Zod (partilhado via `packages/shared`) |
-| Testes | Vitest (unit) + Playwright (E2E) |
-| CI/CD | GitHub Actions |
-| Infra local | Docker Compose (Postgres + Redis) |
-| Monorepo | pnpm workspaces |
-| Licença | AGPL-3.0 |
+| Camada                | Escolha                                                           |
+| --------------------- | ----------------------------------------------------------------- |
+| Frontend              | React 18 + Vite + TypeScript; PWA via `vite-plugin-pwa` (Workbox) |
+| Estado / dados locais | TanStack Query + Dexie (IndexedDB)                                |
+| UI                    | Tailwind CSS + Radix primitives + Lucide icons                    |
+| Backend               | Node 20 + Fastify + TypeScript                                    |
+| Base de dados         | PostgreSQL (Neon free) via `pg` + drizzle-orm                     |
+| Cache                 | Upstash Redis (`@upstash/redis`)                                  |
+| Autenticação          | JWT (EdDSA) + refresh rotativo + argon2id (`@node-rs/argon2`)     |
+| Validação             | Zod (partilhado via `packages/shared`)                            |
+| Testes                | Vitest (unit) + Playwright (E2E)                                  |
+| CI/CD                 | GitHub Actions                                                    |
+| Infra local           | Docker Compose (Postgres + Redis)                                 |
+| Monorepo              | pnpm workspaces                                                   |
+| Licença               | AGPL-3.0                                                          |
 
 ### Estrutura do repositório
 
@@ -163,6 +163,27 @@ O admin vive na mesma app (`apps/web`), em rotas `/admin/*`, carregadas por `Rea
 **Contexto**: simplicidade operacional.
 **Decisão**: `/admin/*` lazy-loaded, protegido por role `admin` no JWT e por middleware no backend.
 **Consequências**: um só deploy; middleware no backend **deve** revalidar role em cada pedido (nunca confiar só no frontend).
+
+### ADR-011 — Recuperação de conta: código imediato, perguntas com atraso
+
+**Contexto**: sem email, a recuperação depende de segredos que o utilizador guarda. O código de
+recuperação tem 80 bits de entropia; as perguntas (cor, número 0–999, igreja) têm pouca, e
+bastava acertá-las para tomar a conta.
+**Decisão**:
+
+- Código de recuperação → efeito imediato. A sessão de recuperação (JWT 5 min) é de **uso único**
+  (`jti` em `used_recovery_sessions`) e o reset corre numa só transacção: nova palavra-passe,
+  novo código, revogação de todas as sessões e cancelamento de pedidos pendentes.
+- Perguntas → a nova palavra-passe fica **pendente** (`pending_password_resets`) durante
+  `RECOVERY_QUESTIONS_DELAY_HOURS` (24 h). Não se emite código novo. Se o dono entrar entretanto
+  com a palavra-passe actual, o pedido é cancelado e o login devolve `pendingRecoveryCancelled`.
+  Passado o prazo, o 1.º login com a nova palavra-passe aplica-a, revoga as sessões e devolve um
+  código novo (uma única vez).
+- Limites por conta (todos os IPs) e por IP (todas as contas), além de IP+utilizador; sem Redis
+  ou com o Redis em baixo, o limite aplica-se em memória (nunca falha em aberto).
+  **Consequências**: quem perde o código e não entra durante 24 h perde a conta para quem tiver
+  acertado as perguntas — risco aceite sem email. Os atrasos exigem a UI mostrar `recovery_pending`
+  e `pendingRecoveryCancelled`.
 
 ## 5. Modelo de dados
 
@@ -279,10 +300,12 @@ erDiagram
 ```
 
 **Notas**
+
 - UUID v7 em todas as PKs (ordenação temporal sem colisões).
 - `citext` para `username` (unicidade case-insensitive).
 - Índices: `posts(status, created_at desc)`, `posts(gospel_card_id, status)`, `post_likes(user_id)`, `reports(post_id, status)`, `outbox(status, next_attempt_at)`.
 - `outbox` e `idempotency_keys` têm TTL — purga periódica pelo worker (ex.: > 7 dias).
+- `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
 
 ## 6. Contratos de API (resumo)
 
@@ -290,57 +313,57 @@ Base: `/api/v1`. Todas as rotas autenticadas usam `Authorization: Bearer <access
 
 ### Autenticação
 
-| Método | Rota | Descrição |
-|---|---|---|
-| POST | `/auth/register` | Cria conta. Devolve tokens + `recovery_code` (única vez). |
-| POST | `/auth/login` | Devolve tokens. Rate-limited por IP + username. |
-| POST | `/auth/refresh` | Rotativo. Deteta reuso → revoga família. |
-| POST | `/auth/logout` | Revoga o refresh atual. |
-| GET | `/auth/me` | Dados do utilizador autenticado. |
-| POST | `/auth/recover/verify` | Valida código de recuperação **ou** 3 perguntas. Devolve `recovery_session`. |
-| POST | `/auth/recover/reset` | Usa `recovery_session` para definir nova palavra-passe. |
+| Método | Rota                   | Descrição                                                                    |
+| ------ | ---------------------- | ---------------------------------------------------------------------------- |
+| POST   | `/auth/register`       | Cria conta. Devolve tokens + `recovery_code` (única vez).                    |
+| POST   | `/auth/login`          | Devolve tokens. Rate-limited por IP + username.                              |
+| POST   | `/auth/refresh`        | Rotativo. Deteta reuso → revoga família.                                     |
+| POST   | `/auth/logout`         | Revoga o refresh atual.                                                      |
+| GET    | `/auth/me`             | Dados do utilizador autenticado.                                             |
+| POST   | `/auth/recover/verify` | Valida código de recuperação **ou** 3 perguntas. Devolve `recovery_session`. |
+| POST   | `/auth/recover/reset`  | Usa `recovery_session` para definir nova palavra-passe.                      |
 
 ### Conteúdo
 
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | `/gospel-cards` | Lista de cards. |
-| GET | `/gospel-cards/:slug` | Detalhe de card. |
-| GET | `/posts` | Feed com `?category=&filter=recent|top|liked&cursor=`. |
-| GET | `/posts/:id` | Detalhe. |
-| POST | `/posts` | Cria partilha. Requer `Idempotency-Key`. |
-| DELETE | `/posts/:id` | Autor apaga. |
-| POST | `/posts/:id/like` | Idempotente. |
-| DELETE | `/posts/:id/like` | Idempotente. |
-| POST | `/posts/:id/report` | Uma denúncia por user por post. |
-| DELETE | `/posts/:id/report` | Cancela denúncia aberta. |
-| GET | `/users/me/posts` | Gestão de partilhas. |
-| GET | `/users/me/reports` | Denúncias do utilizador. |
-| PATCH | `/users/me` | Alterar username. |
-| POST | `/users/me/password` | Alterar palavra-passe (atual + nova). |
+| Método | Rota                  | Descrição                                |
+| ------ | --------------------- | ---------------------------------------- |
+| GET    | `/gospel-cards`       | Lista de cards.                          |
+| GET    | `/gospel-cards/:slug` | Detalhe de card.                         |
+| GET    | `/posts`              | Feed com `?category=&filter=recent       | top | liked&cursor=`. |
+| GET    | `/posts/:id`          | Detalhe.                                 |
+| POST   | `/posts`              | Cria partilha. Requer `Idempotency-Key`. |
+| DELETE | `/posts/:id`          | Autor apaga.                             |
+| POST   | `/posts/:id/like`     | Idempotente.                             |
+| DELETE | `/posts/:id/like`     | Idempotente.                             |
+| POST   | `/posts/:id/report`   | Uma denúncia por user por post.          |
+| DELETE | `/posts/:id/report`   | Cancela denúncia aberta.                 |
+| GET    | `/users/me/posts`     | Gestão de partilhas.                     |
+| GET    | `/users/me/reports`   | Denúncias do utilizador.                 |
+| PATCH  | `/users/me`           | Alterar username.                        |
+| POST   | `/users/me/password`  | Alterar palavra-passe (atual + nova).    |
 
 ### Sync
 
-| Método | Rota | Descrição |
-|---|---|---|
-| POST | `/sync` | Lote de operações idempotentes da outbox local. Devolve estado por operação. |
+| Método | Rota    | Descrição                                                                    |
+| ------ | ------- | ---------------------------------------------------------------------------- |
+| POST   | `/sync` | Lote de operações idempotentes da outbox local. Devolve estado por operação. |
 
 ### Admin
 
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | `/admin/posts?status=pending_review` | Fila de revisão. |
-| POST | `/admin/posts/:id/approve` | Aprova. |
-| POST | `/admin/posts/:id/reject` | Rejeita com motivo. |
-| GET | `/admin/reports` | Denúncias. |
-| GET | `/admin/moderation-log` | Auditoria. |
+| Método | Rota                                 | Descrição           |
+| ------ | ------------------------------------ | ------------------- |
+| GET    | `/admin/posts?status=pending_review` | Fila de revisão.    |
+| POST   | `/admin/posts/:id/approve`           | Aprova.             |
+| POST   | `/admin/posts/:id/reject`            | Rejeita com motivo. |
+| GET    | `/admin/reports`                     | Denúncias.          |
+| GET    | `/admin/moderation-log`              | Auditoria.          |
 
 ### Operação
 
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | `/health` | Leve — **não** toca em DB nem Redis. Devolve versão e timestamp. |
-| GET | `/health/deep` | Toca em DB e Redis. Usado em CI, não em cron. |
+| Método | Rota           | Descrição                                                        |
+| ------ | -------------- | ---------------------------------------------------------------- |
+| GET    | `/health`      | Leve — **não** toca em DB nem Redis. Devolve versão e timestamp. |
+| GET    | `/health/deep` | Toca em DB e Redis. Usado em CI, não em cron.                    |
 
 ## 7. Fluxo de autenticação
 
@@ -373,10 +396,11 @@ sequenceDiagram
 ```
 
 **Regras**
+
 - Access 15 min, refresh 30 dias rotativo.
 - Reuso de refresh revoga **a família inteira** (o utilizador tem de voltar a autenticar-se com password).
 - Recuperação: `recovery_code` (primário) ou 3 perguntas (secundário). Ambos hasheados com argon2id.
-- Rate limit em login: 5 tentativas / 15 min por IP+username; depois 15 min de bloqueio progressivo.
+- Rate limit em login: 5 tentativas / 15 min por IP+username, 20 / h por conta e 30 / 15 min por IP; login válido repõe o balde IP+username. Recuperação por perguntas: 5 / dia por conta.
 
 ## 8. Fluxo de sync offline
 
@@ -412,6 +436,7 @@ sequenceDiagram
 ```
 
 **Regras**
+
 - `POST /sync` aceita até 20 operações por chamada.
 - Cada operação tem `{op_id, idempotency_key, type, payload}`.
 - Retry exponencial no cliente: 5s, 15s, 45s, 2m, 5m, 15m (máx. 6 tentativas); depois estado `failed` visível.
@@ -420,15 +445,16 @@ sequenceDiagram
 
 ## 9. Estratégia de caching
 
-| Chave | TTL | Invalidação |
-|---|---|---|
-| `feed:{category}:{filter}:{cursor}` | 60s | Ao publicar/apagar post na categoria |
-| `post:{id}` | 120s | Ao editar, apagar, mudar status, like |
-| `post:{id}:likes_count` | 120s | Ao like/unlike (increment atómico) |
-| `cards:list` | 1h | Só em seed de conteúdo |
-| `user:{id}:profile` | 60s | Ao alterar username |
+| Chave                               | TTL  | Invalidação                           |
+| ----------------------------------- | ---- | ------------------------------------- |
+| `feed:{category}:{filter}:{cursor}` | 60s  | Ao publicar/apagar post na categoria  |
+| `post:{id}`                         | 120s | Ao editar, apagar, mudar status, like |
+| `post:{id}:likes_count`             | 120s | Ao like/unlike (increment atómico)    |
+| `cards:list`                        | 1h   | Só em seed de conteúdo                |
+| `user:{id}:profile`                 | 60s  | Ao alterar username                   |
 
 **Regras**
+
 - Cache-aside: o backend lê do Redis, em falha vai a Postgres.
 - Contadores (`likes_count`, `reports_count`) mantidos em Postgres como fonte de verdade; Redis só acelera leitura.
 - Rate limit: `@upstash/ratelimit` (sliding window).
@@ -437,7 +463,7 @@ sequenceDiagram
 
 - **`/health` leve**: `{status, version, timestamp}` — sem tocar em DB nem Redis. É este que o cron-job.org chama.
 - **cron-job.org** a cada **14 minutos**, entre as **06:00 e as 23:00** (hora local dos utilizadores maioritários). Fora desse intervalo, deixar dormir.
-- **Frontend**: ao arrancar, mostra UI local imediatamente e faz healthcheck em background com timeout de 3s. Se falhar, banner discreto: *"Servidor a acordar — podes continuar a ler; o envio fica em fila."*
+- **Frontend**: ao arrancar, mostra UI local imediatamente e faz healthcheck em background com timeout de 3s. Se falhar, banner discreto: _"Servidor a acordar — podes continuar a ler; o envio fica em fila."_
 - **Loading de formulário**: mensagens progressivas conforme estado (contactar → tentar acordar → sincronizar) — já definidas no briefing.
 
 ## 11. Segurança e privacidade
@@ -481,6 +507,7 @@ flowchart LR
 ```
 
 **Regras**
+
 - `main` protegida: PR + 1 review + CI verde.
 - Migrações: apenas forward; versionadas em `apps/api/drizzle/`.
 - `docker-compose` local sobe Postgres + Redis para desenvolvimento e testes E2E.
@@ -489,14 +516,13 @@ flowchart LR
 
 O plano detalhado será produzido no próximo passo, mas a espinha dorsal é:
 
-| Etapa | Entregáveis | Critério de saída |
-|---|---|---|
-| **E0 — Fundação** | Monorepo, CI, docker-compose, ADRs, setup Neon/Upstash/Render/Pages, `/health` | CI verde; `/health` responde em produção |
-| **E1 — Autenticação** | Registo, login, refresh, recuperação por código + perguntas, rate limit | Fluxos completos testados E2E; tokens rotativos |
-| **E2 — Conteúdo + leitura** | `gospel_cards` seed, ecrãs de leitura, feed público (só leitura), cache | Utilizador lê offline; cache invalida corretamente |
-| **E3 — Escrita + sync** | Composer, outbox local, `/sync`, likes, denúncias | Publicar offline → sincronizar sem duplicados |
-| **E4 — Moderação + admin** | `/admin`, fila de revisão, log de auditoria | Admin aprova/rejeita; posts ocultos corretamente |
-| **E5 — Perfil + suporte + contribuir** | Perfil, gestão de posts, FAQ, suporte, contribuir | Fluxos completos |
-| **E6 — Polimento** | Acessibilidade, i18n preparado, runbook, política de privacidade, termos | Auditoria de acessibilidade; documentos publicados |
-| **E7 — Entrega** | Deploy final, backups, monitorização | Smoke tests completos; cron ativo; backups a correr |
-
+| Etapa                                  | Entregáveis                                                                    | Critério de saída                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------- |
+| **E0 — Fundação**                      | Monorepo, CI, docker-compose, ADRs, setup Neon/Upstash/Render/Pages, `/health` | CI verde; `/health` responde em produção            |
+| **E1 — Autenticação**                  | Registo, login, refresh, recuperação por código + perguntas, rate limit        | Fluxos completos testados E2E; tokens rotativos     |
+| **E2 — Conteúdo + leitura**            | `gospel_cards` seed, ecrãs de leitura, feed público (só leitura), cache        | Utilizador lê offline; cache invalida corretamente  |
+| **E3 — Escrita + sync**                | Composer, outbox local, `/sync`, likes, denúncias                              | Publicar offline → sincronizar sem duplicados       |
+| **E4 — Moderação + admin**             | `/admin`, fila de revisão, log de auditoria                                    | Admin aprova/rejeita; posts ocultos corretamente    |
+| **E5 — Perfil + suporte + contribuir** | Perfil, gestão de posts, FAQ, suporte, contribuir                              | Fluxos completos                                    |
+| **E6 — Polimento**                     | Acessibilidade, i18n preparado, runbook, política de privacidade, termos       | Auditoria de acessibilidade; documentos publicados  |
+| **E7 — Entrega**                       | Deploy final, backups, monitorização                                           | Smoke tests completos; cron ativo; backups a correr |

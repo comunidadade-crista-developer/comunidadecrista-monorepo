@@ -19,19 +19,20 @@ pnpm docker:up
 cp apps/api/.env.example apps/api/.env
 pnpm dev
 ```
-* Web: http://localhost:5173
 
-* API: http://localhost:3000
+- Web: http://localhost:5173
 
-* Health: http://localhost:3000/health
+- API: http://localhost:3000
+
+- Health: http://localhost:3000/health
 
 ## Estilo de código
 
-* Prettier + ESLint; `pnpm format` antes de commit.
+- Prettier + ESLint; `pnpm format` antes de commit.
 
-* TypeScript estrito; evitar `any`.
+- TypeScript estrito; evitar `any`.
 
-* Linguagem da UI: PT-PT, sem emojis, ícones Lucide.
+- Linguagem da UI: PT-PT, sem emojis, ícones Lucide.
 
 ## DCO
 

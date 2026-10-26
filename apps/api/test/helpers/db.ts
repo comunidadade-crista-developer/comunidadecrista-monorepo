@@ -1,8 +1,8 @@
-import 'dotenv/config';
-import { sql } from 'drizzle-orm';
-import type { Pool } from 'pg';
-import { createDb, type Database } from '../../src/db/client.js';
-import { runMigrations } from '../../src/db/migrate.js';
+import "dotenv/config";
+import { sql } from "drizzle-orm";
+import type { Pool } from "pg";
+import { createDb, type Database } from "../../src/db/client.js";
+import { runMigrations } from "../../src/db/migrate.js";
 
 type Instance = { db: Database; pool: Pool };
 let instance: Instance | null = null;
@@ -12,7 +12,7 @@ export async function getTestDb(): Promise<Database> {
     const url = process.env.DATABASE_URL;
     if (!url) {
       throw new Error(
-        'DATABASE_URL não definido. Cria apps/api/.env (copia de .env.example) ou define a variável no ambiente.',
+        "DATABASE_URL não definido. Cria apps/api/.env (copia de .env.example) ou define a variável no ambiente.",
       );
     }
     await runMigrations(url);
@@ -26,7 +26,7 @@ export async function truncateAll(): Promise<void> {
   await db.execute(sql`
     TRUNCATE TABLE
       refresh_tokens, post_likes, reports, moderation_log, outbox, idempotency_keys,
-      posts, users, gospel_cards
+      posts, users, gospel_cards, pending_password_resets, used_recovery_sessions
     RESTART IDENTITY CASCADE
   `);
 }
