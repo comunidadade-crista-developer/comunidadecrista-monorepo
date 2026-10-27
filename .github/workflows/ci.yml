@@ -24,7 +24,7 @@ jobs:
           POSTGRES_PASSWORD: comunidade_test
           POSTGRES_DB: comunidade_test
         ports:
-          - 5432:5432
+          - 5430:5432
         options: >-
           --health-cmd "pg_isready -U comunidade -d comunidade_test"
           --health-interval 5s

@@ -305,6 +305,8 @@ erDiagram
 - `citext` para `username` (unicidade case-insensitive).
 - Índices: `posts(status, created_at desc)`, `posts(gospel_card_id, status)`, `post_likes(user_id)`, `reports(post_id, status)`, `outbox(status, next_attempt_at)`.
 - `outbox` e `idempotency_keys` têm TTL — purga periódica pelo worker (ex.: > 7 dias).
+- Purga de conta: `posts.author_id` → NULL (partilha anónima, "[removido]"); `moderation_log.post_id` e `moderator_id` → NULL (a auditoria nunca se perde); `post_likes`, `reports`, `refresh_tokens` e `idempotency_keys` apagam-se em cascata. `idempotency_keys` tem PK `(user_id, key)`: a chave vem do cliente e só é única por utilizador.
+- Outbox: `claimBatch` empurra `next_attempt_at` para o futuro (5 min) ao reservar; um evento preso em `processing` só volta a ser reclamável depois desse prazo.
 - `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
 
 ## 6. Contratos de API (resumo)
