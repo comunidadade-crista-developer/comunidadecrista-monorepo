@@ -1,4 +1,4 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, lt } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import { refreshTokens, users } from "../db/schema.js";
 import type {
@@ -175,6 +175,15 @@ export function refreshTokensRepo(db: Database) {
             isNull(refreshTokens.revokedAt),
           ),
         );
+    },
+
+    /** Apaga tokens que expiraram antes de `olderThan` (revogados ou não). */
+    async purgeExpired(olderThan: Date): Promise<number> {
+      const rows = await db
+        .delete(refreshTokens)
+        .where(lt(refreshTokens.expiresAt, olderThan))
+        .returning({ id: refreshTokens.id });
+      return rows.length;
     },
 
     async revokeAllForUser(userId: string): Promise<void> {

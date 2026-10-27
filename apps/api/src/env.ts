@@ -130,30 +130,6 @@ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
   }
 });
 
-const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
-  if (env.EDGE_MODE === 'cloudflare' && !env.CF_ORIGIN_SECRET) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['CF_ORIGIN_SECRET'],
-      message: 'obrigatório quando EDGE_MODE=cloudflare',
-    });
-  }
-  if (env.EDGE_MODE === 'cloudflare' && env.TRUST_PROXY) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['TRUST_PROXY'],
-      message: 'não combinar TRUST_PROXY com EDGE_MODE=cloudflare',
-    });
-  }
-  if (env.NODE_ENV === 'production' && !env.IP_HASH_SECRET) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['IP_HASH_SECRET'],
-      message: 'obrigatório em produção',
-    });
-  }
-});
-
 export type Env = z.infer<typeof EnvSchema>;
 
 export function loadEnv(overrides: Partial<Env> = {}): Env {

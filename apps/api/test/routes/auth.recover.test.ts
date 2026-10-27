@@ -44,13 +44,11 @@ async function verifyQuestions(
 }
 
 function reset(app: App, recoverySession: string, newPassword: string) {
-  return request(app.server)
-    .post("/auth/recover/reset")
-    .send({
-      recoverySession,
-      newPassword,
-      newPasswordConfirmation: newPassword,
-    });
+  return request(app.server).post("/auth/recover/reset").send({
+    recoverySession,
+    newPassword,
+    newPasswordConfirmation: newPassword,
+  });
 }
 
 function login(app: App, username: string, password: string) {
