@@ -18,7 +18,7 @@ type OutboxRow = {
   next_attempt_at: string;
   created_at: string;
   processed_at: string | null;
-};   
+};
 
 function toOutboxEvent(row: OutboxRow): OutboxEvent {
   return {
@@ -33,7 +33,7 @@ function toOutboxEvent(row: OutboxRow): OutboxEvent {
     createdAt: new Date(row.created_at),
     processedAt: row.processed_at ? new Date(row.processed_at) : null,
   };
-}   
+}
 
 export function outboxRepo(db: Database) {
   return {
