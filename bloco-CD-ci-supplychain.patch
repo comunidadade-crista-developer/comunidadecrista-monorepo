@@ -1,0 +1,103 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+new file mode 100644
+index 0000000..b58ced3
+--- /dev/null
++++ b/.github/dependabot.yml
+@@ -0,0 +1,20 @@
++version: 2
++updates:
++  - package-ecosystem: "npm"
++    directory: "/"
++    schedule:
++      interval: "weekly"
++    open-pull-requests-limit: 5
++    # Espera 3 dias após a publicação (supply-chain). Não atrasa os security updates.
++    cooldown:
++      default-days: 3
++    groups:
++      minor-and-patch:
++        update-types: ["minor", "patch"]
++
++  - package-ecosystem: "github-actions"
++    directory: "/"
++    schedule:
++      interval: "weekly"
++    cooldown:
++      default-days: 3
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index bf94efc..1eba990 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -6,6 +6,10 @@ on:
+   push:
+     branches: [master, dev]
+ 
++# Privilégios mínimos para o GITHUB_TOKEN (cada job pode pedir mais, se precisar).
++permissions:
++  contents: read
++
+ concurrency:
+   group: ci-${{ github.ref }}
+   cancel-in-progress: true
+@@ -24,7 +28,7 @@ jobs:
+           POSTGRES_PASSWORD: comunidade_test
+           POSTGRES_DB: comunidade_test
+         ports:
+-          - 5430:5432
++          - 5432:5432
+         options: >-
+           --health-cmd "pg_isready -U comunidade -d comunidade_test"
+           --health-interval 5s
+@@ -48,6 +52,8 @@ jobs:
+ 
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+ 
+       - name: Setup pnpm
+         uses: pnpm/action-setup@v4
+@@ -77,3 +83,30 @@ jobs:
+ 
+       - name: Build
+         run: pnpm build
++
++  audit:
++    name: Dependency audit
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
++
++      - name: Setup pnpm
++        uses: pnpm/action-setup@v4
++        with:
++          version: 10
++
++      - name: Setup Node.js
++        uses: actions/setup-node@v4
++        with:
++          node-version-file: .nvmrc
++          cache: pnpm
++
++      - name: Install dependencies
++        run: pnpm install --frozen-lockfile
++
++      - name: Audit (falha em high ou critical)
++        run: pnpm audit --audit-level=high
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index 0498b7e..60f11ae 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -6,3 +6,8 @@ packages:
+ # esbuild <=0.24.2 (via drizzle-kit > @esbuild-kit) e 0.27.3–0.28.0 (via tsup).
+ overrides:
+   esbuild: "^0.28.1"
++
++# Supply-chain: não instalar versões publicadas há menos de 3 dias (valor em minutos).
++# A maioria dos pacotes npm comprometidos é detectada e retirada nesse prazo.
++# Para um patch de segurança urgente, listar o pacote em minimumReleaseAgeExclude.
++minimumReleaseAge: 4320

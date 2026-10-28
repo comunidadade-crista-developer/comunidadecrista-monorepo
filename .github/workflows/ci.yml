@@ -6,6 +6,10 @@ on:
   push:
     branches: [master, dev]
 
+# Privilégios mínimos para o GITHUB_TOKEN (cada job pode pedir mais, se precisar).
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -24,7 +28,7 @@ jobs:
           POSTGRES_PASSWORD: comunidade_test
           POSTGRES_DB: comunidade_test
         ports:
-          - 5430:5432
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U comunidade -d comunidade_test"
           --health-interval 5s
@@ -48,6 +52,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -77,3 +83,30 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit (falha em high ou critical)
+        run: pnpm audit --audit-level=high
