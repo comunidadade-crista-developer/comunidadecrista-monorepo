@@ -38,8 +38,8 @@ const BaseEnvSchema = z.object({
   // Segredo do HMAC que anonimiza IP/username nas chaves do rate limit (Redis).
   IP_HASH_SECRET: optionalSecret,
 
-  DATABASE_URL: z.string().url().optional(),
-  REDIS_URL: z.string().url().optional(),
+  DATABASE_URL: z.url().optional(),
+  REDIS_URL: z.url().optional(),
 
   JWT_PRIVATE_JWK: z.string().optional(),
   JWT_PUBLIC_JWK: z.string().optional(),
@@ -109,21 +109,21 @@ const BaseEnvSchema = z.object({
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
   if (env.EDGE_MODE === "cloudflare" && !env.CF_ORIGIN_SECRET) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["CF_ORIGIN_SECRET"],
       message: "obrigatório quando EDGE_MODE=cloudflare",
     });
   }
   if (env.EDGE_MODE === "cloudflare" && env.TRUST_PROXY) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["TRUST_PROXY"],
       message: "não combinar TRUST_PROXY com EDGE_MODE=cloudflare",
     });
   }
   if (env.NODE_ENV === "production" && !env.IP_HASH_SECRET) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["IP_HASH_SECRET"],
       message: "obrigatório em produção",
     });
@@ -137,7 +137,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
   if (!parsed.success) {
     console.error(
       "Invalid environment variables:",
-      parsed.error.flatten().fieldErrors,
+      z.flattenError(parsed.error).fieldErrors,
     );
     throw new Error("Invalid environment variables");
   }

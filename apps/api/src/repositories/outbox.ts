@@ -18,7 +18,7 @@ type OutboxRow = {
   next_attempt_at: string;
   created_at: string;
   processed_at: string | null;
-};   
+};
 
 function toOutboxEvent(row: OutboxRow): OutboxEvent {
   return {
@@ -33,7 +33,7 @@ function toOutboxEvent(row: OutboxRow): OutboxEvent {
     createdAt: new Date(row.created_at),
     processedAt: row.processed_at ? new Date(row.processed_at) : null,
   };
-}   
+}
 
 export function outboxRepo(db: Database) {
   return {
@@ -42,12 +42,6 @@ export function outboxRepo(db: Database) {
       return row!;
     },
 
-    /**
-     * Reserva atómica. Os eventos reservados ficam invisíveis durante
-     * `visibilityTimeoutS` (next_attempt_at é empurrado para o futuro): se o
-     * worker morrer a meio, o evento volta a ser reclamável depois desse prazo
-     * — e, antes dele, nenhum outro worker o apanha.
-     */
     async claimBatch(
       limit = 20,
       visibilityTimeoutS = 300,

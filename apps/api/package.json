@@ -26,29 +26,29 @@
     "@fastify/rate-limit": "^10.2.0",
     "@node-rs/argon2": "^2.0.2",
     "dotenv": "^16.4.7",
-    "drizzle-orm": "^0.38.0",
+    "drizzle-orm": "^0.45.2",
     "fastify": "^5.2.0",
-    "fastify-type-provider-zod": "^4.0.2",
+    "fastify-type-provider-zod": "^7.0.0",
     "ioredis": "^5.4.1",
     "jose": "^6.2.13",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "rate-limiter-flexible": "^5.0.4",
     "uuidv7": "^1.0.2",
-    "zod": "^3.24.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@comunidade/config": "workspace:*",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
     "@types/supertest": "^6.0.2",
-    "drizzle-kit": "^0.30.6",
+    "drizzle-kit": "^0.31.3",
     "eslint": "^9.16.0",
     "pino-pretty": "^13.0.0",
     "supertest": "^7.0.0",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.12"
   }
 }

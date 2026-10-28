@@ -7,14 +7,14 @@ export const APP_AUTHOR = "Gekko Dreamers" as const;
 export const HealthResponse = z.object({
   status: z.literal("ok"),
   version: z.string(),
-  timestamp: z.string().datetime(),
+  timestamp: z.iso.datetime(),
 });
 export type HealthResponse = z.infer<typeof HealthResponse>;
 
 export const DeepHealthResponse = z.object({
   status: z.enum(["ok", "degraded"]),
   version: z.string(),
-  timestamp: z.string().datetime(),
+  timestamp: z.iso.datetime(),
   checks: z.object({
     db: z.enum(["ok", "fail", "not_configured"]),
     redis: z.enum(["ok", "fail", "not_configured"]),

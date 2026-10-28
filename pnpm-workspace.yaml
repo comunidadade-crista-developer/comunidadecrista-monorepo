@@ -1,3 +1,13 @@
 packages:
   - "apps/*"
   - "packages/*"
+
+# Força versões corrigidas de dependências transitivas (pnpm audit):
+# esbuild <=0.24.2 (via drizzle-kit > @esbuild-kit) e 0.27.3–0.28.0 (via tsup).
+overrides:
+  esbuild: "^0.28.1"
+
+# Supply-chain: não instalar versões publicadas há menos de 3 dias (valor em minutos).
+# A maioria dos pacotes npm comprometidos é detectada e retirada nesse prazo.
+# Para um patch de segurança urgente, listar o pacote em minimumReleaseAgeExclude.
+minimumReleaseAge: 4320

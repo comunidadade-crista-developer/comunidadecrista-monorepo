@@ -18,7 +18,7 @@ export const SecurityAnswer = z.string().min(1).max(100);
 export const NumberAnswer = z.string().regex(/^\d{1,3}$/, "número de 0 a 999");
 
 export const UserPublic = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   username: z.string(),
   role: z.enum(["user", "admin"]),
 });
@@ -77,7 +77,7 @@ export type RefreshResponse = z.infer<typeof RefreshResponse>;
 export const LogoutRequest = z.object({ refreshToken: z.string().min(1) });
 
 export const MeResponse = z.object({
-  user: UserPublic.extend({ createdAt: z.string().datetime() }),
+  user: UserPublic.extend({ createdAt: z.iso.datetime() }),
 });
 export type MeResponse = z.infer<typeof MeResponse>;
 
@@ -121,7 +121,7 @@ export const RecoverResetResponse = z.object({
   status: z.enum(["completed", "pending"]),
   recoveryCode: z.string().optional(),
   recoveryCodeWarning: z.string().optional(),
-  effectiveAt: z.string().datetime().optional(),
+  effectiveAt: z.iso.datetime().optional(),
 });
 export type RecoverResetResponse = z.infer<typeof RecoverResetResponse>;
 
