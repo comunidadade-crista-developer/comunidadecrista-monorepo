@@ -15,31 +15,26 @@ export interface RateLimitResult {
 export type RecoverMode = "code" | "questions";
 
 export interface RateLimiters {
-  /** Consome 1 ponto em 3 baldes: IP, IP+utilizador e conta (só o utilizador). */
   checkLogin(ip: string, username: string): Promise<RateLimitResult>;
-  /** Login válido: repõe o balde IP+utilizador e devolve o ponto da conta. */
   loginSucceeded(ip: string, username: string): Promise<void>;
   checkRegister(ip: string): Promise<RateLimitResult>;
-  /** Consome em 3 baldes: IP, IP+utilizador e conta (balde próprio por modo). */
   checkRecover(
     ip: string,
     username: string,
     mode: RecoverMode,
   ): Promise<RateLimitResult>;
-  /** Recuperação validada: repõe IP+utilizador e devolve o ponto da conta. */
   recoverSucceeded(
     ip: string,
     username: string,
     mode: RecoverMode,
   ): Promise<void>;
+  checkCardsPublic(ip: string): Promise<RateLimitResult>; 
 }
 
-/** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
 export interface RateLimitLogger {
   warn(obj: Record<string, unknown>, msg: string): void;
 }
 
-/** Falha inesperada do próprio limitador: recusa em vez de deixar passar. */
 const FAIL_CLOSED_RETRY_S = 30;
 
 export function createRateLimiters(
@@ -54,8 +49,6 @@ export function createRateLimiters(
       .digest("hex")
       .slice(0, 32);
 
-  // Sem Redis, ou com o Redis em baixo, o limite continua a aplicar-se em memória
-  // (insuranceLimiter) — nunca falha em aberto.
   const make = (
     keyPrefix: string,
     points: number,
@@ -121,6 +114,8 @@ export function createRateLimiters(
     ),
   };
 
+  const cardsPublic = make("rl:cards", 30, 60);
+
   const consume = async (
     limiter: RateLimiterAbstract,
     key: string,
@@ -129,7 +124,6 @@ export function createRateLimiters(
       await limiter.consume(key);
       return { allowed: true };
     } catch (err) {
-      // Balde esgotado: o limitador rejeita com um RateLimiterRes.
       if (err && typeof err === "object" && "msBeforeNext" in err) {
         const ms = (err as { msBeforeNext: number }).msBeforeNext;
         return {
@@ -137,7 +131,6 @@ export function createRateLimiters(
           retryAfter: Math.max(1, Math.ceil(ms / 1000)),
         };
       }
-      // Falha do próprio limitador (Redis e memória): recusar, sem registar dados do pedido.
       log?.warn(
         { errorName: err instanceof Error ? err.name : typeof err },
         "rate limiter failure — failing closed",
@@ -146,7 +139,6 @@ export function createRateLimiters(
     }
   };
 
-  // Consome por ordem e pára no primeiro balde esgotado (os seguintes não gastam pontos).
   const consumeAll = async (
     steps: ReadonlyArray<readonly [RateLimiterAbstract, string]>,
   ): Promise<RateLimitResult> => {
@@ -157,7 +149,6 @@ export function createRateLimiters(
     return { allowed: true };
   };
 
-  // Repor/devolver pontos é só uma conveniência: um erro aqui nunca deve partir o pedido.
   const settle = async (
     ops: ReadonlyArray<() => Promise<unknown>>,
   ): Promise<void> => {
@@ -202,5 +193,6 @@ export function createRateLimiters(
         () => recoverAccount[mode].reward(anon(user), 1),
       ]);
     },
+    checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
   };
-}
+}   
