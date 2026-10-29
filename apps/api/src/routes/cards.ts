@@ -25,7 +25,7 @@ export async function cardsRoutes(
 
   f.get(
     '/gospel-cards',
-    { schema: { response: { 200: GospelCardListResponse } } },
+    { schema: { response: { 200: GospelCardListResponse, 429: ErrorResponse } } },
     async (request, reply) => {
       const rl = await limiters.checkCardsPublic(request.clientIp);
       if (!rl.allowed) {
@@ -55,7 +55,7 @@ export async function cardsRoutes(
     {
       schema: {
         params: CardSlugParams,
-        response: { 200: GospelCardResponse, 404: ErrorResponse },
+        response: { 200: GospelCardResponse, 404: ErrorResponse, 429: ErrorResponse, },
       },
     },
     async (request, reply) => {

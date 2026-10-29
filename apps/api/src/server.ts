@@ -21,6 +21,9 @@ import type { Env } from "./env.js";
 import { createEdgeGuard } from "./net/edge.js";
 import { createRedis, waitUntilReady } from "./redis.js";
 import { authRoutes } from "./routes/auth.js";
+import { cardsRoutes } from "./routes/cards.js";
+import { createCardsCache } from "./cache/cards-cache.js";
+import { cardsRepo } from "./repositories/cards.js";
 import { healthRoutes } from "./routes/health.js";
 
 export type AppInstance = FastifyInstance<
@@ -89,15 +92,15 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
-  // Tem de correr antes do rate limit global, que usa request.clientIp.
   app.decorateRequest("clientIp", "");
   app.addHook("onRequest", createEdgeGuard(env).onRequest);
 
-  // Respostas da API nunca devem ser guardadas em cache (Cloudflare, browsers, proxies).
   app.addHook("onSend", async (_request, reply, payload) => {
-    reply.header("Cache-Control", "no-store");
-    return payload;
-  });
+    if (!reply.getHeader("Cache-Control")) {
+      reply.header("Cache-Control", "no-store");
+    }
+     return payload;
+   });
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
@@ -145,8 +148,16 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       jwt,
       limiters,
     });
+  await app.register(cardsRoutes, {
+      cache: createCardsCache({
+        redis,
+        cards: cardsRepo(dbBundle.db),
+        logger: app.log,
+      }),
+      limiters,
+    });
   } else {
-    app.log.warn("DATABASE_URL não configurado — rotas de auth desactivadas.");
+    app.log.warn("DATABASE_URL não configurado — rotas de auth e cards desactivadas.");
   }
 
   return app;
