@@ -125,8 +125,12 @@ export const RecoverResetResponse = z.object({
 });
 export type RecoverResetResponse = z.infer<typeof RecoverResetResponse>;
 
+// Formato único de erro da API: `error` é um código estável (snake_case) para o cliente
+// reagir; `fields` só existe em erros de validação (campo → mensagem); `message` é opcional
+// e nunca leva detalhes internos.
 export const ErrorResponse = z.object({
   error: z.string(),
   message: z.string().optional(),
+  fields: z.record(z.string(), z.string()).optional(),
 });
 export type ErrorResponse = z.infer<typeof ErrorResponse>;
