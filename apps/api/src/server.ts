@@ -18,6 +18,7 @@ import { createRateLimiters } from "./auth/rate-limit.js";
 import { createRecoveryService } from "./auth/recovery.js";
 import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
+import { errorHandler, notFoundHandler } from "./http-errors.js";
 import { createEdgeGuard } from "./net/edge.js";
 import { createRedis, waitUntilReady } from "./redis.js";
 import { authRoutes } from "./routes/auth.js";
@@ -89,6 +90,10 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
+  // Formato de erro único; nunca devolve detalhes internos em erros 5xx.
+  app.setErrorHandler(errorHandler);
+  app.setNotFoundHandler(notFoundHandler);
+
   // Tem de correr antes do rate limit global, que usa request.clientIp.
   app.decorateRequest("clientIp", "");
   app.addHook("onRequest", createEdgeGuard(env).onRequest);
@@ -108,6 +113,11 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
     max: 100,
     timeWindow: "1 minute",
     keyGenerator: (request) => request.clientIp,
+    // Um Error é lançado e passa pelo errorHandler (formato único `{ error: "rate_limited" }`).
+    errorResponseBuilder: (_request, context) =>
+      Object.assign(new Error("rate limit exceeded"), {
+        statusCode: context.statusCode,
+      }),
   });
 
   const redis = createRedis(env.REDIS_URL);
