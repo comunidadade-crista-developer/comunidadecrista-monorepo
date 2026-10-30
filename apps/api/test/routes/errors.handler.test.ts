@@ -117,10 +117,10 @@ describe("formato único de erro", () => {
   it("content-type não suportado → 415", async () => {
     const app = await makeApp();
     try {
-      const res = await request(app.server)
+       const res = await request(app.server)
         .post("/__test__/echo")
-        .set("Content-Type", "text/plain")
-        .send("olá");
+        .set("Content-Type", "application/xml")
+        .send("<a/>");
       expect(res.status).toBe(415);
       expect(res.body).toEqual({ error: "unsupported_media_type" });
     } finally {
