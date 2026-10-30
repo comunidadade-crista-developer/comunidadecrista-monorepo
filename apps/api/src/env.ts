@@ -38,6 +38,10 @@ const BaseEnvSchema = z.object({
   // Segredo do HMAC que anonimiza IP/username nas chaves do rate limit (Redis).
   IP_HASH_SECRET: optionalSecret,
 
+  // Pool do Postgres. DB_QUERY_TIMEOUT_MS=0 desactiva o limite do cliente.
+  DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+  DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
+
   DATABASE_URL: z.url().optional(),
   REDIS_URL: z.url().optional(),
 

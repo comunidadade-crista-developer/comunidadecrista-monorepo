@@ -117,7 +117,7 @@ describe("formato único de erro", () => {
   it("content-type não suportado → 415", async () => {
     const app = await makeApp();
     try {
-       const res = await request(app.server)
+      const res = await request(app.server)
         .post("/__test__/echo")
         .set("Content-Type", "application/xml")
         .send("<a/>");

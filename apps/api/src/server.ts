@@ -20,7 +20,11 @@ import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
 import { errorHandler, notFoundHandler } from "./http-errors.js";
 import { createEdgeGuard } from "./net/edge.js";
-import { createRedis, waitUntilReady } from "./redis.js";
+import {
+  attachRedisErrorLogging,
+  createRedis,
+  waitUntilReady,
+} from "./redis.js";
 import { authRoutes } from "./routes/auth.js";
 import { healthRoutes } from "./routes/health.js";
 
@@ -121,6 +125,7 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
   });
 
   const redis = createRedis(env.REDIS_URL);
+  if (redis) attachRedisErrorLogging(redis, app.log);
   if (redis && !(await waitUntilReady(redis))) {
     app.log.warn(
       "Redis indisponível no arranque — rate limit pode falhar em aberto.",
@@ -132,7 +137,14 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
     });
   }
 
-  const dbBundle = env.DATABASE_URL ? createDb(env.DATABASE_URL) : null;
+  const dbBundle = env.DATABASE_URL
+    ? createDb(env.DATABASE_URL, {
+        poolMax: env.DB_POOL_MAX,
+        queryTimeoutMs: env.DB_QUERY_TIMEOUT_MS,
+        applicationName: "comunidade-api",
+        log: app.log,
+      })
+    : null;
   if (dbBundle) {
     app.addHook("onClose", async () => {
       await dbBundle.pool.end().catch(() => {});
