@@ -100,12 +100,13 @@ describe("formato único de erro", () => {
     }
   });
 
-  it("JSON inválido → 400 bad_request", async () => {
+   it("JSON inválido → 400 bad_request", async () => {
     const app = await makeApp();
     try {
-       const res = await request(app.server)
-        .post("/__test__/validate")
-        .send({ username: "a", password: "" });
+      const res = await request(app.server)
+        .post("/__test__/echo")
+        .set("Content-Type", "application/json")
+        .send("{");
       expect(res.status).toBe(400);
       expect(res.body).toEqual({ error: "bad_request" });
     } finally {
@@ -147,7 +148,7 @@ describe("formato único de erro", () => {
     try {
       const res = await request(app.server)
         .post("/__test__/validate")
-        .send({ username: "a", password: "x" });
+        .send({ username: "a", password: "" });
       expect(res.status).toBe(400);
       expect(res.body.error).toBe("validation_error");
       expect(Object.keys(res.body.fields ?? {})).toEqual(
