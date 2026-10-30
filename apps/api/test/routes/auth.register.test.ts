@@ -13,8 +13,8 @@ const env = loadEnv({
 function validBody(overrides: Record<string, unknown> = {}) {
   return {
     username: `user${Math.floor(Math.random() * 1e9)}`,
-    password: "password123",
-    passwordConfirmation: "password123",
+    password: "Frase-de-teste-42",
+    passwordConfirmation: "Frase-de-teste-42",
     securityQ1: "Azul",
     securityQ2: "7",
     securityQ3: "Igreja da Graça",

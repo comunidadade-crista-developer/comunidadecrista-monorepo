@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MESSAGES,
+  PASSWORD_MIN_LENGTH,
+  containsUsername,
+  isCommonPassword,
+} from "./password-policy.js";
 
 export const Username = z
   .string()
@@ -9,10 +16,25 @@ export const Username = z
     "apenas letras, números, ponto, underscore e hífen",
   );
 
-export const Password = z
+// Palavra-passe NOVA (registo, recuperação): ver password-policy.ts.
+export const NewPassword = z
   .string()
-  .min(6, "palavra-passe tem de ter pelo menos 6 caracteres")
-  .max(20, "palavra-passe tem no máximo 20 caracteres");
+  .min(PASSWORD_MIN_LENGTH, PASSWORD_MESSAGES.tooShort)
+  .max(PASSWORD_MAX_LENGTH, PASSWORD_MESSAGES.tooLong)
+  .refine((p) => !isCommonPassword(p), PASSWORD_MESSAGES.common);
+
+// Login: não aplica a política nova, para as contas com palavras-passe antigas (6–20) entrarem.
+// O máximo existe só para o Argon2 não receber entradas gigantes.
+export const LoginPassword = z
+  .string()
+  .min(1, "indica a palavra-passe")
+  .max(PASSWORD_MAX_LENGTH, PASSWORD_MESSAGES.tooLong);
+
+// Confirmação: só tem de coincidir com a nova; a política aplica-se ao campo original.
+const PasswordConfirmation = z
+  .string()
+  .min(1, "confirma a palavra-passe")
+  .max(PASSWORD_MAX_LENGTH, PASSWORD_MESSAGES.tooLong);
 
 export const SecurityAnswer = z.string().min(1).max(100);
 export const NumberAnswer = z.string().regex(/^\d{1,3}$/, "número de 0 a 999");
@@ -26,8 +48,8 @@ export const UserPublic = z.object({
 export const RegisterRequest = z
   .object({
     username: Username,
-    password: Password,
-    passwordConfirmation: Password,
+    password: NewPassword,
+    passwordConfirmation: PasswordConfirmation,
     securityQ1: SecurityAnswer,
     securityQ2: NumberAnswer,
     securityQ3: SecurityAnswer,
@@ -35,6 +57,10 @@ export const RegisterRequest = z
   .refine((d) => d.password === d.passwordConfirmation, {
     message: "as palavras-passe não coincidem",
     path: ["passwordConfirmation"],
+  })
+  .refine((d) => !containsUsername(d.password, d.username), {
+    message: PASSWORD_MESSAGES.containsUsername,
+    path: ["password"],
   });
 export type RegisterRequest = z.infer<typeof RegisterRequest>;
 
@@ -49,7 +75,7 @@ export type RegisterResponse = z.infer<typeof RegisterResponse>;
 
 export const LoginRequest = z.object({
   username: Username,
-  password: Password,
+  password: LoginPassword,
 });
 export type LoginRequest = z.infer<typeof LoginRequest>;
 
@@ -106,8 +132,8 @@ export type RecoverVerifyResponse = z.infer<typeof RecoverVerifyResponse>;
 export const RecoverResetRequest = z
   .object({
     recoverySession: z.string(),
-    newPassword: Password,
-    newPasswordConfirmation: Password,
+    newPassword: NewPassword,
+    newPasswordConfirmation: PasswordConfirmation,
   })
   .refine((d) => d.newPassword === d.newPasswordConfirmation, {
     message: "as palavras-passe não coincidem",

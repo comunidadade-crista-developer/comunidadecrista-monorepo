@@ -3,10 +3,12 @@ import {
   LoginRequest,
   LogoutRequest,
   MeResponse,
+  PASSWORD_MESSAGES,
   RefreshRequest,
   RecoverResetRequest,
   RecoverVerifyRequest,
   RegisterRequest,
+  containsUsername,
 } from "@comunidade/shared";
 import type {
   LoginResponse,
@@ -366,6 +368,15 @@ export async function authRoutes(
       const user = await users.findById(session.sub);
       if (!user)
         return reply.code(401).send({ error: "invalid_recovery_session" });
+
+      // O body não traz o username (vem da sessão), por isso esta regra não está no schema.
+      // Tem de vir ANTES de consumir a sessão: assim o utilizador corrige e tenta de novo.
+      if (containsUsername(request.body.newPassword, user.username)) {
+        return reply.code(400).send({
+          error: "validation_error",
+          fields: { newPassword: PASSWORD_MESSAGES.containsUsername },
+        });
+      }
 
       const newPasswordHash = await password.hashPassword(
         request.body.newPassword,
