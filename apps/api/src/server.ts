@@ -22,7 +22,9 @@ import { createEdgeGuard } from "./net/edge.js";
 import { createRedis, waitUntilReady } from "./redis.js";
 import { authRoutes } from "./routes/auth.js";
 import { cardsRoutes } from "./routes/cards.js";
+import { postsRoutes } from "./routes/posts.js";
 import { createCardsCache } from "./cache/cards-cache.js";
+import { createFeedCache } from "./cache/feed-cache.js";
 import { cardsRepo } from "./repositories/cards.js";
 import { healthRoutes } from "./routes/health.js";
 
@@ -155,6 +157,17 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
         logger: app.log,
       }),
       limiters,
+    });
+    await app.register(postsRoutes, {
+      env,
+      db: dbBundle.db,
+      jwt,
+      limiters,
+      feedCache: createFeedCache({
+        redis,
+        db: dbBundle.db,
+        logger: app.log,
+      }),
     });
   } else {
     app.log.warn("DATABASE_URL não configurado — rotas de auth e cards desactivadas.");

@@ -1,4 +1,4 @@
-import { and, eq, isNull, lt } from "drizzle-orm";
+import { and, inArray, eq, isNull, lt } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import { refreshTokens, users } from "../db/schema.js";
 import type {
@@ -23,6 +23,11 @@ export function usersRepo(db: Database) {
         .where(and(eq(users.id, id), isNull(users.deletedAt)))
         .limit(1);
       return row ?? null;
+    },
+
+    async findManyByIds(ids: string[]): Promise<User[]> {
+      if (ids.length === 0) return [];
+      return db.select().from(users).where(inArray(users.id, ids));
     },
 
     async findByUsername(username: string): Promise<User | null> {

@@ -18,6 +18,11 @@ export interface RateLimiters {
   checkLogin(ip: string, username: string): Promise<RateLimitResult>;
   loginSucceeded(ip: string, username: string): Promise<void>;
   checkRegister(ip: string): Promise<RateLimitResult>;
+  checkReadFeed(ip: string): Promise<RateLimitResult>;        // 60/min
+  // checkPostsCreate(userId: string): Promise<RateLimitResult>; // 10/h
+  // checkPostsDelete(userId: string): Promise<RateLimitResult>; // 30/h
+  // checkLikes(userId: string): Promise<RateLimitResult>;       // 120/h
+  // checkReports(userId: string): Promise<RateLimitResult>;     // 10/h
   checkRecover(
     ip: string,
     username: string,
@@ -194,5 +199,10 @@ export function createRateLimiters(
       ]);
     },
     checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
+    checkReadFeed: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
+  // checkPostsCreate: (userId: string): Promise<RateLimitResult>; // 10/h
+  // checkPostsDelete(userId: string): Promise<RateLimitResult>; // 30/h
+  // checkLikes(userId: string): Promise<RateLimitResult>;       // 120/h
+  // checkReports(userId: string): Promise<RateLimitResult>; 
   };
 }   
