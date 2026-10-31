@@ -1,5 +1,9 @@
 import { z } from "zod";
 import {
+  RESERVED_USERNAME_MESSAGE,
+  isReservedUsername,
+} from "./reserved-usernames.js";
+import {
   PASSWORD_MAX_LENGTH,
   PASSWORD_MESSAGES,
   PASSWORD_MIN_LENGTH,
@@ -16,21 +20,22 @@ export const Username = z
     "apenas letras, números, ponto, underscore e hífen",
   );
 
-// Palavra-passe NOVA (registo, recuperação): ver password-policy.ts.
+export const NewUsername = Username.refine(
+  (u) => !isReservedUsername(u),
+  RESERVED_USERNAME_MESSAGE,
+);
+
 export const NewPassword = z
   .string()
   .min(PASSWORD_MIN_LENGTH, PASSWORD_MESSAGES.tooShort)
   .max(PASSWORD_MAX_LENGTH, PASSWORD_MESSAGES.tooLong)
   .refine((p) => !isCommonPassword(p), PASSWORD_MESSAGES.common);
 
-// Login: não aplica a política nova, para as contas com palavras-passe antigas (6–20) entrarem.
-// O máximo existe só para o Argon2 não receber entradas gigantes.
 export const LoginPassword = z
   .string()
   .min(1, "indica a palavra-passe")
   .max(PASSWORD_MAX_LENGTH, PASSWORD_MESSAGES.tooLong);
 
-// Confirmação: só tem de coincidir com a nova; a política aplica-se ao campo original.
 const PasswordConfirmation = z
   .string()
   .min(1, "confirma a palavra-passe")
@@ -47,7 +52,7 @@ export const UserPublic = z.object({
 
 export const RegisterRequest = z
   .object({
-    username: Username,
+    username: NewUsername,
     password: NewPassword,
     passwordConfirmation: PasswordConfirmation,
     securityQ1: SecurityAnswer,
@@ -83,12 +88,10 @@ export const LoginResponse = z.object({
   user: UserPublic,
   accessToken: z.string(),
   refreshToken: z.string(),
-  // Alguém pediu recuperação por perguntas e o pedido foi cancelado por este login.
   pendingRecoveryCancelled: z.boolean().optional(),
   // Só no 1.º login depois de uma recuperação por perguntas ter produzido efeito.
   recoveryCode: z.string().optional(),
   recoveryCodeWarning: z.string().optional(),
-  // A conta estava em apagamento e este login reactivou-a.
   accountRestored: z.boolean().optional(),
 });
 export type LoginResponse = z.infer<typeof LoginResponse>;
