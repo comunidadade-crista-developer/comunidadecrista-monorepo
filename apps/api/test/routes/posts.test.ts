@@ -213,9 +213,9 @@ describe('POST /posts/:id/report', () => {
     const post = await makePost(author.id);
     const token = await loginToken(user.username, plainPassword);
     await request(app.server).post(`/posts/${post.id}/report`)
-      .set('Authorization', `Bearer ${token}`).send({ reason: 'x' });
+      .set('Authorization', `Bearer ${token}`).send({ reason: 'motivo de teste' });
     const r = await request(app.server).post(`/posts/${post.id}/report`)
-      .set('Authorization', `Bearer ${token}`).send({ reason: 'x' });
+      .set('Authorization', `Bearer ${token}`).send({ reason: 'motivo de teste' });
     expect(r.status).toBe(200);
     expect(r.body.outcome).toBe('duplicate');
   });
@@ -225,7 +225,7 @@ describe('POST /posts/:id/report', () => {
     const post = await makePost(user.id);
     const token = await loginToken(user.username, plainPassword);
     const r = await request(app.server).post(`/posts/${post.id}/report`)
-      .set('Authorization', `Bearer ${token}`).send({ reason: 'x' });
+      .set('Authorization', `Bearer ${token}`).send({ reason: 'motivo de teste' });
     expect(r.status).toBe(400);
     expect(r.body.outcome).toBe('own_post');
   });
@@ -234,7 +234,7 @@ describe('POST /posts/:id/report', () => {
     const { user, plainPassword } = await makeUserWithPassword();
     const token = await loginToken(user.username, plainPassword);
     const r = await request(app.server).post(`/posts/${crypto.randomUUID()}/report`)
-      .set('Authorization', `Bearer ${token}`).send({ reason: 'x' });
+      .set('Authorization', `Bearer ${token}`).send({ reason: 'motivo de teste' });
     expect(r.status).toBe(404);
     expect(r.body.outcome).toBe('post_not_found');
   });

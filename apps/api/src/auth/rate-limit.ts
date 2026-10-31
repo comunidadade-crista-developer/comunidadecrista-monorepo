@@ -18,11 +18,6 @@ export interface RateLimiters {
   checkLogin(ip: string, username: string): Promise<RateLimitResult>;
   loginSucceeded(ip: string, username: string): Promise<void>;
   checkRegister(ip: string): Promise<RateLimitResult>;
-  checkReadFeed(ip: string): Promise<RateLimitResult>;        // 60/min
-  // checkPostsCreate(userId: string): Promise<RateLimitResult>; // 10/h
-  // checkPostsDelete(userId: string): Promise<RateLimitResult>; // 30/h
-  // checkLikes(userId: string): Promise<RateLimitResult>;       // 120/h
-  // checkReports(userId: string): Promise<RateLimitResult>;     // 10/h
   checkRecover(
     ip: string,
     username: string,
@@ -33,7 +28,12 @@ export interface RateLimiters {
     username: string,
     mode: RecoverMode,
   ): Promise<void>;
-  checkCardsPublic(ip: string): Promise<RateLimitResult>; 
+  checkCardsPublic(ip: string): Promise<RateLimitResult>;
+  checkReadFeed(ip: string): Promise<RateLimitResult>;
+  checkPostsCreate(userId: string): Promise<RateLimitResult>;
+  checkPostsDelete(userId: string): Promise<RateLimitResult>;
+  checkLikes(userId: string): Promise<RateLimitResult>;
+  checkReports(userId: string): Promise<RateLimitResult>;
 }
 
 export interface RateLimitLogger {
@@ -121,6 +121,12 @@ export function createRateLimiters(
 
   const cardsPublic = make("rl:cards", 30, 60);
 
+  const readFeed = make("rl:feed:read", 60, 60);        
+  const postsCreate = make("rl:posts:create", 10, 3600); 
+  const postsDelete = make("rl:posts:delete", 30, 3600); 
+  const likes = make("rl:likes", 120, 3600);            
+  const reports = make("rl:reports", 10, 3600);         
+
   const consume = async (
     limiter: RateLimiterAbstract,
     key: string,
@@ -199,10 +205,10 @@ export function createRateLimiters(
       ]);
     },
     checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
-    checkReadFeed: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
-  // checkPostsCreate: (userId: string): Promise<RateLimitResult>; // 10/h
-  // checkPostsDelete(userId: string): Promise<RateLimitResult>; // 30/h
-  // checkLikes(userId: string): Promise<RateLimitResult>;       // 120/h
-  // checkReports(userId: string): Promise<RateLimitResult>; 
+    checkReadFeed: (ip) => consumeAll([[readFeed, anon(ip)]]),
+    checkPostsCreate: (userId) => consumeAll([[postsCreate, anon(userId)]]),
+    checkPostsDelete: (userId) => consumeAll([[postsDelete, anon(userId)]]),
+    checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
+    checkReports: (userId) => consumeAll([[reports, anon(userId)]]),
   };
 }   

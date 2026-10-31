@@ -215,7 +215,7 @@ export async function postsRoutes(
         status: post.status,
       };
 
-      await idem.set(userId, idemKey, 'post.create', response);
+      await idem.set(idemKey, userId, 'post.create', response);
       await feedCache.invalidate();
       await outbox.enqueue({
         aggregateType: 'post',
@@ -343,7 +343,7 @@ export async function postsRoutes(
         body: ReportRequest,
         response: {
           200: ReportResponse,
-          400: ReportResponse,
+          400: z.union([ReportResponse, ErrorResponse]),
           404: ReportResponse,
           429: ErrorResponse,
         },
