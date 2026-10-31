@@ -30,8 +30,6 @@ export async function accountRoutes(
   const users = usersRepo(db);
   const deletion = accountDeletionRepo(db);
 
-  // Pede o apagamento da conta: fica pendente ACCOUNT_DELETION_GRACE_DAYS dias e um login
-  // com a palavra-passe correcta reactiva-a. POST (e não DELETE) porque leva corpo.
   f.post(
     "/users/me/deletion",
     {
@@ -50,8 +48,6 @@ export async function accountRoutes(
       const user = await users.findById(request.user!.id);
       if (!user) return reply.code(401).send({ error: "invalid_token" });
 
-      // Mesmo limite do login: um access token roubado não pode servir para adivinhar a
-      // palavra-passe aqui.
       const rl = await limiters.checkLogin(request.clientIp, user.username);
       if (!rl.allowed) {
         return reply

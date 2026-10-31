@@ -32,23 +32,18 @@ const BaseEnvSchema = z.object({
   // cabeçalho X-Origin-Auth (injectado por uma Transform Rule) e lê o IP em CF-Connecting-IP.
   EDGE_MODE: z.enum(["none", "cloudflare"]).default("none"),
   CF_ORIGIN_SECRET: optionalSecret,
-  // Segredo anterior, aceite durante uma rotação sem downtime.
   CF_ORIGIN_SECRET_PREVIOUS: optionalSecret,
 
-  // Segredo do HMAC que anonimiza IP/username nas chaves do rate limit (Redis).
   IP_HASH_SECRET: optionalSecret,
 
-  // Dias entre o pedido de apagamento e a eliminação definitiva da conta.
   ACCOUNT_DELETION_GRACE_DAYS: z.coerce
     .number()
     .int()
     .min(1)
     .max(365)
     .default(30),
-  // Intervalo da limpeza periódica (purga de dados com prazo e de contas).
   MAINTENANCE_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
 
-  // Pool do Postgres. DB_QUERY_TIMEOUT_MS=0 desactiva o limite do cliente.
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
 
@@ -62,7 +57,6 @@ const BaseEnvSchema = z.object({
   ACCESS_TOKEN_TTL: z.string().default("15m"),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
   RECOVERY_SESSION_TTL: z.string().default("5m"),
-  // Atraso até uma recuperação por perguntas de segurança produzir efeito.
   RECOVERY_QUESTIONS_DELAY_HOURS: z.coerce
     .number()
     .int()
@@ -83,7 +77,6 @@ const BaseEnvSchema = z.object({
     .default(3600),
   RATE_LIMIT_RECOVER_MAX: z.coerce.number().int().positive().default(5),
   RATE_LIMIT_RECOVER_WINDOW_S: z.coerce.number().int().positive().default(3600),
-  // Limites que não dependem de o atacante usar sempre o mesmo IP+utilizador.
   RATE_LIMIT_LOGIN_IP_MAX: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_LOGIN_IP_WINDOW_S: z.coerce.number().int().positive().default(900),
   RATE_LIMIT_LOGIN_ACCOUNT_MAX: z.coerce.number().int().positive().default(20),

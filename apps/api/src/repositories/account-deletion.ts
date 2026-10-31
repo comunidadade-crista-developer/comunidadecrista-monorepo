@@ -18,9 +18,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 export type RequestDeletionResult =
   | { outcome: "requested"; purgeAt: Date }
-  /** Já estava pendente: devolve o prazo original, não muda nada. */
   | { outcome: "already_pending"; purgeAt: Date }
-  /** É o último administrador activo: sem ele a plataforma ficava sem moderação. */
   | { outcome: "last_admin" }
   | { outcome: "not_found" };
 
@@ -32,7 +30,6 @@ export interface PurgeSummary {
   failed: number;
 }
 
-/** Autor a mostrar: nulo quando a conta foi removida ou está em apagamento com «anónimas». */
 export function publicAuthorId(post: {
   authorId: string | null;
   authorHidden: boolean;
@@ -44,13 +41,6 @@ function addDays(date: Date, days: number): Date {
   return new Date(date.getTime() + days * DAY_MS);
 }
 
-/**
- * Apagamento de conta em duas fases (como o Facebook):
- *  1. `request`: a conta fica pendente durante `graceDays`. Sem sessões e sem acesso, mas o
- *     nome de utilizador continua reservado e um login com a palavra-passe correcta
- *     reactiva-a (`restore`). As partilhas ficam anónimas ou ocultas, conforme a escolha.
- *  2. `purgeDue`: passado o prazo, apaga a conta de vez.
- */
 export function accountDeletionRepo(db: Database) {
   return {
     async request(args: {
@@ -124,8 +114,6 @@ export function accountDeletionRepo(db: Database) {
           .where(eq(pendingPasswordResets.userId, args.userId));
 
         if (args.postsMode === "delete") {
-          // Oculta guardando o estado anterior, para a reactivação o repor. Posts que já
-          // estavam ocultos (ex.: por um admin) não se tocam.
           await tx
             .update(posts)
             .set({ suspendedStatus: sql`${posts.status}`, status: "hidden" })
@@ -153,7 +141,6 @@ export function accountDeletionRepo(db: Database) {
       });
     },
 
-    /** Reactiva uma conta pendente (chamado depois de a palavra-passe ser validada). */
     async restore(userId: string): Promise<RestoreResult> {
       return db.transaction(async (tx) => {
         const [row] = await tx
@@ -193,10 +180,6 @@ export function accountDeletionRepo(db: Database) {
       });
     },
 
-    /**
-     * Apaga de vez as contas pendentes há mais de `graceDays`. Uma transacção por conta: se
-     * uma falhar, as outras seguem. Seguro com várias instâncias em simultâneo (SKIP LOCKED).
-     */
     async purgeDue(
       opts: { now?: Date; graceDays?: number; batch?: number } = {},
     ): Promise<PurgeSummary> {
@@ -239,8 +222,6 @@ async function purgeOne(
   cutoff: Date,
 ): Promise<{ postsDeleted: number } | null> {
   return db.transaction(async (tx: Tx) => {
-    // Volta a verificar com a linha bloqueada: se entretanto a conta foi reactivada (ou outra
-    // instância a está a apagar), não se faz nada.
     const [user] = await tx
       .select({ mode: users.deletionPostsMode })
       .from(users)
@@ -255,8 +236,6 @@ async function purgeOne(
       .limit(1);
     if (!user) return null;
 
-    // Os likes e denúncias abertas desta conta desaparecem em cascata: acerta os contadores
-    // das partilhas dos outros ANTES de apagar. (user_id e reporter_id são únicos por post.)
     await tx.execute(sql`
       UPDATE posts p
       SET likes_count = GREATEST(p.likes_count - 1, 0)
@@ -279,8 +258,6 @@ async function purgeOne(
       postsDeleted = removed.length;
     }
 
-    // Cascata: sessões, idempotência, likes, denúncias, pedido de nova palavra-passe.
-    // author_id das partilhas «anónimas» passa a nulo; o log de moderação mantém-se.
     await tx.delete(users).where(eq(users.id, userId));
     return { postsDeleted };
   });

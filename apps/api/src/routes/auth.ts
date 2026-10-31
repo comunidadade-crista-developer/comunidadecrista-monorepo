@@ -192,7 +192,6 @@ export async function authRoutes(
       let accountRestored = false;
       if (user.deletionRequestedAt) {
         const restored = await deletion.restore(user.id);
-        // Apagada de vez entretanto (a purga correu a meio deste pedido).
         if (restored === "gone") {
           return reply.code(401).send({ error: "invalid_credentials" });
         }
@@ -334,8 +333,6 @@ export async function authRoutes(
       const user = await users.findByUsername(body.username);
       const sentinel = await password.getSentinelHash();
 
-      // Trabalho constante: com ou sem utilizador (ou sem código guardado) fazem-se sempre
-      // as mesmas verificações argon2, contra a sentinela quando não há hash real.
       let ok: boolean;
       if (body.mode === "code") {
         ok = await recovery.verifyCode(
@@ -385,8 +382,6 @@ export async function authRoutes(
       if (!user)
         return reply.code(401).send({ error: "invalid_recovery_session" });
 
-      // O body não traz o username (vem da sessão), por isso esta regra não está no schema.
-      // Tem de vir ANTES de consumir a sessão: assim o utilizador corrige e tenta de novo.
       if (containsUsername(request.body.newPassword, user.username)) {
         return reply.code(400).send({
           error: "validation_error",
@@ -400,7 +395,6 @@ export async function authRoutes(
       const consumed = { jti: session.jti, expiresAt: session.expiresAt };
 
       if (session.method === "code") {
-        // Prova forte (código de 80 bits): efeito imediato, uma só transacção.
         const newCode = recovery.generate();
         const outcome = await resets.completeResetWithCode({
           session: consumed,
@@ -419,9 +413,6 @@ export async function authRoutes(
         return reply.code(200).send(response);
       }
 
-      // Prova fraca (perguntas): nada muda já. A nova palavra-passe fica pendente durante
-      // RECOVERY_QUESTIONS_DELAY_HOURS e não se emite código novo (senão o código dava a
-      // volta ao atraso). Se o dono entrar entretanto com a palavra-passe actual, é cancelado.
       const effectiveAt = new Date(
         Date.now() + env.RECOVERY_QUESTIONS_DELAY_HOURS * 60 * 60 * 1000,
       );

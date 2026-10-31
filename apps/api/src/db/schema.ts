@@ -177,7 +177,6 @@ export const posts = pgTable(
   "posts",
   {
     id: id(),
-    // Nulo = autor removido (purga da conta após 30 dias): a partilha fica anónima.
     authorId: uuid("author_id").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -253,8 +252,6 @@ export const moderationLog = pgTable(
   "moderation_log",
   {
     id: id(),
-    // A auditoria não pode desaparecer com a partilha nem com o moderador:
-    // ficam a nulo.
     postId: uuid("post_id").references(() => posts.id, {
       onDelete: "set null",
     }),
@@ -301,8 +298,6 @@ export const idempotencyKeys = pgTable(
     createdAt: createdAt(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   },
-  // A chave vem do cliente: só é única dentro de cada utilizador (senão um
-  // utilizador podia ler ou bloquear as operações de outro).
   (t) => [
     primaryKey({ columns: [t.userId, t.key] }),
     index("idempotency_keys_expires_idx").on(t.expiresAt),
