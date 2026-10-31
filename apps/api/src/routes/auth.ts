@@ -29,6 +29,7 @@ import { generateRefreshToken, hashRefreshToken } from "../auth/refresh.js";
 import type { RecoveryService } from "../auth/recovery.js";
 import type { Database } from "../db/client.js";
 import type { Env } from "../env.js";
+import { accountDeletionRepo } from "../repositories/account-deletion.js";
 import { recoveryRepo } from "../repositories/recovery.js";
 import { refreshTokensRepo, usersRepo } from "../repositories/users.js";
 
@@ -53,6 +54,7 @@ export async function authRoutes(
   const users = usersRepo(db);
   const tokens = refreshTokensRepo(db);
   const resets = recoveryRepo(db);
+  const deletion = accountDeletionRepo(db);
 
   const refreshTtlMs = env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 
@@ -186,6 +188,17 @@ export async function authRoutes(
         newRecoveryCode = code.formatted;
       }
 
+      // Conta em apagamento: a palavra-passe está validada, por isso este login reactiva-a.
+      let accountRestored = false;
+      if (user.deletionRequestedAt) {
+        const restored = await deletion.restore(user.id);
+        // Apagada de vez entretanto (a purga correu a meio deste pedido).
+        if (restored === "gone") {
+          return reply.code(401).send({ error: "invalid_credentials" });
+        }
+        accountRestored = restored === "restored";
+      }
+
       await limiters.loginSucceeded(request.clientIp, body.username);
 
       const familyId = uuidv7();
@@ -208,6 +221,7 @@ export async function authRoutes(
         accessToken,
         refreshToken,
         ...(pendingRecoveryCancelled ? { pendingRecoveryCancelled: true } : {}),
+        ...(accountRestored ? { accountRestored: true } : {}),
         ...(newRecoveryCode
           ? {
               recoveryCode: newRecoveryCode,
@@ -247,7 +261,7 @@ export async function authRoutes(
       }
 
       const user = await users.findById(result.userId);
-      if (!user || user.deletedAt) {
+      if (!user || user.deletedAt || user.deletionRequestedAt) {
         return reply.code(401).send({ error: "invalid_refresh" });
       }
 
@@ -285,7 +299,9 @@ export async function authRoutes(
     },
     async (request, reply) => {
       const user = await users.findById(request.user!.id);
-      if (!user) return reply.code(401).send({ error: "invalid_token" });
+      if (!user || user.deletionRequestedAt) {
+        return reply.code(401).send({ error: "invalid_token" });
+      }
       const response: MeResponse = {
         user: {
           id: user.id,

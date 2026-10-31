@@ -19,12 +19,14 @@ import { createRecoveryService } from "./auth/recovery.js";
 import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
 import { errorHandler, notFoundHandler } from "./http-errors.js";
+import { startMaintenance } from "./maintenance.js";
 import { createEdgeGuard } from "./net/edge.js";
 import {
   attachRedisErrorLogging,
   createRedis,
   waitUntilReady,
 } from "./redis.js";
+import { accountRoutes } from "./routes/account.js";
 import { authRoutes } from "./routes/auth.js";
 import { healthRoutes } from "./routes/health.js";
 
@@ -167,6 +169,24 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       jwt,
       limiters,
     });
+    await app.register(accountRoutes, {
+      env,
+      db: dbBundle.db,
+      password,
+      jwt,
+      limiters,
+    });
+
+    // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
+    // corre-se `runMaintenance` à mão.
+    if (env.NODE_ENV !== "test") {
+      const stopMaintenance = startMaintenance({
+        db: dbBundle.db,
+        env,
+        log: app.log,
+      });
+      app.addHook("onClose", async () => stopMaintenance());
+    }
   } else {
     app.log.warn("DATABASE_URL não configurado — rotas de auth desactivadas.");
   }

@@ -109,13 +109,11 @@ describe("política de palavras-passe — rotas", () => {
     expect(rejected.body.fields.newPassword).toContain("nome de utilizador");
 
     const good = "Cavalo-azul-bateria-77";
-    const ok = await request(app.server)
-      .post("/auth/recover/reset")
-      .send({
-        recoverySession,
-        newPassword: good,
-        newPasswordConfirmation: good,
-      });
+    const ok = await request(app.server).post("/auth/recover/reset").send({
+      recoverySession,
+      newPassword: good,
+      newPasswordConfirmation: good,
+    });
     expect(ok.status).toBe(200);
     expect(ok.body.status).toBe("completed");
     expect((await login(app, user.username, good)).status).toBe(200);

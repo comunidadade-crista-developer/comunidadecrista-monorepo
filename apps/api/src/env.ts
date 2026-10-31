@@ -38,6 +38,16 @@ const BaseEnvSchema = z.object({
   // Segredo do HMAC que anonimiza IP/username nas chaves do rate limit (Redis).
   IP_HASH_SECRET: optionalSecret,
 
+  // Dias entre o pedido de apagamento e a eliminação definitiva da conta.
+  ACCOUNT_DELETION_GRACE_DAYS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .default(30),
+  // Intervalo da limpeza periódica (purga de dados com prazo e de contas).
+  MAINTENANCE_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
+
   // Pool do Postgres. DB_QUERY_TIMEOUT_MS=0 desactiva o limite do cliente.
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),

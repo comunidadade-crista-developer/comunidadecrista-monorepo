@@ -32,7 +32,8 @@ export function requireAdmin(db: Database): preHandlerAsyncHookHandler {
     }
     // Revalida na DB: protege contra JWT antigo / utilizador despromovido
     const user = await usersRepo(db).findById(request.user.id);
-    if (!user || user.role !== "admin") {
+    // Conta em apagamento também perde o acesso (o JWT pode ainda não ter expirado).
+    if (!user || user.deletionRequestedAt || user.role !== "admin") {
       return reply.code(403).send({ error: "forbidden" });
     }
   };
