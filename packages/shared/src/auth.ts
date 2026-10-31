@@ -144,8 +144,6 @@ export const RecoverResetRequest = z
 export type RecoverResetRequest = z.infer<typeof RecoverResetRequest>;
 
 export const RecoverResetResponse = z.object({
-  // 'completed': palavra-passe mudada já (via código). 'pending': só produz efeito em effectiveAt
-  // (via perguntas) e não é emitido código novo.
   status: z.enum(["completed", "pending"]),
   recoveryCode: z.string().optional(),
   recoveryCodeWarning: z.string().optional(),
@@ -156,7 +154,6 @@ export type RecoverResetResponse = z.infer<typeof RecoverResetResponse>;
 export const DeletionPostsMode = z.enum(["anonymize", "delete"]);
 export type DeletionPostsMode = z.infer<typeof DeletionPostsMode>;
 
-// A palavra-passe confirma que é mesmo o dono (um access token roubado não chega).
 export const DeleteAccountRequest = z.object({
   password: LoginPassword,
   postsMode: DeletionPostsMode,
@@ -165,14 +162,10 @@ export type DeleteAccountRequest = z.infer<typeof DeleteAccountRequest>;
 
 export const DeleteAccountResponse = z.object({
   status: z.literal("pending_deletion"),
-  // Até esta data um login reactiva a conta; depois é apagada de vez.
   purgeAt: z.iso.datetime(),
 });
 export type DeleteAccountResponse = z.infer<typeof DeleteAccountResponse>;
 
-// Formato único de erro da API: `error` é um código estável (snake_case) para o cliente
-// reagir; `fields` só existe em erros de validação (campo → mensagem); `message` é opcional
-// e nunca leva detalhes internos.
 export const ErrorResponse = z.object({
   error: z.string(),
   message: z.string().optional(),
