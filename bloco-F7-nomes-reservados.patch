@@ -1,0 +1,338 @@
+diff --git a/apps/api/test/routes/register.reserved.test.ts b/apps/api/test/routes/register.reserved.test.ts
+new file mode 100644
+index 0000000..295d59b
+--- /dev/null
++++ b/apps/api/test/routes/register.reserved.test.ts
+@@ -0,0 +1,73 @@
++import { eq } from "drizzle-orm";
++import request from "supertest";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { users } from "../../src/db/schema.js";
++import { loadEnv } from "../../src/env.js";
++import { buildServer } from "../../src/server.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++
++const env = loadEnv({ NODE_ENV: "test", LOG_LEVEL: "fatal", APP_VERSION: "test" });
++
++type App = Awaited<ReturnType<typeof buildServer>>;
++
++function registerBody(username: string) {
++  return {
++    username,
++    password: "uma-frase-passe-longa-42",
++    passwordConfirmation: "uma-frase-passe-longa-42",
++    securityQ1: "azul",
++    securityQ2: "7",
++    securityQ3: "igreja central",
++  };
++}
++
++describe("POST /auth/register — nomes reservados", () => {
++  let app: App;
++  beforeAll(async () => {
++    await getTestDb();
++    app = await buildServer({ env });
++    await app.ready();
++  });
++  afterAll(async () => {
++    await app.close();
++    await closeTestDb();
++  });
++  beforeEach(async () => {
++    await truncateAll();
++  });
++
++  it.each(["admin", "Moderador", "4dm1n", "suporte-oficial", "removido"])(
++    "recusa %s com 400 e não cria conta",
++    async (name) => {
++      const res = await request(app.server)
++        .post("/auth/register")
++        .send(registerBody(name));
++      expect(res.status).toBe(400);
++      expect(res.body.error).toBe("validation_error");
++      expect(res.body.fields.username).toBe(
++        "este nome de utilizador não está disponível",
++      );
++      const db = await getTestDb();
++      const rows = await db.select().from(users).where(eq(users.username, name));
++      expect(rows).toHaveLength(0);
++    },
++  );
++
++  it("aceita um nome normal", async () => {
++    const res = await request(app.server)
++      .post("/auth/register")
++      .send(registerBody("ana_maria"));
++    expect(res.status).toBe(201);
++  });
++
++  it("o login de uma conta antiga com nome reservado continua a funcionar", async () => {
++    const { makeUserWithPassword } = await import("../helpers/factories.js");
++    const { user, plainPassword } = await makeUserWithPassword({
++      username: "admin",
++    });
++    const res = await request(app.server)
++      .post("/auth/login")
++      .send({ username: user.username, password: plainPassword });
++    expect(res.status).toBe(200);
++  });
++});
+diff --git a/apps/api/test/shared/reserved-usernames.test.ts b/apps/api/test/shared/reserved-usernames.test.ts
+new file mode 100644
+index 0000000..84e2122
+--- /dev/null
++++ b/apps/api/test/shared/reserved-usernames.test.ts
+@@ -0,0 +1,82 @@
++import { isReservedUsername, NewUsername, Username } from "@comunidade/shared";
++import { describe, expect, it } from "vitest";
++
++describe("isReservedUsername", () => {
++  const reserved = [
++    "admin",
++    "Admin",
++    "ADMIN",
++    "ad.min",
++    "a_d-m_i-n",
++    "4dm1n",
++    "adm1n",
++    "admin2024",
++    "2admin",
++    "admin-oficial",
++    "theadmin",
++    "admin-team",
++    "moderador",
++    "Moderador123",
++    "m0d3r4d0r",
++    "suporte",
++    "Suporte_Oficial",
++    "support",
++    "r00t",
++    "removido",
++    "comunidade-crista",
++    "gekko.dreamers",
++    "mod",
++    "m0d",
++  ];
++  it.each(reserved)("recusa %s", (name) => {
++    expect(isReservedUsername(name)).toBe(true);
++  });
++
++  const allowed = [
++    "ana",
++    "joao_silva",
++    "maria.admin.x",
++    "badminton",
++    "admiral",
++    "adminton",
++    "modesto",
++    "moderno",
++    "helpful",
++    "sistemas",
++    "teamo",
++    "bota",
++    "dome",
++    "dame",
++    "dono-da-casa",
++    "themeu",
++    "teammod",
++    "realsuporte",
++    "pedro123",
++    "comunidade_viva",
++  ];
++  it.each(allowed)("aceita %s (não procura dentro de outras palavras)", (name) => {
++    expect(isReservedUsername(name)).toBe(false);
++  });
++});
++
++describe("schemas de username", () => {
++  it("NewUsername (registo) recusa reservados com mensagem genérica", () => {
++    const res = NewUsername.safeParse("Admin");
++    expect(res.success).toBe(false);
++    if (!res.success) {
++      expect(res.error.issues[0]?.message).toBe(
++        "este nome de utilizador não está disponível",
++      );
++    }
++  });
++
++  it("NewUsername continua a validar o formato", () => {
++    expect(NewUsername.safeParse("ab").success).toBe(false);
++    expect(NewUsername.safeParse("com espaço").success).toBe(false);
++    expect(NewUsername.safeParse("ana_maria").success).toBe(true);
++  });
++
++  it("Username (login/recuperação) NÃO aplica a reserva: contas antigas entram", () => {
++    expect(Username.safeParse("admin").success).toBe(true);
++  });
++});
+diff --git a/packages/shared/src/auth.ts b/packages/shared/src/auth.ts
+index d6e774b..9335e26 100644
+--- a/packages/shared/src/auth.ts
++++ b/packages/shared/src/auth.ts
+@@ -1,4 +1,8 @@
+ import { z } from "zod";
++import {
++  RESERVED_USERNAME_MESSAGE,
++  isReservedUsername,
++} from "./reserved-usernames.js";
+ import {
+   PASSWORD_MAX_LENGTH,
+   PASSWORD_MESSAGES,
+@@ -16,6 +20,13 @@ export const Username = z
+     "apenas letras, números, ponto, underscore e hífen",
+   );
+ 
++// Username para CRIAR contas (registo): além do formato, recusa os nomes reservados.
++// Login e recuperação usam `Username` sem esta regra (contas antigas continuam a entrar).
++export const NewUsername = Username.refine(
++  (u) => !isReservedUsername(u),
++  RESERVED_USERNAME_MESSAGE,
++);
++
+ // Palavra-passe NOVA (registo, recuperação): ver password-policy.ts.
+ export const NewPassword = z
+   .string()
+@@ -47,7 +58,7 @@ export const UserPublic = z.object({
+ 
+ export const RegisterRequest = z
+   .object({
+-    username: Username,
++    username: NewUsername,
+     password: NewPassword,
+     passwordConfirmation: PasswordConfirmation,
+     securityQ1: SecurityAnswer,
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 01bdf2e..915a43a 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ export * from "./auth.js";
+ export * from "./password-policy.js";
++export * from "./reserved-usernames.js";
+ 
+ export const APP_NAME = "Comunidade Cristã" as const;
+ export const APP_AUTHOR = "Gekko Dreamers" as const;
+diff --git a/packages/shared/src/reserved-usernames.ts b/packages/shared/src/reserved-usernames.ts
+new file mode 100644
+index 0000000..803b0ff
+--- /dev/null
++++ b/packages/shared/src/reserved-usernames.ts
+@@ -0,0 +1,117 @@
++/**
++ * Nomes de utilizador reservados (registo e futura alteração de username).
++ * Impedem a personificação da equipa («admin», «moderador», «suporte»...) e colisões com
++ * textos do sistema («removido»). O login NÃO aplica esta regra: contas existentes com estes
++ * nomes (por exemplo um administrador criado à mão) continuam a entrar.
++ *
++ * A comparação é feita sobre uma forma normalizada, não sobre o texto literal, para apanhar
++ * variantes como «Admin», «ad.min», «a_d-m_i-n», «4dm1n», «admin2024», «admin-oficial».
++ * Nunca se procura a palavra DENTRO de outra («badminton», «admiral» e «modesto» passam).
++ */
++
++// Minúsculas, sem acentos, sem separadores. Aumenta-se por PR.
++const RESERVED: ReadonlySet<string> = new Set([
++  // Equipa e papéis
++  "admin", "adm", "administrador", "administradora", "administrator", "administracao",
++  "sysadmin", "superadmin", "superuser", "root", "owner", "dono",
++  "moderador", "moderadora", "moderator", "mod", "mods", "moderacao", "moderation",
++  "suporte", "support", "helpdesk", "ajuda", "help", "staff", "equipa", "team",
++  "oficial", "official", "sistema", "system", "bot",
++  // Contacto e infra-estrutura habitual
++  "contacto", "contato", "contact", "info", "security", "seguranca", "abuse", "postmaster",
++  "webmaster", "hostmaster", "noreply", "naoresponder", "api", "www", "app", "login",
++  "logout", "register", "registo", "auth", "me", "eu",
++  // Valores que confundem código, interface ou outros utilizadores
++  "null", "undefined", "none", "nan", "anonymous", "anonimo", "anonima", "removido",
++  "removida", "apagado", "apagada", "deleted", "removed", "unknown", "desconhecido",
++  // Marca
++  "comunidade", "comunidadecrista", "comunidadecristao", "gekkodreamers",
++]);
++
++// Prefixos/sufixos que não mudam a quem o nome «se parece»: «admin-oficial», «theadmin».
++const AFFIXES: readonly string[] = [
++  "oficial", "official", "the", "real", "equipa", "team", "app",
++];
++
++// Com afixo só contam as palavras reservadas com 5+ letras: evita que «dome» ou «teamo»
++// caiam por causa de «me»/«mo» e mantém «theadmin», «suporte-oficial», «moderador.team».
++const MIN_RESERVED_LENGTH_WITH_AFFIX = 5;
++
++// «Leetspeak» (4dm1n). O «1» é ambíguo (i ou l), por isso gera-se uma variante para cada.
++const LEET: Readonly<Record<string, string>> = {
++  "0": "o",
++  "3": "e",
++  "4": "a",
++  "5": "s",
++  "7": "t",
++  "8": "b",
++};
++
++function stripAccents(value: string): string {
++  return value.normalize("NFKD").replace(/[̀-ͯ]/g, "");
++}
++
++/** Só letras e dígitos, minúsculas (remove `.`, `_` e `-`). */
++function squash(value: string): string {
++  return stripAccents(value)
++    .toLowerCase()
++    .replace(/[^a-z0-9]/g, "");
++}
++
++function stripEdgeDigits(value: string): string {
++  return value.replace(/^\d+/, "").replace(/\d+$/, "");
++}
++
++function leet(value: string, one: "i" | "l"): string {
++  let out = "";
++  for (const ch of value) {
++    out += ch === "1" ? one : (LEET[ch] ?? ch);
++  }
++  return out;
++}
++
++function candidates(username: string): Set<string> {
++  const base = squash(username);
++  const forms = [
++    base,
++    leet(base, "i"),
++    leet(base, "l"),
++  ];
++  const out = new Set<string>();
++  for (const form of forms) {
++    // Com dígitos nas pontas («admin2024») e sem eles («4dm1n» já foi convertido acima).
++    out.add(form);
++    out.add(stripEdgeDigits(form));
++  }
++  out.delete("");
++  return out;
++}
++
++function matchesReserved(form: string): boolean {
++  if (RESERVED.has(form)) return true;
++  const isReservedWithAffix = (rest: string): boolean => {
++    const core = stripEdgeDigits(rest);
++    return core.length >= MIN_RESERVED_LENGTH_WITH_AFFIX && RESERVED.has(core);
++  };
++  for (const affix of AFFIXES) {
++    if (form.length > affix.length && form.startsWith(affix)) {
++      if (isReservedWithAffix(form.slice(affix.length))) return true;
++    }
++    if (form.length > affix.length && form.endsWith(affix)) {
++      if (isReservedWithAffix(form.slice(0, -affix.length))) return true;
++    }
++  }
++  return false;
++}
++
++/** `true` se o nome (ou uma variante óbvia dele) está reservado. */
++export function isReservedUsername(username: string): boolean {
++  for (const form of candidates(username)) {
++    if (matchesReserved(form)) return true;
++  }
++  return false;
++}
++
++// Mensagem genérica de propósito: não revela a lista nem porque é que foi recusado.
++export const RESERVED_USERNAME_MESSAGE =
++  "este nome de utilizador não está disponível";

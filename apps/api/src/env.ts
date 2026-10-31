@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
 
-// Aceita boolean (overrides em testes) e string ('true' / 'false') vinda de process.env.
 const booleanFromEnv = z
   .union([z.string(), z.boolean()])
   .optional()
@@ -10,6 +9,12 @@ const booleanFromEnv = z
 const optionalSecret = z.preprocess(
   (v) => (v === "" ? undefined : v),
   z.string().min(32, "tem de ter pelo menos 32 caracteres").optional(),
+);
+
+// '' no .env conta como ausente (ex.: JWT_PUBLIC_JWK_PREVIOUS= fora de uma rotação).
+const optionalString = z.preprocess(
+  (v) => (v === "" ? undefined : v),
+  z.string().optional(),
 );
 
 const BaseEnvSchema = z.object({
@@ -52,6 +57,7 @@ const BaseEnvSchema = z.object({
 
   JWT_PRIVATE_JWK: z.string().optional(),
   JWT_PUBLIC_JWK: z.string().optional(),
+  JWT_PUBLIC_JWK_PREVIOUS: optionalString,
   JWT_ISSUER: z.string().default("comunidade-crista"),
   JWT_AUDIENCE: z.string().default("comunidade-crista-api"),
   ACCESS_TOKEN_TTL: z.string().default("15m"),

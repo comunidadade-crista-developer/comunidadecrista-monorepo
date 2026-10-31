@@ -14,6 +14,8 @@
 3. Build command: `pnpm install --frozen-lockfile && pnpm --filter @comunidade/api build`
 4. Start command: `node apps/api/dist/index.js`
 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
+   Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
+   Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
 6. Plano: Free.
 
 ### Frontend (Cloudflare Pages)
@@ -30,15 +32,43 @@
 3. Janela activa: **06:00–23:00** (timezone Europe/Lisbon).
 4. Não usar `/health/deep` (acordaria Neon e Upstash desnecessariamente).
 
-## Rotação de chaves JWT (E2)
+## Rotação de chaves JWT
 
-Documentar aqui quando implementado.
+Os tokens levam `kid` (thumbprint da chave pública). A API assina com a chave actual e verifica com a
+actual e, durante a rotação, também com `JWT_PUBLIC_JWK_PREVIOUS` (só a parte **pública** da chave antiga).
+Tempo de vida máximo dos tokens: access 15 min, sessão de recuperação 5 min. Os refresh tokens são opacos
+(não dependem da chave).
+
+### Rotação normal (planeada, sem downtime)
+
+1. Gerar um par novo: `pnpm --filter @comunidade/api generate-jwt-keys`.
+2. Guardar a pública da chave **actual** (`JWT_PUBLIC_JWK` de hoje) para a usar como anterior.
+3. Render → Environment:
+   - `JWT_PUBLIC_JWK_PREVIOUS=<pública antiga>`
+   - `JWT_PRIVATE_JWK` e `JWT_PUBLIC_JWK` = par novo
+     e fazer redeploy. No arranque a API recusa chaves incoerentes (par que não corresponde, pública com
+     parte privada, anterior igual à actual): ver os logs de arranque se o deploy falhar.
+4. Verificar: login funciona e uma sessão aberta antes do deploy continua válida.
+5. Passados **mais de 15 minutos**, remover `JWT_PUBLIC_JWK_PREVIOUS` e fazer redeploy.
+6. Apagar a chave privada antiga de onde estiver guardada.
+
+### Compromisso da chave privada (emergência)
+
+Igual, mas **sem** `JWT_PUBLIC_JWK_PREVIOUS`: todos os access tokens e sessões de recuperação antigos
+ficam inválidos de imediato. Os clientes renovam a sessão pelo refresh token; se também houver suspeita
+de roubo de refresh tokens, revogar todas as sessões na base de dados (`refresh_tokens.revoked_at`).
+Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprometida.
+
+### Boas práticas
+
+- Rodar as chaves de forma planeada (por exemplo, uma vez por ano) para manter o procedimento ensaiado.
+- Nunca colocar a chave privada no repositório, em logs, tickets ou chats.
 
 ## Incidentes
 
 - **API fora**: verificar dashboard Render; ver logs; confirmar Neon e Upstash operacionais.
 - **Cold start prolongado**: verificar cron-job.org; confirmar que `/health` responde em < 1s quando acordado.
-- **Rate limit a disparar em produção**: confirmar Upstash `@upstash/ratelimit` (E2).
+- **Rate limit a disparar em produção**: confirmar o Redis (Upstash) acessível; sem Redis o limite aplica-se em memória, por instância.
 
 ## IP do cliente, proxy e Cloudflare
 
