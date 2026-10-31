@@ -88,6 +88,8 @@ export const LoginResponse = z.object({
   // Só no 1.º login depois de uma recuperação por perguntas ter produzido efeito.
   recoveryCode: z.string().optional(),
   recoveryCodeWarning: z.string().optional(),
+  // A conta estava em apagamento e este login reactivou-a.
+  accountRestored: z.boolean().optional(),
 });
 export type LoginResponse = z.infer<typeof LoginResponse>;
 
@@ -150,6 +152,23 @@ export const RecoverResetResponse = z.object({
   effectiveAt: z.iso.datetime().optional(),
 });
 export type RecoverResetResponse = z.infer<typeof RecoverResetResponse>;
+
+export const DeletionPostsMode = z.enum(["anonymize", "delete"]);
+export type DeletionPostsMode = z.infer<typeof DeletionPostsMode>;
+
+// A palavra-passe confirma que é mesmo o dono (um access token roubado não chega).
+export const DeleteAccountRequest = z.object({
+  password: LoginPassword,
+  postsMode: DeletionPostsMode,
+});
+export type DeleteAccountRequest = z.infer<typeof DeleteAccountRequest>;
+
+export const DeleteAccountResponse = z.object({
+  status: z.literal("pending_deletion"),
+  // Até esta data um login reactiva a conta; depois é apagada de vez.
+  purgeAt: z.iso.datetime(),
+});
+export type DeleteAccountResponse = z.infer<typeof DeleteAccountResponse>;
 
 // Formato único de erro da API: `error` é um código estável (snake_case) para o cliente
 // reagir; `fields` só existe em erros de validação (campo → mensagem); `message` é opcional

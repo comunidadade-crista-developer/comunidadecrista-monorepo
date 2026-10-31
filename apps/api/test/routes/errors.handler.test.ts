@@ -100,7 +100,7 @@ describe("formato único de erro", () => {
     }
   });
 
-   it("JSON inválido → 400 bad_request", async () => {
+  it("JSON inválido → 400 bad_request", async () => {
     const app = await makeApp();
     try {
       const res = await request(app.server)

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   customType,
   index,
   integer,
@@ -42,6 +43,11 @@ export const postStatusEnum = pgEnum("post_status", [
   "hidden",
   "rejected",
 ]);
+// O que fazer às partilhas quando a conta é apagada (escolha do utilizador).
+export const deletionPostsModeEnum = pgEnum("deletion_posts_mode", [
+  "anonymize",
+  "delete",
+]);
 export const postCategoryEnum = pgEnum("post_category", [
   "entendimento",
   "ensinamento",
@@ -79,10 +85,18 @@ export const users = pgTable(
     updatedAt: updatedAt(),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    // Pedido de apagamento: a conta fica «pendente» (sem sessões, sem acesso) e um login com
+    // a palavra-passe correcta nos 30 dias seguintes reactiva-a. Passado o prazo, um job
+    // apaga-a de vez. Nulo = conta activa.
+    deletionRequestedAt: timestamp("deletion_requested_at", {
+      withTimezone: true,
+    }),
+    deletionPostsMode: deletionPostsModeEnum("deletion_posts_mode"),
   },
   (t) => [
     uniqueIndex("users_username_unique").on(t.username),
     index("users_role_idx").on(t.role),
+    index("users_deletion_requested_idx").on(t.deletionRequestedAt),
   ],
 );
 
@@ -176,6 +190,12 @@ export const posts = pgTable(
     status: postStatusEnum("status").notNull().default("published"),
     likesCount: integer("likes_count").notNull().default(0),
     reportsCount: integer("reports_count").notNull().default(0),
+    // Conta em apagamento com «manter anónimas»: a partilha continua visível mas sem autor.
+    // Volta a falso se a conta for reactivada.
+    authorHidden: boolean("author_hidden").notNull().default(false),
+    // Conta em apagamento com «apagar partilhas»: guarda o estado anterior enquanto o post
+    // fica oculto (status = hidden). Nulo = o post não foi ocultado por esta razão.
+    suspendedStatus: postStatusEnum("suspended_status"),
     createdAt: createdAt(),
     publishedAt: timestamp("published_at", { withTimezone: true }),
   },
