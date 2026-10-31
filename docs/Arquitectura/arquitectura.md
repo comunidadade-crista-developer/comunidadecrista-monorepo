@@ -138,7 +138,16 @@ O admin vive na mesma app (`apps/web`), em rotas `/admin/*`, carregadas por `Rea
 
 **Contexto**: offline-first com privacidade.
 **Decisão**: access token EdDSA (15 min); refresh rotativo (30 dias, one-time use, deteção de reuso → revogar família); passwords e respostas de segurança hasheadas com argon2id (params OWASP: m=19456 KiB, t=2, p=1).
-**Consequências**: chaves Ed25519 geradas no deploy (env vars); necessidade de rotação documentada no runbook.
+**Rotação de chaves**: cada token leva `kid` no cabeçalho = _thumbprint_ RFC 7638 da chave pública Ed25519
+(derivado, não guardado). A API assina com a chave actual (`JWT_PRIVATE_JWK`/`JWT_PUBLIC_JWK`) e verifica com a
+actual **e**, opcionalmente, com a anterior (`JWT_PUBLIC_JWK_PREVIOUS`, só pública), até os tokens antigos
+expirarem (access 15 min, recuperação 5 min). Regras: algoritmo fixo `EdDSA`; `kid` desconhecido é recusado; a
+assinatura é sempre verificada (um `kid` forjado não dá acesso); tokens sem `kid` (anteriores a esta mudança)
+tentam as chaves configuradas. No arranque valida-se que as chaves são Ed25519, que a privada tem `d`, que as
+públicas não têm `d`, que o par corresponde e que a anterior difere da actual. Refresh tokens são opacos (não
+dependem da chave): numa rotação os utilizadores renovam a sessão sem voltar a autenticar-se.
+**Consequências**: chaves Ed25519 geradas no deploy (env vars); procedimento de rotação (normal e por
+compromisso) no runbook. Em caso de compromisso, omitir `JWT_PUBLIC_JWK_PREVIOUS` invalida de imediato os access tokens antigos.
 
 ### ADR-007 — Offline-first com outbox local + idempotency keys
 
@@ -185,6 +194,23 @@ bastava acertá-las para tomar a conta.
   acertado as perguntas — risco aceite sem email. Os atrasos exigem a UI mostrar `recovery_pending`
   e `pendingRecoveryCancelled`.
 
+### ADR-012 — Apagamento de conta: período de graça de 30 dias
+
+**Contexto**: apagar logo é irreversível e uma conta tomada (ver ADR-011) seria destruída pelo atacante.
+**Decisão** (modelo "Facebook"):
+
+- `POST /users/me/deletion` (confirma a palavra-passe) coloca a conta em estado **pendente** durante
+  `ACCOUNT_DELETION_GRACE_DAYS` (30). A conta continua a existir; o `username` fica reservado e as sessões são revogadas.
+- Um **login** com sucesso durante o período reactiva a conta (`accountRestored`) e repõe as partilhas.
+- Partilhas, à escolha do utilizador no pedido: `anonymize` (ficam visíveis como autor oculto, `author_hidden`)
+  ou `delete` (ficam ocultas durante o período — `suspended_status` — e são apagadas na purga).
+- Passados os 30 dias, o job de manutenção (`setInterval` in-process, `unref`, `MAINTENANCE_INTERVAL_MINUTES`; ADR-005)
+  purga a conta: decrementa os contadores de likes/denúncias de terceiros antes da cascata, aplica `SET NULL`/cascatas
+  do modelo de dados e liberta o `username`. `SKIP LOCKED` torna a purga segura com várias instâncias.
+- O último administrador não pode apagar a conta.
+  **Consequências**: quem tiver a palavra-passe comprometida pode pedir o apagamento, mas o dono recupera a conta ao
+  entrar (ou pelo ADR-011) dentro do prazo. A UI tem de mostrar `accountRestored` e o estado pendente.
+
 ## 5. Modelo de dados
 
 ```mermaid
@@ -212,7 +238,7 @@ erDiagram
     timestamptz created_at
     timestamptz updated_at
     timestamptz last_login_at
-    timestamptz deleted_at "soft delete"
+    timestamptz deleted_at "pedido de apagamento (conta pendente; purga após a graça)"
   }
 
   REFRESH_TOKENS {
@@ -307,6 +333,7 @@ erDiagram
 - `outbox` e `idempotency_keys` têm TTL — purga periódica pelo worker (ex.: > 7 dias).
 - Purga de conta: `posts.author_id` → NULL (partilha anónima, "[removido]"); `moderation_log.post_id` e `moderator_id` → NULL (a auditoria nunca se perde); `post_likes`, `reports`, `refresh_tokens` e `idempotency_keys` apagam-se em cascata. `idempotency_keys` tem PK `(user_id, key)`: a chave vem do cliente e só é única por utilizador.
 - Outbox: `claimBatch` empurra `next_attempt_at` para o futuro (5 min) ao reservar; um evento preso em `processing` só volta a ser reclamável depois desse prazo.
+- Apagamento de conta (ADR-012): `users.deleted_at` marca a conta pendente; a purga corre no job de manutenção. Partilhas: `author_hidden` (modo anonimizar) ou `suspended_status` (modo apagar, ocultas até à purga).
 - `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
 
 ## 6. Contratos de API (resumo)
@@ -325,24 +352,29 @@ Base: `/api/v1`. Todas as rotas autenticadas usam `Authorization: Bearer <access
 | POST   | `/auth/recover/verify` | Valida código de recuperação **ou** 3 perguntas. Devolve `recovery_session`. |
 | POST   | `/auth/recover/reset`  | Usa `recovery_session` para definir nova palavra-passe.                      |
 
+Formato de erro único em toda a API: `{ "error": "<código>", "message"?: "...", "fields"?: { campo: [mensagens] } }`.
+Erros 5xx devolvem sempre uma mensagem genérica (sem detalhes internos nem _stack_). Palavras-passe: mínimo 8, máximo 128,
+lista embebida de palavras-passe comuns recusada, não pode conter o username, sem regras de composição.
+
 ### Conteúdo
 
-| Método | Rota                  | Descrição                                |
-| ------ | --------------------- | ---------------------------------------- |
-| GET    | `/gospel-cards`       | Lista de cards.                          |
-| GET    | `/gospel-cards/:slug` | Detalhe de card.                         |
-| GET    | `/posts`              | Feed com `?category=&filter=recent       | top | liked&cursor=`. |
-| GET    | `/posts/:id`          | Detalhe.                                 |
-| POST   | `/posts`              | Cria partilha. Requer `Idempotency-Key`. |
-| DELETE | `/posts/:id`          | Autor apaga.                             |
-| POST   | `/posts/:id/like`     | Idempotente.                             |
-| DELETE | `/posts/:id/like`     | Idempotente.                             |
-| POST   | `/posts/:id/report`   | Uma denúncia por user por post.          |
-| DELETE | `/posts/:id/report`   | Cancela denúncia aberta.                 |
-| GET    | `/users/me/posts`     | Gestão de partilhas.                     |
-| GET    | `/users/me/reports`   | Denúncias do utilizador.                 |
-| PATCH  | `/users/me`           | Alterar username.                        |
-| POST   | `/users/me/password`  | Alterar palavra-passe (atual + nova).    |
+| Método | Rota                  | Descrição                                                                 |
+| ------ | --------------------- | ------------------------------------------------------------------------- |
+| GET    | `/gospel-cards`       | Lista de cards.                                                           |
+| GET    | `/gospel-cards/:slug` | Detalhe de card.                                                          |
+| GET    | `/posts`              | Feed com `?category=&filter=recent                                        | top | liked&cursor=`. |
+| GET    | `/posts/:id`          | Detalhe.                                                                  |
+| POST   | `/posts`              | Cria partilha. Requer `Idempotency-Key`.                                  |
+| DELETE | `/posts/:id`          | Autor apaga.                                                              |
+| POST   | `/posts/:id/like`     | Idempotente.                                                              |
+| DELETE | `/posts/:id/like`     | Idempotente.                                                              |
+| POST   | `/posts/:id/report`   | Uma denúncia por user por post.                                           |
+| DELETE | `/posts/:id/report`   | Cancela denúncia aberta.                                                  |
+| GET    | `/users/me/posts`     | Gestão de partilhas.                                                      |
+| GET    | `/users/me/reports`   | Denúncias do utilizador.                                                  |
+| PATCH  | `/users/me`           | Alterar username.                                                         |
+| POST   | `/users/me/deletion`  | Pede o apagamento (30 dias de graça; `postsMode`: `anonymize`\|`delete`). |
+| POST   | `/users/me/password`  | Alterar palavra-passe (atual + nova).                                     |
 
 ### Sync
 
@@ -474,13 +506,13 @@ sequenceDiagram
 - **Cabeçalhos**: HSTS, CSP estrita (self + api), `X-Content-Type-Options`, `Referrer-Policy: no-referrer`.
 - **CORS**: apenas o domínio do frontend.
 - **Passwords e respostas**: argon2id (m=19456 KiB, t=2, p=1).
-- **JWT**: EdDSA (Ed25519); chaves em env vars; rotação documentada.
+- **JWT**: EdDSA (Ed25519) com `kid`; chaves em env vars; rotação com chave anterior só pública (ADR-006), procedimento no runbook.
 - **Rate limiting**: login (IP+username), registo (IP), criação de posts (user), denúncias (user).
 - **Validação**: Zod em todos os endpoints.
 - **SQL**: drizzle-orm com prepared statements; sem concatenação.
 - **Logs**: sem passwords, sem tokens, sem PII; username é o único identificador presente.
 - **Privacidade**: sem IP persistido, sem analytics de terceiros, sem cookies de rastreio. Política de privacidade e termos de utilização publicados.
-- **Apagamento de conta**: soft-delete; purga após 30 dias; posts ficam anonimizados (`author_id = null`, `username = "[removido]"`).
+- **Apagamento de conta**: estado pendente 30 dias (login reactiva); purga pelo job de manutenção; partilhas anonimizadas ou apagadas conforme a escolha do utilizador (ADR-012).
 - **Headers de admin**: middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido.
 
 ## 12. Observabilidade
