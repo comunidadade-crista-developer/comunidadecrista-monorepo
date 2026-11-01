@@ -1,9 +1,9 @@
-import type { Redis } from 'ioredis';
-import type { GospelCard } from '../db/schema.js';
-import type { GospelCardPublic } from '@comunidade/shared';
-import type { cardsRepo } from '../repositories/cards.js';
+import type { Redis } from "ioredis";
+import type { GospelCard } from "../db/schema.js";
+import type { GospelCardPublic } from "@comunidade/shared";
+import type { cardsRepo } from "../repositories/cards.js";
 
-const NAMESPACE = 'cc:v1:cards';
+const NAMESPACE = "cc:v1:cards";
 const VERSION_KEY = `${NAMESPACE}:version`;
 const LIST_TTL_SECONDS = 3600;
 const ITEM_TTL_SECONDS = 3600;
@@ -56,7 +56,7 @@ export function createCardsCache(deps: {
       memVersion = { value: safe, at: Date.now() };
       return safe;
     } catch (err) {
-      logger.warn({ err }, 'cards-cache: version read failed');
+      logger.warn({ err }, "cards-cache: version read failed");
       memVersion = null;
       return null;
     }
@@ -80,7 +80,7 @@ export function createCardsCache(deps: {
           return JSON.parse(cached) as GospelCardPublic[];
         }
       } catch (err) {
-        logger.warn({ err, key }, 'cards-cache: read failed');
+        logger.warn({ err, key }, "cards-cache: read failed");
       }
 
       const rows = await cards.list();
@@ -88,9 +88,14 @@ export function createCardsCache(deps: {
 
       if (publicRows.length > 0) {
         try {
-          await redis!.set(key, JSON.stringify(publicRows), 'EX', LIST_TTL_SECONDS);
+          await redis!.set(
+            key,
+            JSON.stringify(publicRows),
+            "EX",
+            LIST_TTL_SECONDS,
+          );
         } catch (err) {
-          logger.warn({ err, key }, 'cards-cache: write failed');
+          logger.warn({ err, key }, "cards-cache: write failed");
         }
       }
 
@@ -110,12 +115,13 @@ export function createCardsCache(deps: {
       try {
         const cached = await redis!.get(key);
         if (cached) {
-          const parsed = JSON.parse(cached) as GospelCardPublic | { __null__: true };
-          if ('__null__' in parsed) return null;
+          const parsed = JSON.parse(cached) as
+            GospelCardPublic | { __null__: true };
+          if ("__null__" in parsed) return null;
           return parsed;
         }
       } catch (err) {
-        logger.warn({ err, key }, 'cards-cache: read failed');
+        logger.warn({ err, key }, "cards-cache: read failed");
       }
 
       const row = await cards.findBySlug(slug);
@@ -123,10 +129,15 @@ export function createCardsCache(deps: {
 
       try {
         if (publicRow) {
-          await redis!.set(key, JSON.stringify(publicRow), 'EX', ITEM_TTL_SECONDS);
+          await redis!.set(
+            key,
+            JSON.stringify(publicRow),
+            "EX",
+            ITEM_TTL_SECONDS,
+          );
         }
       } catch (err) {
-        logger.warn({ err, key }, 'cards-cache: write failed');
+        logger.warn({ err, key }, "cards-cache: write failed");
       }
 
       return publicRow;
@@ -137,10 +148,10 @@ export function createCardsCache(deps: {
       try {
         const newVersion = await redis.incr(VERSION_KEY);
         memVersion = { value: newVersion, at: Date.now() };
-        logger.warn({ version: newVersion }, 'cards-cache: invalidated');
+        logger.warn({ version: newVersion }, "cards-cache: invalidated");
         return newVersion;
       } catch (err) {
-        logger.warn({ err }, 'cards-cache: invalidation failed');
+        logger.warn({ err }, "cards-cache: invalidation failed");
         return 0;
       }
     },

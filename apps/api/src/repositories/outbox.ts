@@ -1,5 +1,5 @@
 import { and, eq, gt, lt, sql } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import { idempotencyKeys, outbox } from "../db/schema.js";
 import type {
   IdempotencyKey,
@@ -35,7 +35,7 @@ function toOutboxEvent(row: OutboxRow): OutboxEvent {
   };
 }
 
-export function outboxRepo(db: Database) {
+export function outboxRepo(db: Executor) {
   return {
     async enqueue(data: NewOutboxEvent): Promise<OutboxEvent> {
       const [row] = await db.insert(outbox).values(data).returning();
@@ -105,7 +105,7 @@ export function outboxRepo(db: Database) {
   };
 }
 
-export function idempotencyKeysRepo(db: Database) {
+export function idempotencyKeysRepo(db: Executor) {
   return {
     /** Só devolve chaves do próprio utilizador e ainda não expiradas. */
     async get(userId: string, key: string): Promise<IdempotencyKey | null> {

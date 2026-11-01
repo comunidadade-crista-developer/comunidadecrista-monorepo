@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createCardsCache } from '../cache/cards-cache.js';
-import { cardsRepo } from '../repositories/cards.js';
-import { createRedis } from '../redis.js';
-import pino from 'pino';
+import { createCardsCache } from "../cache/cards-cache.js";
+import { cardsRepo } from "../repositories/cards.js";
+import { createRedis } from "../redis.js";
+import pino from "pino";
 import { loadEnv } from "../env.js";
 import { createDb } from "./client.js";
 
@@ -51,19 +51,21 @@ if (allSucceeded) {
     const cache = createCardsCache({
       redis,
       cards: cardsRepo(db),
-      logger: pino({ level: 'warn' }),
+      logger: pino({ level: "warn" }),
     });
     const newVersion = await cache.invalidate();
     console.log(`Cache invalidado (versão=${newVersion}).`);
     await redis.quit();
   } else {
-    console.warn('REDIS_URL ausente — cache não invalidado.');
+    console.warn("REDIS_URL ausente — cache não invalidado.");
   }
 } else {
-  console.warn('Seed parcial: cache NÃO invalidado (DB pode estar inconsistente).');
+  console.warn(
+    "Seed parcial: cache NÃO invalidado (DB pode estar inconsistente).",
+  );
 }
 
 await pool.end();
 console.log(`Seed concluído: ${created} criados, ${updated} actualizados.`);
 
-if (!allSucceeded) process.exit(1);   
+if (!allSucceeded) process.exit(1);

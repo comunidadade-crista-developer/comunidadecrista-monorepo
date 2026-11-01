@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from "zod";
 
 export const MAX_CARDS_PER_RESPONSE = 200;
 
@@ -26,8 +26,8 @@ export type GospelCardResponse = z.infer<typeof GospelCardResponse>;
 export const CardSlugParams = z.object({
   slug: z
     .string()
-    .min(1, 'slug vazio')
-    .max(100, 'slug demasiado longo')
-    .regex(/^[a-z0-9-]+$/, 'slug inválido'),
+    .min(1, "slug vazio")
+    .max(100, "slug demasiado longo")
+    .regex(/^[a-z0-9-]+$/, "slug inválido"),
 });
 export type CardSlugParams = z.infer<typeof CardSlugParams>;

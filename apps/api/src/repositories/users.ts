@@ -1,5 +1,5 @@
 import { and, inArray, eq, isNull, lt } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import { refreshTokens, users } from "../db/schema.js";
 import type {
   NewRefreshToken,
@@ -14,7 +14,7 @@ export type RotateResult =
   | { status: "reuse_detected"; familyId: string }
   | { status: "expired" };
 
-export function usersRepo(db: Database) {
+export function usersRepo(db: Executor) {
   return {
     async findById(id: string): Promise<User | null> {
       const [row] = await db
@@ -86,7 +86,7 @@ export function usersRepo(db: Database) {
   };
 }
 
-export function refreshTokensRepo(db: Database) {
+export function refreshTokensRepo(db: Executor) {
   return {
     async create(data: NewRefreshToken): Promise<RefreshToken> {
       const [row] = await db.insert(refreshTokens).values(data).returning();

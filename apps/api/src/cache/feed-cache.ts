@@ -1,11 +1,11 @@
-import type { PostPublic, PostCategory } from '@comunidade/shared';
-import type { Redis } from 'ioredis';
-import type { Database } from '../db/client.js';
+import type { PostPublic, PostCategory } from "@comunidade/shared";
+import type { Redis } from "ioredis";
+import type { Database } from "../db/client.js";
 // import type { Post } from '../db/schema.js';
-import { postsRepo } from '../repositories/posts.js';
-import { presentPosts } from '../services/post-presenter.js';
+import { postsRepo } from "../repositories/posts.js";
+import { presentPosts } from "../services/post-presenter.js";
 
-const PREFIX = 'cc:v1:feed';
+const PREFIX = "cc:v1:feed";
 const TTL_SECONDS = 60;
 
 interface Logger {
@@ -15,7 +15,7 @@ interface Logger {
 export interface FeedCacheReadOptions {
   category?: PostCategory;
   gospelCardId?: string;
-  filter: 'recent' | 'top';
+  filter: "recent" | "top";
   cursor?: string;
   limit: number;
 }
@@ -40,9 +40,9 @@ export function createFeedCache(deps: {
   const repo = postsRepo(db);
 
   function buildKey(opts: FeedCacheReadOptions): string {
-    const cat = opts.category ?? 'all';
-    const card = opts.gospelCardId ?? 'all';
-    const cur = opts.cursor ?? 'first';
+    const cat = opts.category ?? "all";
+    const card = opts.gospelCardId ?? "all";
+    const cur = opts.cursor ?? "first";
     return `${PREFIX}:${cat}:${card}:${opts.filter}:${opts.limit}:${cur}`;
   }
 
@@ -68,11 +68,14 @@ export function createFeedCache(deps: {
       try {
         const raw = await redis.get(key);
         if (raw) {
-          const parsed = JSON.parse(raw) as { items: PostPublic[]; nextCursor: string | null };
+          const parsed = JSON.parse(raw) as {
+            items: PostPublic[];
+            nextCursor: string | null;
+          };
           return { ...parsed, cacheHit: true };
         }
       } catch (err) {
-        logger.warn({ err, key }, 'feed-cache: read failed');
+        logger.warn({ err, key }, "feed-cache: read failed");
       }
 
       const result = await repo.list({
@@ -90,11 +93,11 @@ export function createFeedCache(deps: {
           await redis.set(
             key,
             JSON.stringify({ items, nextCursor: result.nextCursor }),
-            'EX',
+            "EX",
             TTL_SECONDS,
           );
         } catch (err) {
-          logger.warn({ err, key }, 'feed-cache: write failed');
+          logger.warn({ err, key }, "feed-cache: write failed");
         }
       }
 
@@ -104,20 +107,26 @@ export function createFeedCache(deps: {
     async invalidate() {
       if (!redis) return 0;
       try {
-        let cursor = '0';
+        let cursor = "0";
         let deleted = 0;
         do {
-          const [next, keys] = await redis.scan(cursor, 'MATCH', `${PREFIX}:*`, 'COUNT', 100);
+          const [next, keys] = await redis.scan(
+            cursor,
+            "MATCH",
+            `${PREFIX}:*`,
+            "COUNT",
+            100,
+          );
           cursor = next;
           if (keys.length > 0) {
             await redis.del(...keys);
             deleted += keys.length;
           }
-        } while (cursor !== '0');
-        if (deleted > 0) logger.warn({ deleted }, 'feed-cache: invalidated');
+        } while (cursor !== "0");
+        if (deleted > 0) logger.warn({ deleted }, "feed-cache: invalidated");
         return deleted;
       } catch (err) {
-        logger.warn({ err }, 'feed-cache: invalidation failed');
+        logger.warn({ err }, "feed-cache: invalidation failed");
         return 0;
       }
     },

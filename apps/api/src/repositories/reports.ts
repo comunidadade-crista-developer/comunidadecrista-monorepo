@@ -1,5 +1,5 @@
 import { and, count, desc, eq, lte, sql } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import { moderationLog, posts, reports, users } from "../db/schema.js";
 import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
 
@@ -8,7 +8,7 @@ export const REPORT_THRESHOLD = 10;
 /** Idade mínima da conta de quem denuncia para a denúncia contar para o limiar. */
 export const REPORTER_MIN_AGE_DAYS = 7;
 
-type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type Tx = Parameters<Parameters<Executor["transaction"]>[0]>[0];
 
 export interface ReportRules {
   threshold?: number;
@@ -59,7 +59,7 @@ async function countValidOpen(
   return Number(row?.c ?? 0);
 }
 
-export function reportsRepo(db: Database) {
+export function reportsRepo(db: Executor) {
   return {
     /**
      * Operação de baixo nível: só insere a linha, sem regras nem contadores.
@@ -251,7 +251,7 @@ export function reportsRepo(db: Database) {
   };
 }
 
-export function moderationLogRepo(db: Database) {
+export function moderationLogRepo(db: Executor) {
   return {
     async create(
       data: typeof moderationLog.$inferInsert,

@@ -4,13 +4,13 @@ import {
   GospelCardResponse,
   ErrorResponse,
   MAX_CARDS_PER_RESPONSE,
-} from '@comunidade/shared';
-import type { FastifyInstance } from 'fastify';
-import type { ZodTypeProvider } from 'fastify-type-provider-zod';
-import type { CardsCache } from '../cache/cards-cache.js';
-import type { RateLimiters } from '../auth/rate-limit.js';
+} from "@comunidade/shared";
+import type { FastifyInstance } from "fastify";
+import type { ZodTypeProvider } from "fastify-type-provider-zod";
+import type { CardsCache } from "../cache/cards-cache.js";
+import type { RateLimiters } from "../auth/rate-limit.js";
 
-const CACHE_CONTROL_PUBLIC = 'public, max-age=60, stale-while-revalidate=300';
+const CACHE_CONTROL_PUBLIC = "public, max-age=60, stale-while-revalidate=300";
 
 export interface CardsRoutesOptions {
   cache: CardsCache;
@@ -24,15 +24,17 @@ export async function cardsRoutes(
   const f = app.withTypeProvider<ZodTypeProvider>();
 
   f.get(
-    '/gospel-cards',
-    { schema: { response: { 200: GospelCardListResponse, 429: ErrorResponse } } },
+    "/gospel-cards",
+    {
+      schema: { response: { 200: GospelCardListResponse, 429: ErrorResponse } },
+    },
     async (request, reply) => {
       const rl = await limiters.checkCardsPublic(request.clientIp);
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
       const all = await cache.list();
@@ -41,21 +43,25 @@ export async function cardsRoutes(
       if (all.length > MAX_CARDS_PER_RESPONSE) {
         request.log.warn(
           { total: all.length, served: MAX_CARDS_PER_RESPONSE },
-          'cards: list truncated — review seed size',
+          "cards: list truncated — review seed size",
         );
       }
 
-      reply.header('Cache-Control', CACHE_CONTROL_PUBLIC);
+      reply.header("Cache-Control", CACHE_CONTROL_PUBLIC);
       return reply.code(200).send({ cards });
     },
   );
 
   f.get(
-    '/gospel-cards/:slug',
+    "/gospel-cards/:slug",
     {
       schema: {
         params: CardSlugParams,
-        response: { 200: GospelCardResponse, 404: ErrorResponse, 429: ErrorResponse, },
+        response: {
+          200: GospelCardResponse,
+          404: ErrorResponse,
+          429: ErrorResponse,
+        },
       },
     },
     async (request, reply) => {
@@ -63,16 +69,16 @@ export async function cardsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
       const card = await cache.bySlug(request.params.slug);
       if (!card) {
-        return reply.code(404).send({ error: 'not_found' });
+        return reply.code(404).send({ error: "not_found" });
       }
 
-      reply.header('Cache-Control', CACHE_CONTROL_PUBLIC);
+      reply.header("Cache-Control", CACHE_CONTROL_PUBLIC);
       return reply.code(200).send({ card });
     },
   );

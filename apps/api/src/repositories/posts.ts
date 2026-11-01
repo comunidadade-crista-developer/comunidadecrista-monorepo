@@ -1,6 +1,6 @@
-import { and, count, desc, eq, inArray, sql } from 'drizzle-orm';
-import type { PostCategory, PostStatus } from '@comunidade/shared'
-import type { Database } from "../db/client.js";
+import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
+import type { PostCategory, PostStatus } from "@comunidade/shared";
+import type { Executor } from "../db/client.js";
 import { postLikes, posts } from "../db/schema.js";
 import type { NewPost, Post } from "../db/schema.js";
 
@@ -20,7 +20,7 @@ export interface ListResult {
   nextCursor: string | null;
 }
 
-export function postsRepo(db: Database) {
+export function postsRepo(db: Executor) {
   return {
     async create(data: NewPost): Promise<Post> {
       const now = new Date();
@@ -34,12 +34,17 @@ export function postsRepo(db: Database) {
 
     async findLatestByAuthorInFilter(
       authorId: string,
-      opts: { gospelCardId?: string; category?: PostCategory; statuses?: PostStatus[] } = {},
+      opts: {
+        gospelCardId?: string;
+        category?: PostCategory;
+        statuses?: PostStatus[];
+      } = {},
     ): Promise<Post | null> {
       const conds: ReturnType<typeof eq>[] = [eq(posts.authorId, authorId)];
-      if (opts.gospelCardId) conds.push(eq(posts.gospelCardId, opts.gospelCardId));
+      if (opts.gospelCardId)
+        conds.push(eq(posts.gospelCardId, opts.gospelCardId));
       if (opts.category) conds.push(eq(posts.category, opts.category));
-      const statuses = opts.statuses ?? ['published', 'pending_review'];
+      const statuses = opts.statuses ?? ["published", "pending_review"];
       conds.push(inArray(posts.status, statuses));
       const [row] = await db
         .select()
@@ -73,7 +78,8 @@ export function postsRepo(db: Database) {
       } = opts;
       const conditions = [eq(posts.status, "published")];
       if (category) conditions.push(eq(posts.category, category));
-      if (opts.gospelCardId) conditions.push(eq(posts.gospelCardId, opts.gospelCardId));
+      if (opts.gospelCardId)
+        conditions.push(eq(posts.gospelCardId, opts.gospelCardId));
 
       if (filter === "recent") {
         if (cursor) {
@@ -166,8 +172,7 @@ export function postsRepo(db: Database) {
   };
 }
 
-
-export function postLikesRepo(db: Database) {
+export function postLikesRepo(db: Executor) {
   return {
     async like(postId: string, userId: string): Promise<boolean> {
       const result = await db
@@ -186,14 +191,18 @@ export function postLikesRepo(db: Database) {
       return result.length > 0;
     },
 
-    async findLikedPostIds(userId: string, postIds: string[]): Promise<string[]> {
+    async findLikedPostIds(
+      userId: string,
+      postIds: string[],
+    ): Promise<string[]> {
       if (postIds.length === 0) return [];
       const rows = await db
         .select({ postId: postLikes.postId })
         .from(postLikes)
-        .where(and(eq(postLikes.userId, userId), inArray(postLikes.postId, postIds)));
+        .where(
+          and(eq(postLikes.userId, userId), inArray(postLikes.postId, postIds)),
+        );
       return rows.map((r) => r.postId);
     },
   };
 }
-

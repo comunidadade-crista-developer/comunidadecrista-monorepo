@@ -1,18 +1,27 @@
-import { z } from 'zod';
+import { z } from "zod";
 
-export const PostCategory = z.enum(['entendimento', 'ensinamento', 'letra_cancao']);
+export const PostCategory = z.enum([
+  "entendimento",
+  "ensinamento",
+  "letra_cancao",
+]);
 export type PostCategory = z.infer<typeof PostCategory>;
 
-export const PostStatus = z.enum(['published', 'pending_review', 'hidden', 'rejected']);
+export const PostStatus = z.enum([
+  "published",
+  "pending_review",
+  "hidden",
+  "rejected",
+]);
 export type PostStatus = z.infer<typeof PostStatus>;
 
-export const FeedFilter = z.enum(['recent', 'top', 'liked']);
+export const FeedFilter = z.enum(["recent", "top", "liked"]);
 export type FeedFilter = z.infer<typeof FeedFilter>;
 
 export const IdempotencyKey = z
   .string()
-  .min(16, 'Idempotency-Key tem de ter pelo menos 16 caracteres')
-  .max(128, 'Idempotency-Key tem no máximo 128 caracteres');
+  .min(16, "Idempotency-Key tem de ter pelo menos 16 caracteres")
+  .max(128, "Idempotency-Key tem no máximo 128 caracteres");
 
 export const PostPublic = z.object({
   id: z.string().uuid(),
@@ -33,7 +42,7 @@ export type PostPublic = z.infer<typeof PostPublic>;
 export const ListPostsQuery = z.object({
   gospelCardId: z.string().uuid().optional(),
   category: PostCategory.optional(),
-  filter: FeedFilter.default('recent'),
+  filter: FeedFilter.default("recent"),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
 });
@@ -47,8 +56,11 @@ export type ListPostsResponse = z.infer<typeof ListPostsResponse>;
 
 export const CreatePostRequest = z.object({
   category: PostCategory,
-  title: z.string().min(1, 'título vazio').max(120, 'título demasiado longo'),
-  content: z.string().min(1, 'conteúdo vazio').max(5000, 'conteúdo demasiado longo'),
+  title: z.string().min(1, "título vazio").max(120, "título demasiado longo"),
+  content: z
+    .string()
+    .min(1, "conteúdo vazio")
+    .max(5000, "conteúdo demasiado longo"),
   gospelCardSlug: z.string().min(1).max(100).optional(),
 });
 export type CreatePostRequest = z.infer<typeof CreatePostRequest>;
@@ -69,11 +81,16 @@ export const LikeResponse = z.object({
 export type LikeResponse = z.infer<typeof LikeResponse>;
 
 export const ReportRequest = z.object({
-  reason: z.string().min(3, 'razão demasiado curta').max(500),
+  reason: z.string().min(3, "razão demasiado curta").max(500),
 });
 export type ReportRequest = z.infer<typeof ReportRequest>;
 
-export const ReportOutcome = z.enum(['created', 'duplicate', 'own_post', 'post_not_found']);
+export const ReportOutcome = z.enum([
+  'created',
+  'duplicate',
+  'own_post',
+  'post_not_found',
+]);
 export type ReportOutcome = z.infer<typeof ReportOutcome>;
 
 export const ReportResponse = z.object({ outcome: ReportOutcome });

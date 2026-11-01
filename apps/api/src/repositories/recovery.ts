@@ -1,5 +1,5 @@
 import { and, eq, isNull, lt, sql } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import {
   pendingPasswordResets,
   refreshTokens,
@@ -8,7 +8,7 @@ import {
 } from "../db/schema.js";
 import type { PendingPasswordReset } from "../db/schema.js";
 
-type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type Tx = Parameters<Parameters<Executor["transaction"]>[0]>[0];
 
 export interface ConsumedSession {
   jti: string;
@@ -46,7 +46,7 @@ async function revokeAllTokens(tx: Tx, userId: string): Promise<void> {
     );
 }
 
-export function recoveryRepo(db: Database) {
+export function recoveryRepo(db: Executor) {
   return {
     /**
      * Reset imediato (prova por código de recuperação): muda a palavra-passe, rota o código,

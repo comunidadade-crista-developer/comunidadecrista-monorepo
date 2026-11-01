@@ -121,11 +121,11 @@ export function createRateLimiters(
 
   const cardsPublic = make("rl:cards", 30, 60);
 
-  const readFeed = make("rl:feed:read", 60, 60);        
-  const postsCreate = make("rl:posts:create", 10, 3600); 
-  const postsDelete = make("rl:posts:delete", 30, 3600); 
-  const likes = make("rl:likes", 120, 3600);            
-  const reports = make("rl:reports", 10, 3600);         
+  const readFeed = make("rl:feed:read", 60, 60);
+  const postsCreate = make("rl:posts:create", 10, 3600);
+  const postsDelete = make("rl:posts:delete", 30, 3600);
+  const likes = make("rl:likes", 120, 3600);
+  const reports = make("rl:reports", 10, 3600);
 
   const consume = async (
     limiter: RateLimiterAbstract,
@@ -211,4 +211,4 @@ export function createRateLimiters(
     checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
     checkReports: (userId) => consumeAll([[reports, anon(userId)]]),
   };
-}   
+}

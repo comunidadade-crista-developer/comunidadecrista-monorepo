@@ -1,9 +1,9 @@
 import { asc, eq, inArray } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import { gospelCards } from "../db/schema.js";
 import type { GospelCard, NewGospelCard } from "../db/schema.js";
 
-export function cardsRepo(db: Database) {
+export function cardsRepo(db: Executor) {
   return {
     async list(): Promise<GospelCard[]> {
       return db.select().from(gospelCards).orderBy(asc(gospelCards.orderIndex));

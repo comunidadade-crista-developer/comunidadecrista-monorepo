@@ -1,17 +1,26 @@
-import type { PostPublic } from '@comunidade/shared';
-import type { Database } from '../db/client.js';
-import type { Post } from '../db/schema.js';
-import { cardsRepo } from '../repositories/cards.js';
-import { usersRepo } from '../repositories/users.js';
+import type { PostPublic } from "@comunidade/shared";
+import type { Database } from "../db/client.js";
+import type { Post } from "../db/schema.js";
+import { cardsRepo } from "../repositories/cards.js";
+import { usersRepo } from "../repositories/users.js";
 
-export async function presentPosts(posts: Post[], db: Database): Promise<PostPublic[]> {
+export async function presentPosts(
+  posts: Post[],
+  db: Database,
+): Promise<PostPublic[]> {
   if (posts.length === 0) return [];
 
   const authorIds = Array.from(
-    new Set(posts.map((p) => p.authorId).filter((id): id is string => id !== null)),
+    new Set(
+      posts.map((p) => p.authorId).filter((id): id is string => id !== null),
+    ),
   );
   const cardIds = Array.from(
-    new Set(posts.map((p) => p.gospelCardId).filter((id): id is string => id !== null)),
+    new Set(
+      posts
+        .map((p) => p.gospelCardId)
+        .filter((id): id is string => id !== null),
+    ),
   );
 
   const [authors, cards] = await Promise.all([
@@ -23,7 +32,7 @@ export async function presentPosts(posts: Post[], db: Database): Promise<PostPub
   const cardSlugMap = new Map(cards.map((c) => [c.id, c.slug]));
 
   return posts.map((p) => {
-    let authorUsername = '[removido]';
+    let authorUsername = "[removido]";
     if (p.authorId) {
       const a = authorMap.get(p.authorId);
       if (a && !a.deletedAt) authorUsername = a.username;
@@ -39,14 +48,19 @@ export async function presentPosts(posts: Post[], db: Database): Promise<PostPub
       isLiked: false,
       authorId: p.authorId,
       authorUsername,
-      gospelCardSlug: p.gospelCardId ? (cardSlugMap.get(p.gospelCardId) ?? null) : null,
+      gospelCardSlug: p.gospelCardId
+        ? (cardSlugMap.get(p.gospelCardId) ?? null)
+        : null,
       createdAt: p.createdAt.toISOString(),
       publishedAt: p.publishedAt?.toISOString() ?? null,
     };
   });
 }
 
-export async function presentOne(post: Post, db: Database): Promise<PostPublic> {
+export async function presentOne(
+  post: Post,
+  db: Database,
+): Promise<PostPublic> {
   const [result] = await presentPosts([post], db);
   return result!;
 }

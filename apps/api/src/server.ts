@@ -101,8 +101,8 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
     if (!reply.getHeader("Cache-Control")) {
       reply.header("Cache-Control", "no-store");
     }
-     return payload;
-   });
+    return payload;
+  });
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
@@ -150,7 +150,7 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       jwt,
       limiters,
     });
-  await app.register(cardsRoutes, {
+    await app.register(cardsRoutes, {
       cache: createCardsCache({
         redis,
         cards: cardsRepo(dbBundle.db),
@@ -170,7 +170,9 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       }),
     });
   } else {
-    app.log.warn("DATABASE_URL não configurado — rotas de auth e cards desactivadas.");
+    app.log.warn(
+      "DATABASE_URL não configurado — rotas de auth e cards desactivadas.",
+    );
   }
 
   return app;

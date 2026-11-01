@@ -1,4 +1,6 @@
-import { z } from 'zod';
+type ReportOutcome = "created" | "duplicate" | "own_post" | "post_not_found";
+import type {
+  PostPublic} from "@comunidade/shared";
 import {
   CreatePostRequest,
   CreatePostResponse,
@@ -9,20 +11,26 @@ import {
   PostIdParams,
   ReportRequest,
   ReportResponse,
-} from '@comunidade/shared';
-import type { FastifyInstance } from 'fastify';
-import type { ZodTypeProvider } from 'fastify-type-provider-zod';
-import { requireAuth } from '../auth/middleware.js';
-import type { JwtService } from '../auth/jwt.js';
-import type { RateLimiters } from '../auth/rate-limit.js';
-import type { FeedCache } from '../cache/feed-cache.js';
-import type { Database } from '../db/client.js';
-import type { Env } from '../env.js';
-import { cardsRepo } from '../repositories/cards.js';
-import { idempotencyKeysRepo, outboxRepo } from '../repositories/outbox.js';
-import { postLikesRepo, postsRepo } from '../repositories/posts.js';
-import { reportsRepo } from '../repositories/reports.js';
-import { presentOne, presentPosts } from '../services/post-presenter.js';
+} from "@comunidade/shared";
+import type { FastifyInstance } from "fastify";
+import type { ZodTypeProvider } from "fastify-type-provider-zod";
+import { z } from "zod";
+import type { JwtService } from "../auth/jwt.js";
+import { requireAuth } from "../auth/middleware.js";
+import type { RateLimiters } from "../auth/rate-limit.js";
+import type { FeedCache } from "../cache/feed-cache.js";
+import type { Database } from "../db/client.js";
+import type { Env } from "../env.js";
+import { postLikesRepo, postsRepo } from "../repositories/posts.js";
+import {
+  createPostService,
+  deletePostService,
+  likePostService,
+  reportPostService,
+  unlikePostService,
+  unreportPostService,
+} from "../services/posts.js";
+import { presentOne, presentPosts } from "../services/post-presenter.js";
 
 export interface PostsRoutesOptions {
   env: Env;
@@ -39,29 +47,31 @@ export async function postsRoutes(
   const f = app.withTypeProvider<ZodTypeProvider>();
   const posts = postsRepo(db);
   const likes = postLikesRepo(db);
-  const reports = reportsRepo(db);
-  const cards = cardsRepo(db);
-  const outbox = outboxRepo(db);
-  const idem = idempotencyKeysRepo(db);
-
   const authPre = requireAuth(jwt);
+  const deps = { db };
 
   f.get(
-    '/posts',
+    "/posts",
     {
       schema: {
         querystring: ListPostsQuery,
-        response: { 200: ListPostsResponse, 401: ErrorResponse, 429: ErrorResponse },
+        response: {
+          200: ListPostsResponse,
+          401: ErrorResponse,
+          429: ErrorResponse,
+        },
       },
-      preHandler: async (request, reply) => {
+      preHandler: async (request) => {
         const auth = request.headers.authorization;
         if (!auth) return;
         try {
-          const payload = await jwt.verifyAccessToken(auth.replace(/^Bearer\s+/i, '').trim());
+          const payload = await jwt.verifyAccessToken(
+            auth.replace(/^Bearer\s+/i, "").trim(),
+          );
           request.user = { id: payload.sub, role: payload.role };
         } catch {
+          /* leitura pública */
         }
-        void reply;
       },
     },
     async (request, reply) => {
@@ -69,22 +79,20 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
       const { gospelCardId, category, filter, cursor, limit } = request.query;
       const viewerId = request.user?.id ?? null;
 
-      let items;
+      let items: PostPublic[];
       let nextCursor: string | null;
 
-      if (filter === 'liked') {
-        if (!viewerId) {
-          return reply.code(401).send({ error: 'auth_required' });
-        }
+      if (filter === "liked") {
+        if (!viewerId) return reply.code(401).send({ error: "auth_required" });
         const result = await posts.list({
-          filter: 'liked',
+          filter: "liked",
           viewerId,
           gospelCardId,
           category,
@@ -104,7 +112,6 @@ export async function postsRoutes(
         nextCursor = result.nextCursor;
       }
 
-      // Patch isLiked por viewer
       if (viewerId && items.length > 0) {
         const likedIds = await likes.findLikedPostIds(
           viewerId,
@@ -114,11 +121,11 @@ export async function postsRoutes(
         items = items.map((p) => ({ ...p, isLiked: likedSet.has(p.id) }));
       }
 
-      if (filter === 'recent' && viewerId) {
+      if (filter === "recent" && viewerId) {
         const own = await posts.findLatestByAuthorInFilter(viewerId, {
           gospelCardId,
           category,
-          statuses: ['published', 'pending_review'],
+          statuses: ["published", "pending_review"],
         });
         if (own && !items.some((p) => p.id === own.id)) {
           const ownPublic = await presentOne(own, db);
@@ -131,12 +138,12 @@ export async function postsRoutes(
   );
 
   f.get(
-    '/posts/:id',
+    "/posts/:id",
     {
       schema: {
         params: PostIdParams,
         response: {
-          200: ListPostsResponse.shape.posts.element.transform((p) => ({ post: p })),
+          200: z.object({ post: ListPostsResponse.shape.posts.element }),
           404: ErrorResponse,
           429: ErrorResponse,
         },
@@ -147,30 +154,31 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
-
       const post = await posts.findById(request.params.id);
-      if (!post || (post.status !== 'published' && post.status !== 'pending_review')) {
-        return reply.code(404).send({ error: 'not_found' });
+      if (
+        !post ||
+        (post.status !== "published" && post.status !== "pending_review")
+      ) {
+        return reply.code(404).send({ error: "not_found" });
       }
-
       const [presented] = await presentPosts([post], db);
       return reply.code(200).send({ post: presented! });
     },
   );
 
   f.post(
-    '/posts',
+    "/posts",
     {
       preHandler: authPre,
       schema: {
-        headers: z.object({ 'idempotency-key': z.string().min(16).max(128) }),
+        headers: z.object({ "idempotency-key": z.string().min(16).max(128) }),
         body: CreatePostRequest,
         response: {
           201: CreatePostResponse,
-          400: ErrorResponse,
+          400: z.union([ErrorResponse, z.object({ error: z.string() })]),
           409: ErrorResponse,
           429: ErrorResponse,
         },
@@ -182,59 +190,40 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const idemKey = request.headers['idempotency-key'] as string;
-      const existing = await idem.get(userId, idemKey);
-      if (existing) {
-        return reply.code(201).send(existing.response as CreatePostResponse);
+      const idemKey = request.headers["idempotency-key"] as string;
+      const result = await createPostService(
+        deps,
+        userId,
+        request.body,
+        idemKey,
+      );
+
+      if (!result.ok) {
+        const code = result.error.status;
+        return reply.code(code).send({ error: result.error.code });
       }
 
-      const body = request.body;
-      let gospelCardId: string | null = null;
-      if (body.gospelCardSlug) {
-        const card = await cards.findBySlug(body.gospelCardSlug);
-        if (!card) return reply.code(400).send({ error: 'gospel_card_not_found' });
-        gospelCardId = card.id;
-      }
-
-      const post = await posts.create({
-        authorId: userId,
-        category: body.category,
-        title: body.title,
-        content: body.content,
-        status: 'published',
-        gospelCardId,
-      });
-
-      const presented = await presentOne(post, db);
-      const response: CreatePostResponse = {
-        post: presented,
-        status: post.status,
-      };
-
-      await idem.set(idemKey, userId, 'post.create', response);
       await feedCache.invalidate();
-      await outbox.enqueue({
-        aggregateType: 'post',
-        aggregateId: post.id,
-        eventType: 'post.created',
-        payload: { postId: post.id, authorId: userId },
-      });
-
-      return reply.code(201).send(response);
+      return reply.code(201).send(result.data);
     },
   );
 
   f.delete(
-    '/posts/:id',
+    "/posts/:id",
     {
       preHandler: authPre,
       schema: {
         params: PostIdParams,
-        response: { 200: z.object({ ok: z.literal(true) }), 403: ErrorResponse, 404: ErrorResponse, 429: ErrorResponse },
+        response: {
+          200: z.object({ ok: z.literal(true) }),
+          403: ErrorResponse,
+          404: ErrorResponse,
+          429: ErrorResponse,
+        },
       },
     },
     async (request, reply) => {
@@ -243,31 +232,23 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const post = await posts.findById(request.params.id);
-      if (!post) return reply.code(404).send({ error: 'not_found' });
-      if (post.authorId !== userId) {
-        return reply.code(403).send({ error: 'forbidden' });
-      }
+      const result = await deletePostService(deps, userId, request.params.id);
+      if (!result.ok)
+        return reply
+          .code(result.error.status)
+          .send({ error: result.error.code });
 
-      await posts.delete(post.id);
       await feedCache.invalidate();
-      await outbox.enqueue({
-        aggregateType: 'post',
-        aggregateId: post.id,
-        eventType: 'post.deleted',
-        payload: { postId: post.id },
-      });
-
       return reply.code(200).send({ ok: true });
     },
   );
 
   f.post(
-    '/posts/:id/like',
+    "/posts/:id/like",
     {
       preHandler: authPre,
       schema: {
@@ -281,28 +262,23 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const post = await posts.findById(request.params.id);
-      if (!post || post.status !== 'published') {
-        return reply.code(404).send({ error: 'not_found' });
-      }
+      const result = await likePostService(deps, userId, request.params.id);
+      if (!result.ok)
+        return reply
+          .code(result.error.status)
+          .send({ error: result.error.code });
 
-      const inserted = await likes.like(post.id, userId);
-      const likesCount = inserted
-        ? await posts.incrementLikes(post.id, 1)
-        : post.likesCount;
-
-      if (inserted) await feedCache.invalidate();
-
-      return reply.code(200).send({ likesCount, isLiked: true });
+      await feedCache.invalidate();
+      return reply.code(200).send(result.data);
     },
   );
 
   f.delete(
-    '/posts/:id/like',
+    "/posts/:id/like",
     {
       preHandler: authPre,
       schema: {
@@ -316,26 +292,23 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const post = await posts.findById(request.params.id);
-      if (!post) return reply.code(404).send({ error: 'not_found' });
+      const result = await unlikePostService(deps, userId, request.params.id);
+      if (!result.ok)
+        return reply
+          .code(result.error.status)
+          .send({ error: result.error.code });
 
-      const removed = await likes.unlike(post.id, userId);
-      const likesCount = removed
-        ? await posts.incrementLikes(post.id, -1)
-        : post.likesCount;
-
-      if (removed) await feedCache.invalidate();
-
-      return reply.code(200).send({ likesCount, isLiked: false });
+      await feedCache.invalidate();
+      return reply.code(200).send(result.data);
     },
   );
 
   f.post(
-    '/posts/:id/report',
+    "/posts/:id/report",
     {
       preHandler: authPre,
       schema: {
@@ -344,7 +317,7 @@ export async function postsRoutes(
         response: {
           200: ReportResponse,
           400: z.union([ReportResponse, ErrorResponse]),
-          404: ReportResponse,
+          404: z.union([ReportResponse, ErrorResponse]),
           429: ErrorResponse,
         },
       },
@@ -355,32 +328,34 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const result = await reports.file({
-        postId: request.params.id,
-        reporterId: userId,
-        reason: request.body.reason,
-      });
+      const result = await reportPostService(
+        deps,
+        userId,
+        request.params.id,
+        request.body.reason,
+      );
+      if (!result.ok) {
+        return reply
+          .code(result.error.status)
+          .send({
+            outcome:
+              result.error.code === "not_found"
+                ? ("post_not_found" as ReportOutcome)
+                : (result.error.code as ReportOutcome),
+          });
+      }   
 
-      switch (result.outcome) {
-        case 'created':
-          await feedCache.invalidate();
-          return reply.code(200).send({ outcome: 'created' });
-        case 'duplicate':
-          return reply.code(200).send({ outcome: 'duplicate' });
-        case 'own_post':
-          return reply.code(400).send({ outcome: 'own_post' });
-        case 'post_not_found':
-          return reply.code(404).send({ outcome: 'post_not_found' });
-      }
+      if (result.data.outcome === "created") await feedCache.invalidate();
+      return reply.code(200).send(result.data);
     },
   );
 
   f.delete(
-    '/posts/:id/report',
+    "/posts/:id/report",
     {
       preHandler: authPre,
       schema: {
@@ -398,21 +373,18 @@ export async function postsRoutes(
       if (!rl.allowed) {
         return reply
           .code(429)
-          .header('Retry-After', String(rl.retryAfter ?? 60))
-          .send({ error: 'rate_limited' });
+          .header("Retry-After", String(rl.retryAfter ?? 60))
+          .send({ error: "rate_limited" });
       }
 
-      const existing = await reports.findOpenByPostAndReporter(
-        request.params.id,
-        userId,
-      );
-      if (!existing) return reply.code(404).send({ error: 'not_found' });
-
-      const cancelled = await reports.cancel(existing.id, userId);
-      if (!cancelled) return reply.code(404).send({ error: 'not_found' });
+      const result = await unreportPostService(deps, userId, request.params.id);
+      if (!result.ok)
+        return reply
+          .code(result.error.status)
+          .send({ error: result.error.code });
 
       await feedCache.invalidate();
-      return reply.code(200).send({ cancelled: true });
+      return reply.code(200).send(result.data);
     },
   );
 }
