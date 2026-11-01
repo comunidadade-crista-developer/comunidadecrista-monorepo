@@ -14,6 +14,7 @@ process.env.RATE_LIMIT_LOGIN_ACCOUNT_MAX = "1000";
 process.env.RATE_LIMIT_RECOVER_IP_MAX = "1000";
 process.env.RATE_LIMIT_RECOVER_ACCOUNT_QUESTIONS_MAX = "1000";
 process.env.RATE_LIMIT_RECOVER_ACCOUNT_CODE_MAX = "1000";
+process.env.RATE_LIMIT_CARDS_MAX = "1000";
 
 // Chaves JWT efémeras por run (nunca reutilizar)
 if (!process.env.JWT_PRIVATE_JWK || !process.env.JWT_PUBLIC_JWK) {

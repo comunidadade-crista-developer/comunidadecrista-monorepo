@@ -32,6 +32,8 @@ export interface RateLimiters {
     username: string,
     mode: RecoverMode,
   ): Promise<void>;
+  /** Leitura pública dos gospel cards: 1 balde por IP. */
+  checkCardsPublic(ip: string): Promise<RateLimitResult>;
 }
 
 /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
@@ -121,6 +123,12 @@ export function createRateLimiters(
     ),
   };
 
+  const cardsPublic = make(
+    "rl:cards",
+    env.RATE_LIMIT_CARDS_MAX,
+    env.RATE_LIMIT_CARDS_WINDOW_S,
+  );
+
   const consume = async (
     limiter: RateLimiterAbstract,
     key: string,
@@ -129,7 +137,6 @@ export function createRateLimiters(
       await limiter.consume(key);
       return { allowed: true };
     } catch (err) {
-      // Balde esgotado: o limitador rejeita com um RateLimiterRes.
       if (err && typeof err === "object" && "msBeforeNext" in err) {
         const ms = (err as { msBeforeNext: number }).msBeforeNext;
         return {
@@ -146,7 +153,6 @@ export function createRateLimiters(
     }
   };
 
-  // Consome por ordem e pára no primeiro balde esgotado (os seguintes não gastam pontos).
   const consumeAll = async (
     steps: ReadonlyArray<readonly [RateLimiterAbstract, string]>,
   ): Promise<RateLimitResult> => {
@@ -202,5 +208,6 @@ export function createRateLimiters(
         () => recoverAccount[mode].reward(anon(user), 1),
       ]);
     },
+    checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
   };
 }

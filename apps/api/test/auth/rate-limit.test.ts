@@ -102,6 +102,18 @@ describe("rate limit — registo", () => {
   });
 });
 
+describe("rate limit — gospel cards (leitura pública)", () => {
+  it("bloqueia por IP ao exceder, com retryAfter; outro IP não é afectado", async () => {
+    const rl = make({ RATE_LIMIT_CARDS_MAX: 2 });
+    expect((await rl.checkCardsPublic("1.1.1.1")).allowed).toBe(true);
+    expect((await rl.checkCardsPublic("1.1.1.1")).allowed).toBe(true);
+    const blocked = await rl.checkCardsPublic("1.1.1.1");
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfter).toBeGreaterThan(0);
+    expect((await rl.checkCardsPublic("2.2.2.2")).allowed).toBe(true);
+  });
+});
+
 describe("rate limit — Redis indisponível", () => {
   it("continua a limitar em memória (não falha em aberto)", async () => {
     // Porta 1: ligação recusada. Sem fila offline, cada comando falha de imediato.

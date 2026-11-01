@@ -479,19 +479,21 @@ sequenceDiagram
 
 ## 9. Estratégia de caching
 
-| Chave                               | TTL  | Invalidação                           |
-| ----------------------------------- | ---- | ------------------------------------- |
-| `feed:{category}:{filter}:{cursor}` | 60s  | Ao publicar/apagar post na categoria  |
-| `post:{id}`                         | 120s | Ao editar, apagar, mudar status, like |
-| `post:{id}:likes_count`             | 120s | Ao like/unlike (increment atómico)    |
-| `cards:list`                        | 1h   | Só em seed de conteúdo                |
-| `user:{id}:profile`                 | 60s  | Ao alterar username                   |
+| Chave                                    | TTL                  | Invalidação                                        |
+| ---------------------------------------- | -------------------- | -------------------------------------------------- |
+| `feed:{category}:{filter}:{cursor}`      | 60s                  | Ao publicar/apagar post na categoria               |
+| `post:{id}`                              | 120s                 | Ao editar, apagar, mudar status, like              |
+| `post:{id}:likes_count`                  | 120s                 | Ao like/unlike (increment atómico)                 |
+| `cc:v1:cards:v<N>:list` / `:item:<slug>` | 1h (L2) / 5 min (L1) | Só em seed: `INCR` da versão `cc:v1:cards:version` |
+| `user:{id}:profile`                      | 60s                  | Ao alterar username                                |
 
 **Regras**
 
 - Cache-aside: o backend lê do Redis, em falha vai a Postgres.
 - Contadores (`likes_count`, `reports_count`) mantidos em Postgres como fonte de verdade; Redis só acelera leitura.
-- Rate limit: `@upstash/ratelimit` (sliding window).
+- Rate limit: `rate-limiter-flexible` (Redis, com fallback em memória que nunca falha em aberto).
+- Gospel cards (E3): duas camadas. L1 em memória do processo (lista e cards montados; um hit não toca no Redis nem na BD) e L2 no Redis com chaves versionadas. A versão lê-se do Redis no máximo 1×/min por instância; invalidar = `INCR` da versão. Redis em baixo → continua com a última versão conhecida e depois vai à BD. O que vem do Redis é validado com zod. Cache negativa (60 s, máx. 1000 entradas) e _single-flight_ protegem a BD. Ver `docs/registos/E3-gospel-cards-cache.md`.
+- Cache HTTP: só as respostas públicas dos cards (200/304) podem ser guardadas (`public, max-age=300, stale-while-revalidate=86400` + `ETag`); todo o resto é `no-store`.
 
 ## 10. Estratégia de cold start
 

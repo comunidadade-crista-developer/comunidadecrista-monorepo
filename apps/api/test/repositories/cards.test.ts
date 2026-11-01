@@ -57,3 +57,49 @@ describe("cardsRepo", () => {
     expect(all[0]!.orderIndex).toBe(2);
   });
 });
+
+describe("cardsRepo.upsertMany", () => {
+  it("cria e actualiza numa só chamada e devolve as contagens", async () => {
+    const db = await getTestDb();
+    const repo = cardsRepo(db);
+    await repo.create(sample("existente", 1));
+
+    const result = await repo.upsertMany([
+      { ...sample("existente", 1), title: "Novo título" },
+      sample("novo", 2),
+    ]);
+    expect(result).toEqual({ created: 1, updated: 1 });
+
+    const all = await repo.list();
+    expect(all.map((c) => c.slug)).toEqual(["existente", "novo"]);
+    expect(all[0]!.title).toBe("Novo título");
+  });
+
+  it("é idempotente", async () => {
+    const db = await getTestDb();
+    const repo = cardsRepo(db);
+    const items = [sample("a", 1), sample("b", 2)];
+    expect(await repo.upsertMany(items)).toEqual({ created: 2, updated: 0 });
+    expect(await repo.upsertMany(items)).toEqual({ created: 0, updated: 2 });
+    expect(await repo.list()).toHaveLength(2);
+  });
+
+  it("transacção: se um item falha, nenhum fica gravado", async () => {
+    const db = await getTestDb();
+    const repo = cardsRepo(db);
+    const broken = {
+      ...sample("quebrado", 2),
+      title: null as unknown as string,
+    };
+    await expect(repo.upsertMany([sample("bom", 1), broken])).rejects.toThrow();
+    expect(await repo.list()).toHaveLength(0);
+  });
+
+  it("lista vazia não faz nada", async () => {
+    const db = await getTestDb();
+    expect(await cardsRepo(db).upsertMany([])).toEqual({
+      created: 0,
+      updated: 0,
+    });
+  });
+});

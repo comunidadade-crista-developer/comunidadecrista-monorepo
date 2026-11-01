@@ -16,6 +16,7 @@ import { createJwtService } from "./auth/jwt.js";
 import { createPasswordService } from "./auth/password.js";
 import { createRateLimiters } from "./auth/rate-limit.js";
 import { createRecoveryService } from "./auth/recovery.js";
+import { createCardsCache } from "./cache/cards-cache.js";
 import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
 import { errorHandler, notFoundHandler } from "./http-errors.js";
@@ -26,8 +27,10 @@ import {
   createRedis,
   waitUntilReady,
 } from "./redis.js";
+import { cardsRepo } from "./repositories/cards.js";
 import { accountRoutes } from "./routes/account.js";
 import { authRoutes } from "./routes/auth.js";
+import { cardsRoutes } from "./routes/cards.js";
 import { healthRoutes } from "./routes/health.js";
 
 export type AppInstance = FastifyInstance<
@@ -44,8 +47,6 @@ export interface BuildServerOptions {
   logStream?: NodeJS.WritableStream;
 }
 
-// Privacidade: os logs nunca levam IP, cabeçalhos nem query string. O Fastify, por omissão,
-// regista remoteAddress/remotePort em cada pedido — aqui o serializer `req` substitui-o.
 const LOG_REDACT_PATHS = [
   "req.headers.authorization",
   "req.headers.cookie",
@@ -104,9 +105,13 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
   app.decorateRequest("clientIp", "");
   app.addHook("onRequest", createEdgeGuard(env).onRequest);
 
-  // Respostas da API nunca devem ser guardadas em cache (Cloudflare, browsers, proxies).
   app.addHook("onSend", async (_request, reply, payload) => {
-    reply.header("Cache-Control", "no-store");
+    const declared = reply.getHeader("Cache-Control");
+    const publicOk =
+      (reply.statusCode === 200 || reply.statusCode === 304) &&
+      typeof declared === "string" &&
+      declared.startsWith("public");
+    if (!publicOk) reply.header("Cache-Control", "no-store");
     return payload;
   });
 
@@ -176,6 +181,14 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       jwt,
       limiters,
     });
+    await app.register(cardsRoutes, {
+      cache: createCardsCache({
+        redis,
+        cards: cardsRepo(dbBundle.db),
+        logger: app.log,
+      }),
+      limiters,
+    });
 
     // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
     // corre-se `runMaintenance` à mão.
@@ -188,7 +201,9 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       app.addHook("onClose", async () => stopMaintenance());
     }
   } else {
-    app.log.warn("DATABASE_URL não configurado — rotas de auth desactivadas.");
+    app.log.warn(
+      "DATABASE_URL não configurado — rotas de auth, conta e cards desactivadas.",
+    );
   }
 
   return app;
