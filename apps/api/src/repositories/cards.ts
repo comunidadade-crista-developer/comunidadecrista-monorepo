@@ -37,19 +37,50 @@ export function cardsRepo(db: Database) {
         .values(data)
         .onConflictDoUpdate({
           target: gospelCards.slug,
-          set: {
-            title: data.title,
-            gospelReference: data.gospelReference,
-            summary: data.summary,
-            otReferences: data.otReferences,
-            ntReferences: data.ntReferences,
-            orderIndex: data.orderIndex,
-          },
+          set: conflictSet(data),
         })
         .returning();
       return row!;
     },
+
+    async upsertMany(
+      items: NewGospelCard[],
+    ): Promise<{ created: number; updated: number }> {
+      if (items.length === 0) return { created: 0, updated: 0 };
+      return db.transaction(async (tx) => {
+        const existing = await tx
+          .select({ slug: gospelCards.slug })
+          .from(gospelCards)
+          .where(
+            inArray(
+              gospelCards.slug,
+              items.map((i) => i.slug),
+            ),
+          );
+        const known = new Set(existing.map((r) => r.slug));
+        for (const data of items) {
+          await tx
+            .insert(gospelCards)
+            .values(data)
+            .onConflictDoUpdate({
+              target: gospelCards.slug,
+              set: conflictSet(data),
+            });
+        }
+        const updated = items.filter((i) => known.has(i.slug)).length;
+        return { created: items.length - updated, updated };
+      });
+    },
   };
 }
 
-//
+function conflictSet(data: NewGospelCard) {
+  return {
+    title: data.title,
+    gospelReference: data.gospelReference,
+    summary: data.summary,
+    otReferences: data.otReferences,
+    ntReferences: data.ntReferences,
+    orderIndex: data.orderIndex,
+  };
+}

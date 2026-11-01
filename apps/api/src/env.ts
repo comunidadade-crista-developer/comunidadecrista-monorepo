@@ -117,6 +117,8 @@ const BaseEnvSchema = z.object({
     .int()
     .positive()
     .default(3600),
+  RATE_LIMIT_CARDS_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_CARDS_WINDOW_S: z.coerce.number().int().positive().default(60),
 });
 
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
