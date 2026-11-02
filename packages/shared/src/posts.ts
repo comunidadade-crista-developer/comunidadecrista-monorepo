@@ -80,18 +80,44 @@ export const LikeResponse = z.object({
 });
 export type LikeResponse = z.infer<typeof LikeResponse>;
 
-export const ReportRequest = z.object({
-  reason: z.string().min(3, "razão demasiado curta").max(500),
-});
+export const ReportCategory = z.enum([
+  "spam",
+  "off_topic",
+  "offensive",
+  "doctrine",
+  "other",
+]);
+export type ReportCategory = z.infer<typeof ReportCategory>;
+
+export const ReportSeverity = z.enum(["basic", "medium", "high"]);
+export type ReportSeverity = z.infer<typeof ReportSeverity>;
+
+export const CATEGORY_TO_SEVERITY: Record<ReportCategory, ReportSeverity> = {
+  spam: "basic",
+  off_topic: "basic",
+  offensive: "medium",
+  doctrine: "high",
+  other: "basic",
+};
+
+export const ReportRequest = z
+  .object({
+    category: ReportCategory,
+    reason: z.string().min(3).max(500).optional(),
+  })
+  .refine((d) => d.category !== "other" || (d.reason?.length ?? 0) >= 3, {
+    message: 'motivo obrigatório para "outro"',
+    path: ["reason"],
+  });
 export type ReportRequest = z.infer<typeof ReportRequest>;
 
 export const ReportOutcome = z.enum([
-  'created',
-  'duplicate',
-  'own_post',
-  'post_not_found',
+  "created",
+  "duplicate",
+  "own_post",
+  "post_not_found",
 ]);
 export type ReportOutcome = z.infer<typeof ReportOutcome>;
 
 export const ReportResponse = z.object({ outcome: ReportOutcome });
-export type ReportResponse = z.infer<typeof ReportResponse>;
+export type ReportResponse = z.infer<typeof ReportResponse>;   

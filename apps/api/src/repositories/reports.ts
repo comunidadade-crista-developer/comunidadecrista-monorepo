@@ -1,77 +1,146 @@
-import { and, count, desc, eq, lte, sql } from "drizzle-orm";
-import type { Executor } from "../db/client.js";
-import { moderationLog, posts, reports, users } from "../db/schema.js";
-import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
+import { and, eq, sql } from 'drizzle-orm';
+import type { ReportCategory, ReportSeverity } from '@comunidade/shared';
+import { CATEGORY_TO_SEVERITY } from '@comunidade/shared';
+import type { Executor } from '../db/client.js';
+import type { Report } from '../db/schema.js';
+import { moderationLog, posts, reports, users } from '../db/schema.js';
 
-/** Nº de denúncias válidas e abertas a partir do qual o post passa a "Em revisão". */
-export const REPORT_THRESHOLD = 10;
-/** Idade mínima da conta de quem denuncia para a denúncia contar para o limiar. */
+export const DEFAULT_THRESHOLDS: Record<ReportSeverity, number> = {
+  basic: 10,
+  medium: 5,
+  high: 2,
+};
+
+/** @deprecated usar DEFAULT_THRESHOLDS.basic */
+export const REPORT_THRESHOLD = DEFAULT_THRESHOLDS.basic;
 export const REPORTER_MIN_AGE_DAYS = 7;
 
-type Tx = Parameters<Parameters<Executor["transaction"]>[0]>[0];
-
-export interface ReportRules {
-  threshold?: number;
-  minAgeDays?: number;
+export interface FileReportArgs {
+  postId: string;
+  reporterId: string;
+  category: ReportCategory;
+  reason?: string;
 }
 
-export type FileReportResult =
-  /** O post não existe ou não está publicado (não é visível para quem denuncia). */
-  | { outcome: "post_not_found" }
-  | { outcome: "own_post" }
-  /** Já existe uma denúncia deste utilizador para este post (aberta ou resolvida). */
-  | { outcome: "duplicate" }
+export interface FileReportRules {
+  thresholds?: Partial<Record<ReportSeverity, number>>;
+}
+
+export type FileReportOutcome =
   | {
-      outcome: "created";
+      outcome: 'created';
       report: Report;
-      /** Denúncias abertas deste post (todas). */
       reportsCount: number;
-      /** Denúncias abertas que contam para o limiar. */
       validReports: number;
-      /** Esta denúncia fez o post passar a "Em revisão". */
+      validReportsBySeverity: Record<ReportSeverity, number>;
       escalated: boolean;
-    };
-
-/**
- * Denúncias abertas que contam para o limiar: a conta tem a idade mínima e já fez pelo
- * menos uma partilha (anti-abuso: contas novas ou sem partilhas não contam).
- */
-async function countValidOpen(
-  tx: Tx,
-  postId: string,
-  minAgeDays: number,
-): Promise<number> {
-  const [row] = await tx
-    .select({ c: count() })
-    .from(reports)
-    .innerJoin(users, eq(users.id, reports.reporterId))
-    .where(
-      and(
-        eq(reports.postId, postId),
-        eq(reports.status, "open"),
-        lte(
-          users.createdAt,
-          sql`now() - make_interval(days => ${minAgeDays}::int)`,
-        ),
-        sql`EXISTS (SELECT 1 FROM ${posts} WHERE ${posts.authorId} = ${users.id})`,
-      ),
-    );
-  return Number(row?.c ?? 0);
-}
+    }
+  | { outcome: 'duplicate' }
+  | { outcome: 'own_post' }
+  | { outcome: 'post_not_found' };
 
 export function reportsRepo(db: Executor) {
   return {
-    /**
-     * Operação de baixo nível: só insere a linha, sem regras nem contadores.
-     * As rotas devem usar `file`, que aplica as regras de negócio numa transacção.
-     */
-    async create(data: NewReport): Promise<Report | null> {
-      const result = await db
-        .insert(reports)
-        .values(data)
-        .onConflictDoNothing()
-        .returning();
-      return result[0] ?? null;
+    async file(
+      args: FileReportArgs,
+      rules: FileReportRules = {},
+      tx?: Executor,
+    ): Promise<FileReportOutcome> {
+      const exec = tx ?? db;
+      const thresholds = { ...DEFAULT_THRESHOLDS, ...(rules.thresholds ?? {}) };
+      const severity = CATEGORY_TO_SEVERITY[args.category];
+
+      return exec.transaction(async (t) => {
+        // 1) Post existe e está publicado?
+        const [post] = await t
+          .select({ id: posts.id, authorId: posts.authorId, status: posts.status, reportsCount: posts.reportsCount })
+          .from(posts)
+          .where(eq(posts.id, args.postId))
+          .for('update')
+          .limit(1);
+
+        if (!post || post.status !== 'published') return { outcome: 'post_not_found' as const };
+        if (post.authorId === args.reporterId) return { outcome: 'own_post' as const };
+
+        // 2) Insert (unique (post, reporter) previne duplicado)
+        const inserted = await t
+          .insert(reports)
+          .values({
+            postId: args.postId,
+            reporterId: args.reporterId,
+            category: args.category,
+            severity,
+            reason: args.reason ?? null,
+          })
+          .onConflictDoNothing()
+          .returning();
+
+        if (inserted.length === 0) {
+          // Já existe (aberta ou já resolvida) → duplicate, sem alterar contadores.
+          return { outcome: 'duplicate' as const };
+        }
+
+        const report = inserted[0]!;
+
+        // 3) Incrementa reports_count (total) no post
+        const [updatedPost] = await t
+          .update(posts)
+          .set({ reportsCount: sql`${posts.reportsCount} + 1` })
+          .where(eq(posts.id, args.postId))
+          .returning({ reportsCount: posts.reportsCount });
+
+        const reportsCount = updatedPost?.reportsCount ?? post.reportsCount + 1;
+
+        // 4) Conta reportes válidos por severidade
+        const validRows = await t
+          .select({
+            severity: reports.severity,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(reports)
+          .innerJoin(users, eq(reports.reporterId, users.id))
+          .where(
+            and(
+              eq(reports.postId, args.postId),
+              eq(reports.status, 'open'),
+              sql`${users.createdAt} <= now() - interval '${sql.raw(String(REPORTER_MIN_AGE_DAYS))} days'`,
+              sql`EXISTS (SELECT 1 FROM posts p WHERE p.author_id = ${users.id})`,
+            ),
+          )
+          .groupBy(reports.severity);
+
+        const bySeverity: Record<ReportSeverity, number> = { basic: 0, medium: 0, high: 0 };
+        for (const row of validRows) {
+          bySeverity[row.severity as ReportSeverity] = row.count;
+        }
+
+        const validReports =
+          bySeverity.basic + bySeverity.medium + bySeverity.high;
+
+        // 5) Escalation check — só uma actualização para pending_review
+        const willEscalate =
+          bySeverity.basic >= thresholds.basic ||
+          bySeverity.medium >= thresholds.medium ||
+          bySeverity.high >= thresholds.high;
+
+        let escalated = false;
+        if (willEscalate && post.status === 'published') {
+          await t
+            .update(posts)
+            .set({ status: 'pending_review' })
+            .where(and(eq(posts.id, args.postId), eq(posts.status, 'published')));
+          escalated = true;
+        }
+
+        return {
+          outcome: 'created' as const,
+          report,
+          reportsCount,
+          validReports,
+          validReportsBySeverity: bySeverity,
+          escalated,
+        };
+      });
     },
 
     async findOpenByPostAndReporter(
@@ -85,7 +154,7 @@ export function reportsRepo(db: Executor) {
           and(
             eq(reports.postId, postId),
             eq(reports.reporterId, reporterId),
-            eq(reports.status, "open"),
+            eq(reports.status, 'open'),
           ),
         )
         .limit(1);
@@ -94,128 +163,31 @@ export function reportsRepo(db: Executor) {
 
     async countOpenByPost(postId: string): Promise<number> {
       const [row] = await db
-        .select({ c: count() })
+        .select({ count: sql<number>`count(*)::int` })
         .from(reports)
-        .where(and(eq(reports.postId, postId), eq(reports.status, "open")));
-      return Number(row?.c ?? 0);
+        .where(and(eq(reports.postId, postId), eq(reports.status, 'open')));
+      return row?.count ?? 0;
     },
 
-    /**
-     * Denuncia um post. Tudo numa transacção, com o post bloqueado (FOR NO KEY UPDATE) para
-     * serializar denúncias concorrentes ao mesmo post: o contador e o limiar nunca se perdem
-     * e só uma denúncia pode ser a que escala o post.
-     *
-     * Regras: só posts publicados; sem auto-denúncia; uma denúncia por utilizador e post;
-     * ao atingir o limiar de denúncias válidas, o post passa a `pending_review`.
-     */
-    async file(
-      args: { postId: string; reporterId: string; reason: string },
-      rules: ReportRules = {},
-    ): Promise<FileReportResult> {
-      const threshold = rules.threshold ?? REPORT_THRESHOLD;
-      const minAgeDays = rules.minAgeDays ?? REPORTER_MIN_AGE_DAYS;
-
-      return db.transaction(async (tx) => {
-        const [post] = await tx
-          .select({ status: posts.status, authorId: posts.authorId })
-          .from(posts)
-          .where(eq(posts.id, args.postId))
-          .for("no key update")
-          .limit(1);
-        if (!post || post.status !== "published") {
-          return { outcome: "post_not_found" as const };
-        }
-        if (post.authorId === args.reporterId) {
-          return { outcome: "own_post" as const };
-        }
-
-        const [report] = await tx
-          .insert(reports)
-          .values({
-            postId: args.postId,
-            reporterId: args.reporterId,
-            reason: args.reason,
-          })
-          .onConflictDoNothing()
-          .returning();
-        if (!report) return { outcome: "duplicate" as const };
-
-        const [counted] = await tx
-          .update(posts)
-          .set({ reportsCount: sql`${posts.reportsCount} + 1` })
-          .where(eq(posts.id, args.postId))
-          .returning({ reportsCount: posts.reportsCount });
-
-        const validReports = await countValidOpen(tx, args.postId, minAgeDays);
-        let escalated = false;
-        if (validReports >= threshold) {
-          // Só sai de "published": nunca ressuscita um post oculto ou rejeitado.
-          const moved = await tx
-            .update(posts)
-            .set({ status: "pending_review" })
-            .where(
-              and(eq(posts.id, args.postId), eq(posts.status, "published")),
-            )
-            .returning({ id: posts.id });
-          escalated = moved.length > 0;
-        }
-
-        return {
-          outcome: "created" as const,
-          report,
-          reportsCount: counted?.reportsCount ?? 0,
-          validReports,
-          escalated,
-        };
-      });
-    },
-
-    /**
-     * Cancela uma denúncia ABERTA do próprio utilizador e actualiza o contador. Uma denúncia
-     * já resolvida não se cancela. Cancelar não tira o post de "Em revisão": quem decide é o
-     * admin.
-     */
-    async cancel(id: string, userId: string): Promise<boolean> {
-      return db.transaction(async (tx) => {
-        const [own] = await tx
-          .select({ postId: reports.postId })
+    async cancel(reportId: string, reporterId: string): Promise<boolean> {
+      const result = await db.transaction(async (t) => {
+        const [row] = await t
+          .select({ id: reports.id, postId: reports.postId, status: reports.status })
           .from(reports)
-          .where(
-            and(
-              eq(reports.id, id),
-              eq(reports.reporterId, userId),
-              eq(reports.status, "open"),
-            ),
-          )
+          .where(and(eq(reports.id, reportId), eq(reports.reporterId, reporterId)))
+          .for('update')
           .limit(1);
-        if (!own) return false;
 
-        // Mesma ordem de bloqueios que `file` (post primeiro): evita deadlock se o mesmo
-        // utilizador cancelar e voltar a denunciar em simultâneo.
-        await tx
-          .select({ id: posts.id })
-          .from(posts)
-          .where(eq(posts.id, own.postId))
-          .for("no key update");
+        if (!row || row.status !== 'open') return false;
 
-        const removed = await tx
-          .delete(reports)
-          .where(
-            and(
-              eq(reports.id, id),
-              eq(reports.reporterId, userId),
-              eq(reports.status, "open"),
-            ),
-          )
-          .returning({ id: reports.id });
-        if (removed.length === 0) return false;
-
-        await tx
+        await t.delete(reports).where(eq(reports.id, reportId));
+        await t
           .update(posts)
           .set({ reportsCount: sql`GREATEST(${posts.reportsCount} - 1, 0)` })
-          .where(eq(posts.id, own.postId));
+          .where(eq(posts.id, row.postId));
         return true;
       });
+      return result;
     },
 
     async listByReporter(reporterId: string): Promise<Report[]> {
@@ -223,26 +195,20 @@ export function reportsRepo(db: Executor) {
         .select()
         .from(reports)
         .where(eq(reports.reporterId, reporterId))
-        .orderBy(desc(reports.createdAt));
+        .orderBy(reports.createdAt);
     },
 
     async resolveAllForPost(
       postId: string,
-      status: "resolved_kept" | "resolved_removed",
+      status: 'resolved_kept' | 'resolved_removed',
       resolvedBy: string,
     ): Promise<void> {
-      await db.transaction(async (tx) => {
-        await tx
-          .select({ id: posts.id })
-          .from(posts)
-          .where(eq(posts.id, postId))
-          .for("no key update");
-        await tx
+      await db.transaction(async (t) => {
+        await t
           .update(reports)
           .set({ status, resolvedAt: new Date(), resolvedBy })
-          .where(and(eq(reports.postId, postId), eq(reports.status, "open")));
-        // `reports_count` = denúncias abertas: ao resolver, ficam todas fechadas.
-        await tx
+          .where(and(eq(reports.postId, postId), eq(reports.status, 'open')));
+        await t
           .update(posts)
           .set({ reportsCount: 0 })
           .where(eq(posts.id, postId));
@@ -253,26 +219,24 @@ export function reportsRepo(db: Executor) {
 
 export function moderationLogRepo(db: Executor) {
   return {
-    async create(
-      data: typeof moderationLog.$inferInsert,
-    ): Promise<ModerationLogEntry> {
+    async create(data: typeof moderationLog.$inferInsert) {
       const [row] = await db.insert(moderationLog).values(data).returning();
       return row!;
     },
 
-    async listByPost(postId: string): Promise<ModerationLogEntry[]> {
+    async listByPost(postId: string) {
       return db
         .select()
         .from(moderationLog)
         .where(eq(moderationLog.postId, postId))
-        .orderBy(desc(moderationLog.createdAt));
+        .orderBy(moderationLog.createdAt);
     },
 
-    async listRecent(limit = 100): Promise<ModerationLogEntry[]> {
+    async listRecent(limit = 100) {
       return db
         .select()
         .from(moderationLog)
-        .orderBy(desc(moderationLog.createdAt))
+        .orderBy(moderationLog.createdAt)
         .limit(limit);
     },
   };

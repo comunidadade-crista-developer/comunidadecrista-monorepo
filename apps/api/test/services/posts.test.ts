@@ -134,10 +134,10 @@ describe("reportPostService / unreportPostService", () => {
     const post = await makePost(author.id);
     const deps = { db };
 
-    const first = await reportPostService(deps, user.id, post.id, "impróprio");
+    const first = await reportPostService(deps, user.id, post.id, "spam", "impróprio");
     expect(first.ok && first.data.outcome).toBe("created");
 
-    const second = await reportPostService(deps, user.id, post.id, "impróprio");
+    const second = await reportPostService(deps, user.id, post.id, "spam", "impróprio");
     expect(second.ok && second.data.outcome).toBe("duplicate");
 
     const cancel = await unreportPostService(deps, user.id, post.id);
@@ -145,5 +145,45 @@ describe("reportPostService / unreportPostService", () => {
 
     const reports = await reportsRepo(db).countOpenByPost(post.id);
     expect(reports).toBe(0);
+  });
+
+  it("category: 'other' sem reason → reason_required 400", async () => {
+    const db = await getTestDb();
+    const author = await makeUser();
+    const user = await makeUser();
+    const post = await makePost(author.id);
+    const deps = { db };
+
+    const result = await reportPostService(deps, user.id, post.id, "other", undefined);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.code).toBe("reason_required");
+    expect(result.error.status).toBe(400);
+  });
+
+  it("category: 'other' com reason → 200", async () => {
+    const db = await getTestDb();
+    const author = await makeUser();
+    const user = await makeUser();
+    const post = await makePost(author.id);
+    const deps = { db };
+
+    const result = await reportPostService(deps, user.id, post.id, "other", "motivo válido");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data.outcome).toBe("created");
+  });
+
+  it("category: 'spam' sem reason → 200 (reason é opcional para não-'other')", async () => {
+    const db = await getTestDb();
+    const author = await makeUser();
+    const user = await makeUser();
+    const post = await makePost(author.id);
+    const deps = { db };
+
+    const result = await reportPostService(deps, user.id, post.id, "spam", undefined);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.data.outcome).toBe("created");
   });
 });

@@ -13,6 +13,7 @@ import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
 import { makePost, makeUser } from "../helpers/factories.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const CAT = "spam" as const;
 
 beforeEach(async () => {
   await truncateAll();
@@ -47,6 +48,7 @@ describe("reportsRepo.file — regras básicas", () => {
     const result = await reportsRepo(db).file({
       postId: post.id,
       reporterId: reporter.id,
+      category: CAT,
       reason: "conteúdo impróprio",
     });
 
@@ -63,6 +65,7 @@ describe("reportsRepo.file — regras básicas", () => {
     const result = await reportsRepo(db).file({
       postId: uuidv7(),
       reporterId: reporter.id,
+      category: CAT,
       reason: "x",
     });
     expect(result.outcome).toBe("post_not_found");
@@ -78,6 +81,7 @@ describe("reportsRepo.file — regras básicas", () => {
       const result = await reportsRepo(db).file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
       expect(result.outcome).toBe("post_not_found");
@@ -92,6 +96,7 @@ describe("reportsRepo.file — regras básicas", () => {
     const result = await reportsRepo(db).file({
       postId: post.id,
       reporterId: author.id,
+      category: CAT,
       reason: "x",
     });
     expect(result.outcome).toBe("own_post");
@@ -105,7 +110,7 @@ describe("reportsRepo.file — regras básicas", () => {
     const reporter = await makeUser();
     const post = await makePost(author.id);
     const repo = reportsRepo(db);
-    const args = { postId: post.id, reporterId: reporter.id, reason: "x" };
+    const args = { postId: post.id, reporterId: reporter.id, category: CAT, reason: "x" };
 
     expect((await repo.file(args)).outcome).toBe("created");
     expect((await repo.file(args)).outcome).toBe("duplicate");
@@ -119,7 +124,7 @@ describe("reportsRepo.file — regras básicas", () => {
     const admin = await makeUser({ role: "admin" });
     const post = await makePost(author.id);
     const repo = reportsRepo(db);
-    const args = { postId: post.id, reporterId: reporter.id, reason: "x" };
+    const args = { postId: post.id, reporterId: reporter.id, category: CAT, reason: "x" };
 
     await repo.file(args);
     await repo.resolveAllForPost(post.id, "resolved_kept", admin.id);
@@ -139,6 +144,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
       const result = await repo.file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
       expect(result.outcome).toBe("created");
@@ -164,6 +170,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
       await repo.file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
     }
@@ -177,11 +184,12 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
     const repo = reportsRepo(db);
 
     for (let i = 0; i < REPORT_THRESHOLD; i++) {
-      const reporter = await makeUser(); // conta nova
-      await makePost(reporter.id); // tem partilha, mas é recente
+      const reporter = await makeUser();
+      await makePost(reporter.id);
       const r = await repo.file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
       expect(r.outcome).toBe("created");
@@ -205,6 +213,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
       const r = await repo.file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
       if (r.outcome === "created") expect(r.validReports).toBe(0);
@@ -212,21 +221,21 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
     expect((await postRow(post.id)).status).toBe("published");
   });
 
-  it("limiar configurável (rules.threshold)", async () => {
+  it("limiar configurável (rules.thresholds.basic)", async () => {
     const db = await getTestDb();
     const author = await makeUser();
     const post = await makePost(author.id);
     const repo = reportsRepo(db);
-    const rules = { threshold: 2 };
+    const rules = { thresholds: { basic: 2 } };
 
     const a = await makeValidReporter();
     const b = await makeValidReporter();
     const first = await repo.file(
-      { postId: post.id, reporterId: a.id, reason: "x" },
+      { postId: post.id, reporterId: a.id, category: CAT, reason: "x" },
       rules,
     );
     const second = await repo.file(
-      { postId: post.id, reporterId: b.id, reason: "x" },
+      { postId: post.id, reporterId: b.id, category: CAT, reason: "x" },
       rules,
     );
     expect(first.outcome === "created" && first.escalated).toBe(false);
@@ -245,7 +254,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
     }
     const results = await Promise.all(
       reporters.map((r) =>
-        repo.file({ postId: post.id, reporterId: r.id, reason: "x" }),
+        repo.file({ postId: post.id, reporterId: r.id, category: CAT, reason: "x" }),
       ),
     );
 
@@ -270,6 +279,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
     const result = await repo.file({
       postId: post.id,
       reporterId: reporter.id,
+      category: CAT,
       reason: "x",
     });
     if (result.outcome !== "created") throw new Error("esperava created");
@@ -277,12 +287,12 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
     expect(await repo.cancel(result.report.id, reporter.id)).toBe(true);
     expect((await postRow(post.id)).reportsCount).toBe(0);
     expect(await repo.countOpenByPost(post.id)).toBe(0);
-    // Pode denunciar de novo depois de cancelar.
     expect(
       (
         await repo.file({
           postId: post.id,
           reporterId: reporter.id,
+          category: CAT,
           reason: "x",
         })
       ).outcome,
@@ -299,6 +309,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
     const result = await repo.file({
       postId: post.id,
       reporterId: r1.id,
+      category: CAT,
       reason: "x",
     });
     if (result.outcome !== "created") throw new Error("esperava created");
@@ -317,6 +328,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
     const result = await repo.file({
       postId: post.id,
       reporterId: reporter.id,
+      category: CAT,
       reason: "x",
     });
     if (result.outcome !== "created") throw new Error("esperava created");
@@ -333,10 +345,10 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
     const author = await makeUser();
     const post = await makePost(author.id);
     const repo = reportsRepo(db);
-    const rules = { threshold: 1 };
+    const rules = { thresholds: { basic: 1 } };
     const reporter = await makeValidReporter();
     const result = await repo.file(
-      { postId: post.id, reporterId: reporter.id, reason: "x" },
+      { postId: post.id, reporterId: reporter.id, category: CAT, reason: "x" },
       rules,
     );
     if (result.outcome !== "created") throw new Error("esperava created");
@@ -359,6 +371,7 @@ describe("reportsRepo.resolveAllForPost", () => {
       await repo.file({
         postId: post.id,
         reporterId: reporter.id,
+        category: CAT,
         reason: "x",
       });
     }
@@ -368,4 +381,4 @@ describe("reportsRepo.resolveAllForPost", () => {
     expect(await repo.countOpenByPost(post.id)).toBe(0);
     expect((await postRow(post.id)).reportsCount).toBe(0);
   });
-});
+});   

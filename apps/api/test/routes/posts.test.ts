@@ -239,7 +239,7 @@ describe("POST /posts/:id/report", () => {
     const r = await request(app.server)
       .post(`/posts/${post.id}/report`)
       .set("Authorization", `Bearer ${token}`)
-      .send({ reason: "impróprio" });
+      .send({ category: "spam", reason: "motivo de teste" });
     expect(r.status).toBe(200);
     expect(r.body.outcome).toBe("created");
   });
@@ -252,11 +252,11 @@ describe("POST /posts/:id/report", () => {
     await request(app.server)
       .post(`/posts/${post.id}/report`)
       .set("Authorization", `Bearer ${token}`)
-      .send({ reason: "motivo de teste" });
+      .send({ category: "spam", reason: "motivo de teste" });
     const r = await request(app.server)
       .post(`/posts/${post.id}/report`)
       .set("Authorization", `Bearer ${token}`)
-      .send({ reason: "motivo de teste" });
+      .send({ category: "spam", reason: "motivo de teste" });
     expect(r.status).toBe(200);
     expect(r.body.outcome).toBe("duplicate");
   });
@@ -268,7 +268,7 @@ describe("POST /posts/:id/report", () => {
     const r = await request(app.server)
       .post(`/posts/${post.id}/report`)
       .set("Authorization", `Bearer ${token}`)
-      .send({ reason: "motivo de teste" });
+      .send({ category: "spam", reason: "motivo de teste" });
     expect(r.status).toBe(400);
     expect(r.body.outcome).toBe("own_post");
   });
@@ -279,8 +279,135 @@ describe("POST /posts/:id/report", () => {
     const r = await request(app.server)
       .post(`/posts/${crypto.randomUUID()}/report`)
       .set("Authorization", `Bearer ${token}`)
-      .send({ reason: "motivo de teste" });
+      .send({ category: "spam", reason: "motivo de teste" });
     expect(r.status).toBe(404);
     expect(r.body.outcome).toBe("post_not_found");
   });
+
+  it("sem category → 400", async () => {
+    const author = await makeUser();
+    const post = await makePost(author.id);
+    const { user, plainPassword } = await makeUserWithPassword();
+    const token = await loginToken(user.username, plainPassword);
+    const r = await request(app.server)
+      .post(`/posts/${post.id}/report`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ reason: "x" });
+    expect(r.status).toBe(400);
+  });
+
+  it("category: 'other' sem reason → 400", async () => {
+    const author = await makeUser();
+    const post = await makePost(author.id);
+    const { user, plainPassword } = await makeUserWithPassword();
+    const token = await loginToken(user.username, plainPassword);
+    const r = await request(app.server)
+      .post(`/posts/${post.id}/report`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ category: "other" });
+    expect(r.status).toBe(400);
+  });
+
+  it("category: 'other' com reason → 200", async () => {
+    const author = await makeUser();
+    const post = await makePost(author.id);
+    const { user, plainPassword } = await makeUserWithPassword();
+    const token = await loginToken(user.username, plainPassword);
+    const r = await request(app.server)
+      .post(`/posts/${post.id}/report`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ category: "other", reason: "motivo" });
+    expect(r.status).toBe(200);
+    expect(r.body.outcome).toBe("created");
+  });
+
+  it("category: 'spam' sem reason → 200", async () => {
+    const author = await makeUser();
+    const post = await makePost(author.id);
+    const { user, plainPassword } = await makeUserWithPassword();
+    const token = await loginToken(user.username, plainPassword);
+    const r = await request(app.server)
+      .post(`/posts/${post.id}/report`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ category: "spam" });
+    expect(r.status).toBe(200);
+    expect(r.body.outcome).toBe("created");
+  });
+});   
+
+it('link → 400 contains_link', async () => {
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post('/posts')
+    .set('Authorization', `Bearer ${token}`)
+    .set('Idempotency-Key', IDEM())
+    .send({ category: 'entendimento', title: 'T', content: 'visita igreja.com' });
+  expect(r.status).toBe(400);
+  expect(r.body.error).toBe('contains_link');
+});
+
+it('email → 400 contains_contact', async () => {
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post('/posts')
+    .set('Authorization', `Bearer ${token}`)
+    .set('Idempotency-Key', IDEM())
+    .send({ category: 'entendimento', title: 'T', content: 'contacto user@x.com' });
+  expect(r.status).toBe(400);
+  expect(r.body.error).toBe('contains_contact');
+});
+
+it('caps → pending_review', async () => {
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post('/posts')
+    .set('Authorization', `Bearer ${token}`)
+    .set('Idempotency-Key', IDEM())
+    .send({
+      category: 'entendimento',
+      title: 'T',
+      content: 'DEUS É MARAVILHOSO E FIEL EM TODAS AS COISAS',
+    });
+  expect(r.status).toBe(201);
+  expect(r.body.status).toBe('pending_review');
+});
+
+it('report sem category → 400', async () => {
+  const author = await makeUser();
+  const post = await makePost(author.id);
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post(`/posts/${post.id}/report`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ reason: 'x' });
+  expect(r.status).toBe(400);
+});
+
+it('report other sem reason → 400 reason_required', async () => {
+  const author = await makeUser();
+  const post = await makePost(author.id);
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post(`/posts/${post.id}/report`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ category: 'other' });
+  expect(r.status).toBe(400);
+});
+
+it('report spam sem reason → 200', async () => {
+  const author = await makeUser();
+  const post = await makePost(author.id);
+  const { user, plainPassword } = await makeUserWithPassword();
+  const token = await loginToken(user.username, plainPassword);
+  const r = await request(app.server)
+    .post(`/posts/${post.id}/report`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ category: 'spam' });
+  expect(r.status).toBe(200);
+  expect(r.body.outcome).toBe('created');
 });

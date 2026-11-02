@@ -1,4 +1,11 @@
-import type { PostCategory, PostPublic, PostStatus, ReportOutcome, } from "@comunidade/shared";
+import type {
+  PostCategory,
+  PostPublic,
+  PostStatus,
+  ReportCategory,
+  ReportOutcome,
+} from '@comunidade/shared';
+import { checkContent } from '@comunidade/shared';
 import type { Database, Executor } from "../db/client.js";
 import { cardsRepo } from "../repositories/cards.js";
 import { idempotencyKeysRepo, outboxRepo } from "../repositories/outbox.js";
@@ -17,7 +24,10 @@ export type ServiceError =
   | { code: "forbidden"; status: 403 }
   | { code: "own_post"; status: 400 }
   | { code: "idempotency_key_conflict"; status: 409 }
-  | { code: "gospel_card_not_found"; status: 400 };
+  | { code: "gospel_card_not_found"; status: 400 }
+  | { code: "contains_link"; status: 400 }
+  | { code: "contains_contact"; status: 400 }
+  | { code: "reason_required"; status: 400 };   
 
 export type ServiceResult<T, E extends ServiceError = ServiceError> =
   { ok: true; data: T } | { ok: false; error: E };
@@ -36,8 +46,14 @@ export interface CreatePostData {
 
 type CreatePostError = Extract<
   ServiceError,
-  { code: "gospel_card_not_found" | "idempotency_key_conflict" }
->;
+  {
+    code:
+      | 'gospel_card_not_found'
+      | 'idempotency_key_conflict'
+      | 'contains_link'
+      | 'contains_contact';
+  }
+ >;
 
 export async function createPostService(
   deps: ServicesDeps,
@@ -60,6 +76,16 @@ export async function createPostService(
     return { ok: true, data: existing.response as unknown as CreatePostData };
   }
 
+  const check = checkContent(input.title, input.content);
+  if (check.reject) {
+    const first = check.violations[0]!;
+    if (first.kind === 'link') {
+      return { ok: false, error: { code: 'contains_link', status: 400 } };
+    }
+    return { ok: false, error: { code: 'contains_contact', status: 400 } };
+  }
+  const hasSpamSignal = check.flags.some((f) => f.kind === 'spam_signal');
+
   let gospelCardId: string | null = null;
   if (input.gospelCardSlug) {
     const card = await cardsRepo(db).findBySlug(input.gospelCardSlug);
@@ -77,7 +103,7 @@ export async function createPostService(
     category: input.category,
     title: input.title,
     content: input.content,
-    status: "published",
+    status: hasSpamSignal ? 'pending_review' : 'published',
     gospelCardId,
   });
 
@@ -202,16 +228,21 @@ export async function unlikePostService(
 
 type ReportPostError = Extract<
   ServiceError,
-  { code: "own_post" | "not_found" }
+  { code: 'own_post' | 'not_found' | 'reason_required' }
 >;
 
 export async function reportPostService(
   deps: ServicesDeps,
   userId: string,
   postId: string,
-  reason: string,
+  category: ReportCategory,
+  reason: string | undefined,
   tx?: Tx,
 ): Promise<ServiceResult<{ outcome: ReportOutcome }, ReportPostError>> {
+  if (category === 'other' && (!reason || reason.trim().length < 3)) {
+    return { ok: false, error: { code: 'reason_required', status: 400 } };
+  }
+
   const db = tx ?? deps.db;
 
   const post = await postsRepo(db).findById(postId);
@@ -219,11 +250,11 @@ export async function reportPostService(
     return { ok: false, error: { code: "not_found", status: 404 } };
   }
 
-  const result = await reportsRepo(db).file({
-    postId,
-    reporterId: userId,
-    reason,
-  });
+  const result = await reportsRepo(db).file(
+    { postId, reporterId: userId, category, reason },
+    {},
+    tx,
+  );
 
   switch (result.outcome) {
     case "created":

@@ -34,6 +34,7 @@ export interface RateLimiters {
   checkPostsDelete(userId: string): Promise<RateLimitResult>;
   checkLikes(userId: string): Promise<RateLimitResult>;
   checkReports(userId: string): Promise<RateLimitResult>;
+  checkSyncBatch(userId: string): Promise<RateLimitResult>;
 }
 
 export interface RateLimitLogger {
@@ -126,6 +127,7 @@ export function createRateLimiters(
   const postsDelete = make("rl:posts:delete", 30, 3600);
   const likes = make("rl:likes", 120, 3600);
   const reports = make("rl:reports", 10, 3600);
+  const syncBatch = make("rl:sync", env.RATE_LIMIT_SYNC_MAX, env.RATE_LIMIT_SYNC_WINDOW_S);
 
   const consume = async (
     limiter: RateLimiterAbstract,
@@ -210,5 +212,6 @@ export function createRateLimiters(
     checkPostsDelete: (userId) => consumeAll([[postsDelete, anon(userId)]]),
     checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
     checkReports: (userId) => consumeAll([[reports, anon(userId)]]),
+    checkSyncBatch: (userId) => consumeAll([[syncBatch, anon(userId)]]),
   };
 }

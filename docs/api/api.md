@@ -30,3 +30,21 @@ _**200**_
   "checks": { "db": "ok", "redis": "ok" }
 }
 ```
+### POST /posts
+
+Body: `{ category, title, content, gospelCardSlug? }`
+
+Erros adicionais:
+- **400 contains_link** — conteúdo contém ligação externa
+- **400 contains_contact** — conteúdo contém email, telefone ou IP
+- `201` com `status: 'pending_review'` — conteúdo sinalizado para revisão
+
+### POST /posts/:id/report
+
+Body:
+\`\`\`json
+{ "category": "spam" | "off_topic" | "offensive" | "doctrine" | "other", "reason": "opcional, obrigatório se category='other'" }
+\`\`\`
+
+Erros:
+- **400 reason_required** — category='other' sem reason válido

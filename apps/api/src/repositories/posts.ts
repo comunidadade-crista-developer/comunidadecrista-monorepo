@@ -204,5 +204,14 @@ export function postLikesRepo(db: Executor) {
         );
       return rows.map((r) => r.postId);
     },
+
+    async getAllLikedPostIdsBy(userId: string, limit = 500): Promise<string[]> {
+      const rows = await db
+        .select({ postId: postLikes.postId })
+        .from(postLikes)
+        .where(eq(postLikes.userId, userId))
+        .limit(limit);
+      return rows.map((r) => r.postId);
+    },
   };
 }

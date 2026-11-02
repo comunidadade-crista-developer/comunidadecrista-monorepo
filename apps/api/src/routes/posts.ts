@@ -336,6 +336,7 @@ export async function postsRoutes(
         deps,
         userId,
         request.params.id,
+        request.body.category,
         request.body.reason,
       );
       if (!result.ok) {

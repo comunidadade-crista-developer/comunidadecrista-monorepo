@@ -104,6 +104,13 @@ const BaseEnvSchema = z.object({
     .int()
     .positive()
     .default(3600),
+
+  SYNC_BATCH_MAX_OPS: z.coerce.number().int().positive().default(20),
+  SYNC_BATCH_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
+  RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
+  OUTBOX_WORKER_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  OUTBOX_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(20),
 });
 
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
