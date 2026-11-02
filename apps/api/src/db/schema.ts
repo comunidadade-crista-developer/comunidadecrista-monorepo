@@ -62,6 +62,18 @@ export const outboxStatusEnum = pgEnum("outbox_status", [
   "done",
   "failed",
 ]);
+export const reportCategoryEnum = pgEnum('report_category', [
+  'spam',
+  'off_topic',
+  'offensive',
+  'doctrine',
+  'other',
+]);
+export const reportSeverityEnum = pgEnum('report_severity', [
+  'basic', 
+  'medium', 
+  'high',
+]);
 
 export const users = pgTable(
   "users",
@@ -214,7 +226,9 @@ export const reports = pgTable(
     reporterId: uuid("reporter_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    reason: text("reason").notNull(),
+    reason: text("reason"),
+    category: reportCategoryEnum('category').notNull().default('other'),
+    severity: reportSeverityEnum('severity').notNull().default('basic'),
     status: reportStatusEnum("status").notNull().default("open"),
     createdAt: createdAt(),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
@@ -225,6 +239,7 @@ export const reports = pgTable(
   (t) => [
     uniqueIndex("reports_post_reporter_unique").on(t.postId, t.reporterId),
     index("reports_post_status_idx").on(t.postId, t.status),
+    index('reports_post_category_status_idx').on(t.postId, t.category, t.status),
     index("reports_reporter_status_idx").on(t.reporterId, t.status),
   ],
 );
