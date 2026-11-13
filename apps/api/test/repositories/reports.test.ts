@@ -23,13 +23,15 @@ describe("reportsRepo", () => {
     const repo = reportsRepo(db);
     const first = await repo.create({
       postId: p.id,
-      reporterId: reporter.id,
+      reporterId: reporter.id, 
+      category: "other",
       reason: "conteúdo impróprio",
     });
     expect(first).not.toBeNull();
     const dup = await repo.create({
       postId: p.id,
       reporterId: reporter.id,
+      category: "other",
       reason: "outro motivo",
     });
     expect(dup).toBeNull();
@@ -45,6 +47,7 @@ describe("reportsRepo", () => {
     const report = await repo.create({
       postId: p.id,
       reporterId: r1.id,
+      category: "other",
       reason: "x",
     });
     expect(await repo.cancel(report!.id, r2.id)).toBe(false);
@@ -58,7 +61,12 @@ describe("reportsRepo", () => {
     const repo = reportsRepo(db);
     for (let i = 0; i < 3; i++) {
       const r = await makeUser();
-      await repo.create({ postId: p.id, reporterId: r.id, reason: "x" });
+      await repo.create({
+        postId: p.id,
+        reporterId: r.id,
+        category: "other",
+        reason: "x",
+      });
     }
     expect(await repo.countOpenByPost(p.id)).toBe(3);
     await repo.resolveAllForPost(p.id, "resolved_kept", author.id);

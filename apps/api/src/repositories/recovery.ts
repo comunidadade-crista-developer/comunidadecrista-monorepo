@@ -17,10 +17,6 @@ export interface ConsumedSession {
 
 export type ResetOutcome = "ok" | "replayed";
 
-/**
- * Marca a sessão de recuperação como usada. Devolve false se o jti já tinha sido usado
- * (repetição). Corre dentro da mesma transacção que o reset: ou tudo, ou nada.
- */
 async function consumeSession(
   tx: Tx,
   session: ConsumedSession,
@@ -48,10 +44,6 @@ async function revokeAllTokens(tx: Tx, userId: string): Promise<void> {
 
 export function recoveryRepo(db: Database) {
   return {
-    /**
-     * Reset imediato (prova por código de recuperação): muda a palavra-passe, rota o código,
-     * revoga todas as sessões e cancela qualquer pedido pendente — numa só transacção.
-     */
     async completeResetWithCode(args: {
       session: ConsumedSession;
       userId: string;
@@ -77,10 +69,6 @@ export function recoveryRepo(db: Database) {
       });
     },
 
-    /**
-     * Pedido com atraso (prova por perguntas): NÃO muda nada no utilizador. Guarda a nova
-     * palavra-passe como pendente; um pedido novo substitui o anterior.
-     */
     async requestDelayedReset(args: {
       session: ConsumedSession;
       userId: string;
@@ -126,12 +114,6 @@ export function recoveryRepo(db: Database) {
       return rows.length > 0;
     },
 
-    /**
-     * Aplica o pedido pendente se já passou o prazo: a palavra-passe pendente passa a ser a
-     * actual, é gravado o novo código de recuperação e todas as sessões são revogadas.
-     * Devolve false se não havia pedido, se ainda não chegou a hora, ou se outro pedido
-     * concorrente já o aplicou.
-     */
     async applyPendingIfDue(args: {
       userId: string;
       recoveryCodeHash: string;

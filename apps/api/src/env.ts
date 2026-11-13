@@ -117,8 +117,34 @@ const BaseEnvSchema = z.object({
     .int()
     .positive()
     .default(3600),
+  // partilham o mesmo IP (CGNAT das operadoras móveis).
   RATE_LIMIT_CARDS_MAX: z.coerce.number().int().positive().default(120),
   RATE_LIMIT_CARDS_WINDOW_S: z.coerce.number().int().positive().default(60),
+  // Leitura do feed de partilhas: 1 balde por utilizador autenticado e outro por IP (anónimos).
+  // Folgado pelo mesmo motivo dos cards (IPs partilhados).
+  RATE_LIMIT_FEED_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_FEED_WINDOW_S: z.coerce.number().int().positive().default(60),
+  // Escritas, por utilizador. O /sync aplica os MESMOS limites, operação a operação, para não
+  // ser um atalho em volta do REST (ADR-013).
+  RATE_LIMIT_POSTS_CREATE_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_POSTS_CREATE_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(3600),
+  RATE_LIMIT_POSTS_DELETE_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_POSTS_DELETE_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(3600),
+  RATE_LIMIT_LIKES_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_LIKES_WINDOW_S: z.coerce.number().int().positive().default(3600),
+  RATE_LIMIT_REPORTS_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_REPORTS_WINDOW_S: z.coerce.number().int().positive().default(3600),
+  // Pedidos /sync por utilizador (cada um com até 20 operações, já limitadas acima).
+  RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
 });
 
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {

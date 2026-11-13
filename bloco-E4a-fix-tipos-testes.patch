@@ -1,0 +1,23 @@
+diff --git a/apps/api/test/repositories/reports.rules.test.ts b/apps/api/test/repositories/reports.rules.test.ts
+index d79c66b..6b6d6ed 100644
+--- a/apps/api/test/repositories/reports.rules.test.ts
++++ b/apps/api/test/repositories/reports.rules.test.ts
+@@ -112,7 +112,7 @@ describe("reportsRepo.file — regras básicas", () => {
+     const args = {
+       postId: post.id,
+       reporterId: reporter.id,
+-      category: "other",
++      category: "other" as const,
+       reason: "x",
+     };
+ 
+@@ -131,7 +131,7 @@ describe("reportsRepo.file — regras básicas", () => {
+     const args = {
+       postId: post.id,
+       reporterId: reporter.id,
+-      category: "other",
++      category: "other" as const,
+       reason: "x",
+     };
+ 
+ 

@@ -1,48 +1,65 @@
 import { and, count, desc, eq, lte, sql } from "drizzle-orm";
+import type { ReportCategory, ReportSeverity } from "@comunidade/shared";
 import type { Database } from "../db/client.js";
 import { moderationLog, posts, reports, users } from "../db/schema.js";
 import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
 
-/** Nº de denúncias válidas e abertas a partir do qual o post passa a "Em revisão". */
-export const REPORT_THRESHOLD = 10;
-/** Idade mínima da conta de quem denuncia para a denúncia contar para o limiar. */
+export const REPORT_THRESHOLDS: Readonly<Record<ReportSeverity, number>> = {
+  basic: 10,
+  medium: 5,
+  high: 3,
+};
+export const REPORT_THRESHOLD = REPORT_THRESHOLDS.basic;
 export const REPORTER_MIN_AGE_DAYS = 7;
+
+const SEVERITIES_BY_GRAVITY: readonly ReportSeverity[] = [
+  "high",
+  "medium",
+  "basic",
+];
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export interface ReportRules {
-  threshold?: number;
+  /** Limiares por gravidade (os que faltarem usam `REPORT_THRESHOLDS`). */
+  thresholds?: Partial<Record<ReportSeverity, number>>;
   minAgeDays?: number;
 }
 
+export interface FileReportArgs {
+  postId: string;
+  reporterId: string;
+  category: ReportCategory;
+  reason?: string | null;
+}
+
 export type FileReportResult =
-  /** O post não existe ou não está publicado (não é visível para quem denuncia). */
+  /** O post não existe, foi apagado ou não está publicado (não é visível para quem denuncia). */
   | { outcome: "post_not_found" }
   | { outcome: "own_post" }
-  /** Já existe uma denúncia deste utilizador para este post (aberta ou resolvida). */
   | { outcome: "duplicate" }
   | {
       outcome: "created";
       report: Report;
       /** Denúncias abertas deste post (todas). */
       reportsCount: number;
-      /** Denúncias abertas que contam para o limiar. */
+      /** Denúncias abertas que contam para o limiar (soma das gravidades). */
       validReports: number;
+      /** O mesmo, por gravidade (é por aqui que se decide a escalada). */
+      validReportsBySeverity: Record<ReportSeverity, number>;
       /** Esta denúncia fez o post passar a "Em revisão". */
       escalated: boolean;
+      /** Gravidade que passou o limiar (só quando `escalated`). */
+      escalatedBy: ReportSeverity | null;
     };
 
-/**
- * Denúncias abertas que contam para o limiar: a conta tem a idade mínima e já fez pelo
- * menos uma partilha (anti-abuso: contas novas ou sem partilhas não contam).
- */
-async function countValidOpen(
+async function countValidOpenBySeverity(
   tx: Tx,
   postId: string,
   minAgeDays: number,
-): Promise<number> {
-  const [row] = await tx
-    .select({ c: count() })
+): Promise<Record<ReportSeverity, number>> {
+  const rows = await tx
+    .select({ severity: reports.severity, c: count() })
     .from(reports)
     .innerJoin(users, eq(users.id, reports.reporterId))
     .where(
@@ -53,18 +70,27 @@ async function countValidOpen(
           users.createdAt,
           sql`now() - make_interval(days => ${minAgeDays}::int)`,
         ),
-        sql`EXISTS (SELECT 1 FROM ${posts} WHERE ${posts.authorId} = ${users.id})`,
+        sql`EXISTS (
+          SELECT 1 FROM ${posts}
+          WHERE ${posts.authorId} = ${users.id}
+            AND ${posts.status} = 'published'
+            AND ${posts.deletedAt} IS NULL
+        )`,
       ),
-    );
-  return Number(row?.c ?? 0);
+    )
+    .groupBy(reports.severity);
+
+  const bySeverity: Record<ReportSeverity, number> = {
+    basic: 0,
+    medium: 0,
+    high: 0,
+  };
+  for (const row of rows) bySeverity[row.severity] = Number(row.c);
+  return bySeverity;
 }
 
 export function reportsRepo(db: Database) {
   return {
-    /**
-     * Operação de baixo nível: só insere a linha, sem regras nem contadores.
-     * As rotas devem usar `file`, que aplica as regras de negócio numa transacção.
-     */
     async create(data: NewReport): Promise<Report | null> {
       const result = await db
         .insert(reports)
@@ -100,29 +126,25 @@ export function reportsRepo(db: Database) {
       return Number(row?.c ?? 0);
     },
 
-    /**
-     * Denuncia um post. Tudo numa transacção, com o post bloqueado (FOR NO KEY UPDATE) para
-     * serializar denúncias concorrentes ao mesmo post: o contador e o limiar nunca se perdem
-     * e só uma denúncia pode ser a que escala o post.
-     *
-     * Regras: só posts publicados; sem auto-denúncia; uma denúncia por utilizador e post;
-     * ao atingir o limiar de denúncias válidas, o post passa a `pending_review`.
-     */
     async file(
-      args: { postId: string; reporterId: string; reason: string },
+      args: FileReportArgs,
       rules: ReportRules = {},
     ): Promise<FileReportResult> {
-      const threshold = rules.threshold ?? REPORT_THRESHOLD;
+      const thresholds = { ...REPORT_THRESHOLDS, ...rules.thresholds };
       const minAgeDays = rules.minAgeDays ?? REPORTER_MIN_AGE_DAYS;
 
       return db.transaction(async (tx) => {
         const [post] = await tx
-          .select({ status: posts.status, authorId: posts.authorId })
+          .select({
+            status: posts.status,
+            authorId: posts.authorId,
+            deletedAt: posts.deletedAt,
+          })
           .from(posts)
           .where(eq(posts.id, args.postId))
           .for("no key update")
           .limit(1);
-        if (!post || post.status !== "published") {
+        if (!post || post.deletedAt !== null || post.status !== "published") {
           return { outcome: "post_not_found" as const };
         }
         if (post.authorId === args.reporterId) {
@@ -134,7 +156,8 @@ export function reportsRepo(db: Database) {
           .values({
             postId: args.postId,
             reporterId: args.reporterId,
-            reason: args.reason,
+            category: args.category,
+            reason: args.reason ?? null,
           })
           .onConflictDoNothing()
           .returning();
@@ -146,13 +169,26 @@ export function reportsRepo(db: Database) {
           .where(eq(posts.id, args.postId))
           .returning({ reportsCount: posts.reportsCount });
 
-        const validReports = await countValidOpen(tx, args.postId, minAgeDays);
+        const bySeverity = await countValidOpenBySeverity(
+          tx,
+          args.postId,
+          minAgeDays,
+        );
+        const validReports =
+          bySeverity.basic + bySeverity.medium + bySeverity.high;
+
+        const triggered = SEVERITIES_BY_GRAVITY.find(
+          (severity) => bySeverity[severity] >= thresholds[severity],
+        );
         let escalated = false;
-        if (validReports >= threshold) {
+        if (triggered) {
           // Só sai de "published": nunca ressuscita um post oculto ou rejeitado.
           const moved = await tx
             .update(posts)
-            .set({ status: "pending_review" })
+            .set({
+              status: "pending_review",
+              reviewFlags: sql`array_append(coalesce(${posts.reviewFlags}, ARRAY[]::text[]), ${`reports_${triggered}`}::text)`,
+            })
             .where(
               and(eq(posts.id, args.postId), eq(posts.status, "published")),
             )
@@ -165,16 +201,13 @@ export function reportsRepo(db: Database) {
           report,
           reportsCount: counted?.reportsCount ?? 0,
           validReports,
+          validReportsBySeverity: bySeverity,
           escalated,
+          escalatedBy: escalated && triggered ? triggered : null,
         };
       });
     },
 
-    /**
-     * Cancela uma denúncia ABERTA do próprio utilizador e actualiza o contador. Uma denúncia
-     * já resolvida não se cancela. Cancelar não tira o post de "Em revisão": quem decide é o
-     * admin.
-     */
     async cancel(id: string, userId: string): Promise<boolean> {
       return db.transaction(async (tx) => {
         const [own] = await tx
@@ -191,15 +224,16 @@ export function reportsRepo(db: Database) {
         if (!own) return false;
 
         // Mesma ordem de bloqueios que `file` (post primeiro): evita deadlock se o mesmo
-        // utilizador cancelar e voltar a denunciar em simultâneo.
+        // utilizador retirar e voltar a denunciar em simultâneo.
         await tx
           .select({ id: posts.id })
           .from(posts)
           .where(eq(posts.id, own.postId))
           .for("no key update");
 
-        const removed = await tx
-          .delete(reports)
+        const withdrawn = await tx
+          .update(reports)
+          .set({ status: "withdrawn", withdrawnAt: new Date() })
           .where(
             and(
               eq(reports.id, id),
@@ -208,7 +242,7 @@ export function reportsRepo(db: Database) {
             ),
           )
           .returning({ id: reports.id });
-        if (removed.length === 0) return false;
+        if (withdrawn.length === 0) return false;
 
         await tx
           .update(posts)
@@ -218,12 +252,14 @@ export function reportsRepo(db: Database) {
       });
     },
 
-    async listByReporter(reporterId: string): Promise<Report[]> {
+    /** As mais recentes primeiro, limitadas (nunca uma lista sem fim). */
+    async listByReporter(reporterId: string, limit = 100): Promise<Report[]> {
       return db
         .select()
         .from(reports)
         .where(eq(reports.reporterId, reporterId))
-        .orderBy(desc(reports.createdAt));
+        .orderBy(desc(reports.createdAt))
+        .limit(limit);
     },
 
     async resolveAllForPost(

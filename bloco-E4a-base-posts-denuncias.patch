@@ -1,0 +1,3748 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f9b9a3a..1166e3a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -28,7 +28,7 @@ jobs:
+           POSTGRES_PASSWORD: comunidade_test
+           POSTGRES_DB: comunidade_test
+         ports:
+-          - 5430:5432
++          - 5432:5432
+         options: >-
+           --health-cmd "pg_isready -U comunidade -d comunidade_test"
+           --health-interval 5s
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index 25782e9..f62a829 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -62,6 +62,21 @@ RATE_LIMIT_RECOVER_ACCOUNT_CODE_WINDOW_S=3600
+ # Leitura pública dos gospel cards, por IP
+ RATE_LIMIT_CARDS_MAX=120
+ RATE_LIMIT_CARDS_WINDOW_S=60
++# Leitura do feed (por utilizador autenticado; por IP para anónimos)
++RATE_LIMIT_FEED_MAX=120
++RATE_LIMIT_FEED_WINDOW_S=60
++# Escritas por utilizador (o /sync aplica os mesmos limites, operação a operação)
++RATE_LIMIT_POSTS_CREATE_MAX=10
++RATE_LIMIT_POSTS_CREATE_WINDOW_S=3600
++RATE_LIMIT_POSTS_DELETE_MAX=30
++RATE_LIMIT_POSTS_DELETE_WINDOW_S=3600
++RATE_LIMIT_LIKES_MAX=120
++RATE_LIMIT_LIKES_WINDOW_S=3600
++RATE_LIMIT_REPORTS_MAX=10
++RATE_LIMIT_REPORTS_WINDOW_S=3600
++# Pedidos /sync por utilizador (até 20 operações cada)
++RATE_LIMIT_SYNC_MAX=60
++RATE_LIMIT_SYNC_WINDOW_S=3600
+ 
+ # Recuperação por perguntas de segurança só produz efeito após este atraso (horas)
+ RECOVERY_QUESTIONS_DELAY_HOURS=24
+diff --git a/apps/api/drizzle/0004_report_categories_soft_delete.sql b/apps/api/drizzle/0004_report_categories_soft_delete.sql
+new file mode 100644
+index 0000000..4c06096
+--- /dev/null
++++ b/apps/api/drizzle/0004_report_categories_soft_delete.sql
+@@ -0,0 +1,20 @@
++-- E4-a: denúncias por categoria/severidade, retirada de denúncia sem apagar, soft delete de
++-- posts, motivos de revisão e hash do pedido nas chaves de idempotência.
++--
++-- Nota: `ADD VALUE` corre dentro da transacção do migrador; o valor novo ('withdrawn') não
++-- é usado nesta migração (Postgres ≥ 12 permite-o desde que não seja usado na mesma tx).
++ALTER TYPE "public"."report_status" ADD VALUE 'withdrawn';--> statement-breakpoint
++CREATE TYPE "public"."report_category" AS ENUM('spam', 'off_topic', 'offensive', 'doctrine', 'other');--> statement-breakpoint
++CREATE TYPE "public"."report_severity" AS ENUM('basic', 'medium', 'high');--> statement-breakpoint
++ALTER TABLE "reports" ALTER COLUMN "reason" DROP NOT NULL;--> statement-breakpoint
++-- As denúncias existentes migram como 'other' (o `reason` já está preenchido). O DEFAULT é
++-- só para o backfill: depois sai, e a categoria passa a ser obrigatória em todos os inserts.
++ALTER TABLE "reports" ADD COLUMN "category" "report_category" DEFAULT 'other' NOT NULL;--> statement-breakpoint
++ALTER TABLE "reports" ALTER COLUMN "category" DROP DEFAULT;--> statement-breakpoint
++ALTER TABLE "reports" ADD COLUMN "severity" "report_severity" GENERATED ALWAYS AS (CASE "reports"."category" WHEN 'offensive' THEN 'medium'::"report_severity" WHEN 'doctrine' THEN 'high'::"report_severity" ELSE 'basic'::"report_severity" END) STORED NOT NULL;--> statement-breakpoint
++ALTER TABLE "reports" ADD COLUMN "withdrawn_at" timestamp with time zone;--> statement-breakpoint
++ALTER TABLE "reports" ADD CONSTRAINT "reports_other_requires_reason" CHECK ("reports"."category" <> 'other' OR ("reports"."reason" IS NOT NULL AND btrim("reports"."reason") <> ''));--> statement-breakpoint
++CREATE INDEX "reports_post_category_status_idx" ON "reports" USING btree ("post_id","category","status");--> statement-breakpoint
++ALTER TABLE "posts" ADD COLUMN "deleted_at" timestamp with time zone;--> statement-breakpoint
++ALTER TABLE "posts" ADD COLUMN "review_flags" text[];--> statement-breakpoint
++ALTER TABLE "idempotency_keys" ADD COLUMN "request_hash" text;
+diff --git a/apps/api/drizzle/meta/0004_snapshot.json b/apps/api/drizzle/meta/0004_snapshot.json
+new file mode 100644
+index 0000000..b929b3e
+--- /dev/null
++++ b/apps/api/drizzle/meta/0004_snapshot.json
+@@ -0,0 +1,1330 @@
++{
++  "id": "d266db0d-1597-4b0a-82ba-8732ea947184",
++  "prevId": "e224042a-e0f8-42b6-a75c-6ff8e862507a",
++  "version": "7",
++  "dialect": "postgresql",
++  "tables": {
++    "public.gospel_cards": {
++      "name": "gospel_cards",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "slug": {
++          "name": "slug",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "gospel_reference": {
++          "name": "gospel_reference",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "summary": {
++          "name": "summary",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "ot_references": {
++          "name": "ot_references",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'[]'::jsonb"
++        },
++        "nt_references": {
++          "name": "nt_references",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'[]'::jsonb"
++        },
++        "order_index": {
++          "name": "order_index",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "gospel_cards_slug_unique": {
++          "name": "gospel_cards_slug_unique",
++          "columns": [
++            {
++              "expression": "slug",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "gospel_cards_order_idx": {
++          "name": "gospel_cards_order_idx",
++          "columns": [
++            {
++              "expression": "order_index",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.idempotency_keys": {
++      "name": "idempotency_keys",
++      "schema": "",
++      "columns": {
++        "key": {
++          "name": "key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "operation": {
++          "name": "operation",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "request_hash": {
++          "name": "request_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "response": {
++          "name": "response",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "idempotency_keys_expires_idx": {
++          "name": "idempotency_keys_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "idempotency_keys_user_id_users_id_fk": {
++          "name": "idempotency_keys_user_id_users_id_fk",
++          "tableFrom": "idempotency_keys",
++          "tableTo": "users",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "idempotency_keys_user_id_key_pk": {
++          "name": "idempotency_keys_user_id_key_pk",
++          "columns": ["user_id", "key"]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.moderation_log": {
++      "name": "moderation_log",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "moderator_id": {
++          "name": "moderator_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "action": {
++          "name": "action",
++          "type": "moderation_action",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reason": {
++          "name": "reason",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "moderation_log_post_created_idx": {
++          "name": "moderation_log_post_created_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "moderation_log_post_id_posts_id_fk": {
++          "name": "moderation_log_post_id_posts_id_fk",
++          "tableFrom": "moderation_log",
++          "tableTo": "posts",
++          "columnsFrom": ["post_id"],
++          "columnsTo": ["id"],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        },
++        "moderation_log_moderator_id_users_id_fk": {
++          "name": "moderation_log_moderator_id_users_id_fk",
++          "tableFrom": "moderation_log",
++          "tableTo": "users",
++          "columnsFrom": ["moderator_id"],
++          "columnsTo": ["id"],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.outbox": {
++      "name": "outbox",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "aggregate_type": {
++          "name": "aggregate_type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "aggregate_id": {
++          "name": "aggregate_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "event_type": {
++          "name": "event_type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "payload": {
++          "name": "payload",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "status": {
++          "name": "status",
++          "type": "outbox_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'pending'"
++        },
++        "attempts": {
++          "name": "attempts",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "next_attempt_at": {
++          "name": "next_attempt_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "processed_at": {
++          "name": "processed_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "outbox_status_next_attempt_idx": {
++          "name": "outbox_status_next_attempt_idx",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "next_attempt_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.pending_password_resets": {
++      "name": "pending_password_resets",
++      "schema": "",
++      "columns": {
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "password_hash": {
++          "name": "password_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "requested_at": {
++          "name": "requested_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "effective_at": {
++          "name": "effective_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "pending_password_resets_effective_idx": {
++          "name": "pending_password_resets_effective_idx",
++          "columns": [
++            {
++              "expression": "effective_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "pending_password_resets_user_id_users_id_fk": {
++          "name": "pending_password_resets_user_id_users_id_fk",
++          "tableFrom": "pending_password_resets",
++          "tableTo": "users",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.post_likes": {
++      "name": "post_likes",
++      "schema": "",
++      "columns": {
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "post_likes_user_id_idx": {
++          "name": "post_likes_user_id_idx",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "post_likes_post_id_posts_id_fk": {
++          "name": "post_likes_post_id_posts_id_fk",
++          "tableFrom": "post_likes",
++          "tableTo": "posts",
++          "columnsFrom": ["post_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "post_likes_user_id_users_id_fk": {
++          "name": "post_likes_user_id_users_id_fk",
++          "tableFrom": "post_likes",
++          "tableTo": "users",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "post_likes_post_id_user_id_pk": {
++          "name": "post_likes_post_id_user_id_pk",
++          "columns": ["post_id", "user_id"]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.posts": {
++      "name": "posts",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "author_id": {
++          "name": "author_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "gospel_card_id": {
++          "name": "gospel_card_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "category": {
++          "name": "category",
++          "type": "post_category",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "content": {
++          "name": "content",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "status": {
++          "name": "status",
++          "type": "post_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'published'"
++        },
++        "likes_count": {
++          "name": "likes_count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "reports_count": {
++          "name": "reports_count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "author_hidden": {
++          "name": "author_hidden",
++          "type": "boolean",
++          "primaryKey": false,
++          "notNull": true,
++          "default": false
++        },
++        "suspended_status": {
++          "name": "suspended_status",
++          "type": "post_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "review_flags": {
++          "name": "review_flags",
++          "type": "text[]",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deleted_at": {
++          "name": "deleted_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "published_at": {
++          "name": "published_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "posts_status_created_idx": {
++          "name": "posts_status_created_idx",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_card_status_idx": {
++          "name": "posts_card_status_idx",
++          "columns": [
++            {
++              "expression": "gospel_card_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_author_created_idx": {
++          "name": "posts_author_created_idx",
++          "columns": [
++            {
++              "expression": "author_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_category_status_idx": {
++          "name": "posts_category_status_idx",
++          "columns": [
++            {
++              "expression": "category",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "posts_author_id_users_id_fk": {
++          "name": "posts_author_id_users_id_fk",
++          "tableFrom": "posts",
++          "tableTo": "users",
++          "columnsFrom": ["author_id"],
++          "columnsTo": ["id"],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        },
++        "posts_gospel_card_id_gospel_cards_id_fk": {
++          "name": "posts_gospel_card_id_gospel_cards_id_fk",
++          "tableFrom": "posts",
++          "tableTo": "gospel_cards",
++          "columnsFrom": ["gospel_card_id"],
++          "columnsTo": ["id"],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.refresh_tokens": {
++      "name": "refresh_tokens",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "token_hash": {
++          "name": "token_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "family_id": {
++          "name": "family_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "revoked_at": {
++          "name": "revoked_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "refresh_tokens_token_hash_unique": {
++          "name": "refresh_tokens_token_hash_unique",
++          "columns": [
++            {
++              "expression": "token_hash",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_user_id_idx": {
++          "name": "refresh_tokens_user_id_idx",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_family_idx": {
++          "name": "refresh_tokens_family_idx",
++          "columns": [
++            {
++              "expression": "family_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_expires_idx": {
++          "name": "refresh_tokens_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "refresh_tokens_user_id_users_id_fk": {
++          "name": "refresh_tokens_user_id_users_id_fk",
++          "tableFrom": "refresh_tokens",
++          "tableTo": "users",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.reports": {
++      "name": "reports",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reporter_id": {
++          "name": "reporter_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reason": {
++          "name": "reason",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "category": {
++          "name": "category",
++          "type": "report_category",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "severity": {
++          "name": "severity",
++          "type": "report_severity",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "generated": {
++            "as": "CASE \"category\" WHEN 'offensive' THEN 'medium'::\"report_severity\" WHEN 'doctrine' THEN 'high'::\"report_severity\" ELSE 'basic'::\"report_severity\" END",
++            "type": "stored"
++          }
++        },
++        "status": {
++          "name": "status",
++          "type": "report_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'open'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "resolved_at": {
++          "name": "resolved_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "withdrawn_at": {
++          "name": "withdrawn_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "resolved_by": {
++          "name": "resolved_by",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "reports_post_reporter_unique": {
++          "name": "reports_post_reporter_unique",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "reporter_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_post_status_idx": {
++          "name": "reports_post_status_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_reporter_status_idx": {
++          "name": "reports_reporter_status_idx",
++          "columns": [
++            {
++              "expression": "reporter_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_post_category_status_idx": {
++          "name": "reports_post_category_status_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "category",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "reports_post_id_posts_id_fk": {
++          "name": "reports_post_id_posts_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "posts",
++          "columnsFrom": ["post_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "reports_reporter_id_users_id_fk": {
++          "name": "reports_reporter_id_users_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "users",
++          "columnsFrom": ["reporter_id"],
++          "columnsTo": ["id"],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "reports_resolved_by_users_id_fk": {
++          "name": "reports_resolved_by_users_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "users",
++          "columnsFrom": ["resolved_by"],
++          "columnsTo": ["id"],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {
++        "reports_other_requires_reason": {
++          "name": "reports_other_requires_reason",
++          "value": "\"reports\".\"category\" <> 'other' OR (\"reports\".\"reason\" IS NOT NULL AND btrim(\"reports\".\"reason\") <> '')"
++        }
++      },
++      "isRLSEnabled": false
++    },
++    "public.used_recovery_sessions": {
++      "name": "used_recovery_sessions",
++      "schema": "",
++      "columns": {
++        "jti": {
++          "name": "jti",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "used_recovery_sessions_expires_idx": {
++          "name": "used_recovery_sessions_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.users": {
++      "name": "users",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "username": {
++          "name": "username",
++          "type": "citext",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "password_hash": {
++          "name": "password_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "recovery_code_hash": {
++          "name": "recovery_code_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "security_q1_hash": {
++          "name": "security_q1_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "security_q2_hash": {
++          "name": "security_q2_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "security_q3_hash": {
++          "name": "security_q3_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "avatar_seed": {
++          "name": "avatar_seed",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "role": {
++          "name": "role",
++          "type": "role",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'user'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "last_login_at": {
++          "name": "last_login_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deleted_at": {
++          "name": "deleted_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deletion_requested_at": {
++          "name": "deletion_requested_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deletion_posts_mode": {
++          "name": "deletion_posts_mode",
++          "type": "deletion_posts_mode",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "users_username_unique": {
++          "name": "users_username_unique",
++          "columns": [
++            {
++              "expression": "username",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "users_role_idx": {
++          "name": "users_role_idx",
++          "columns": [
++            {
++              "expression": "role",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "users_deletion_requested_idx": {
++          "name": "users_deletion_requested_idx",
++          "columns": [
++            {
++              "expression": "deletion_requested_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    }
++  },
++  "enums": {
++    "public.deletion_posts_mode": {
++      "name": "deletion_posts_mode",
++      "schema": "public",
++      "values": ["anonymize", "delete"]
++    },
++    "public.moderation_action": {
++      "name": "moderation_action",
++      "schema": "public",
++      "values": ["approved", "rejected"]
++    },
++    "public.outbox_status": {
++      "name": "outbox_status",
++      "schema": "public",
++      "values": ["pending", "processing", "done", "failed"]
++    },
++    "public.post_category": {
++      "name": "post_category",
++      "schema": "public",
++      "values": ["entendimento", "ensinamento", "letra_cancao"]
++    },
++    "public.post_status": {
++      "name": "post_status",
++      "schema": "public",
++      "values": ["published", "pending_review", "hidden", "rejected"]
++    },
++    "public.report_category": {
++      "name": "report_category",
++      "schema": "public",
++      "values": ["spam", "off_topic", "offensive", "doctrine", "other"]
++    },
++    "public.report_severity": {
++      "name": "report_severity",
++      "schema": "public",
++      "values": ["basic", "medium", "high"]
++    },
++    "public.report_status": {
++      "name": "report_status",
++      "schema": "public",
++      "values": ["open", "resolved_kept", "resolved_removed", "withdrawn"]
++    },
++    "public.role": {
++      "name": "role",
++      "schema": "public",
++      "values": ["user", "admin"]
++    }
++  },
++  "schemas": {},
++  "sequences": {},
++  "roles": {},
++  "policies": {},
++  "views": {},
++  "_meta": {
++    "columns": {},
++    "schemas": {},
++    "tables": {}
++  }
++}
+diff --git a/apps/api/drizzle/meta/_journal.json b/apps/api/drizzle/meta/_journal.json
+index e0a93fd..0a4d525 100644
+--- a/apps/api/drizzle/meta/_journal.json
++++ b/apps/api/drizzle/meta/_journal.json
+@@ -29,6 +29,13 @@
+       "when": 1793449124638,
+       "tag": "0003_mysterious_serpent_society",
+       "breakpoints": true
++    },
++    {
++      "idx": 4,
++      "version": "7",
++      "when": 1793700000000,
++      "tag": "0004_report_categories_soft_delete",
++      "breakpoints": true
+     }
+   ]
+ }
+diff --git a/apps/api/src/auth/rate-limit.ts b/apps/api/src/auth/rate-limit.ts
+index 70336d5..eac68e2 100644
+--- a/apps/api/src/auth/rate-limit.ts
++++ b/apps/api/src/auth/rate-limit.ts
+@@ -34,6 +34,15 @@ export interface RateLimiters {
+   ): Promise<void>;
+   /** Leitura pública dos gospel cards: 1 balde por IP. */
+   checkCardsPublic(ip: string): Promise<RateLimitResult>;
++  /** Leitura do feed: balde por utilizador se autenticado, senão por IP. */
++  checkReadFeed(ip: string, userId?: string): Promise<RateLimitResult>;
++  /** Escritas: 1 balde por utilizador e por tipo de operação (REST e /sync partilham-nos). */
++  checkPostsCreate(userId: string): Promise<RateLimitResult>;
++  checkPostsDelete(userId: string): Promise<RateLimitResult>;
++  checkLikes(userId: string): Promise<RateLimitResult>;
++  checkReports(userId: string): Promise<RateLimitResult>;
++  /** Pedidos /sync (lotes) por utilizador. */
++  checkSyncBatch(userId: string): Promise<RateLimitResult>;
+ }
+ 
+ /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
+@@ -129,6 +138,42 @@ export function createRateLimiters(
+     env.RATE_LIMIT_CARDS_WINDOW_S,
+   );
+ 
++  const feedIp = make(
++    "rl:feed:ip",
++    env.RATE_LIMIT_FEED_MAX,
++    env.RATE_LIMIT_FEED_WINDOW_S,
++  );
++  const feedUser = make(
++    "rl:feed:user",
++    env.RATE_LIMIT_FEED_MAX,
++    env.RATE_LIMIT_FEED_WINDOW_S,
++  );
++  const postsCreate = make(
++    "rl:posts:create",
++    env.RATE_LIMIT_POSTS_CREATE_MAX,
++    env.RATE_LIMIT_POSTS_CREATE_WINDOW_S,
++  );
++  const postsDelete = make(
++    "rl:posts:delete",
++    env.RATE_LIMIT_POSTS_DELETE_MAX,
++    env.RATE_LIMIT_POSTS_DELETE_WINDOW_S,
++  );
++  const likes = make(
++    "rl:likes",
++    env.RATE_LIMIT_LIKES_MAX,
++    env.RATE_LIMIT_LIKES_WINDOW_S,
++  );
++  const reportsLimiter = make(
++    "rl:reports",
++    env.RATE_LIMIT_REPORTS_MAX,
++    env.RATE_LIMIT_REPORTS_WINDOW_S,
++  );
++  const syncBatch = make(
++    "rl:sync",
++    env.RATE_LIMIT_SYNC_MAX,
++    env.RATE_LIMIT_SYNC_WINDOW_S,
++  );
++
+   const consume = async (
+     limiter: RateLimiterAbstract,
+     key: string,
+@@ -211,5 +256,14 @@ export function createRateLimiters(
+       ]);
+     },
+     checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
++    checkReadFeed: (ip, userId) =>
++      userId
++        ? consumeAll([[feedUser, anon(userId)]])
++        : consumeAll([[feedIp, anon(ip)]]),
++    checkPostsCreate: (userId) => consumeAll([[postsCreate, anon(userId)]]),
++    checkPostsDelete: (userId) => consumeAll([[postsDelete, anon(userId)]]),
++    checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
++    checkReports: (userId) => consumeAll([[reportsLimiter, anon(userId)]]),
++    checkSyncBatch: (userId) => consumeAll([[syncBatch, anon(userId)]]),
+   };
+ }
+diff --git a/apps/api/src/db/client.ts b/apps/api/src/db/client.ts
+index 9ff35f7..81b925b 100644
+--- a/apps/api/src/db/client.ts
++++ b/apps/api/src/db/client.ts
+@@ -60,3 +60,14 @@ export function createDb(connectionString: string, options: DbOptions = {}) {
+ }
+ 
+ export type Database = ReturnType<typeof createDb>["db"];
++
++/** Transacção aberta por `db.transaction(async (tx) => …)`. */
++export type DbTransaction = Parameters<
++  Parameters<Database["transaction"]>[0]
++>[0];
++
++/**
++ * Onde uma query corre: o pool ou uma transacção já aberta. Os repositórios que têm de
++ * participar numa transacção do serviço (E4-b) recebem um `Executor`.
++ */
++export type Executor = Database | DbTransaction;
+diff --git a/apps/api/src/db/schema.ts b/apps/api/src/db/schema.ts
+index 19b17a1..9aa9f9e 100644
+--- a/apps/api/src/db/schema.ts
++++ b/apps/api/src/db/schema.ts
+@@ -1,6 +1,7 @@
+ import { sql } from "drizzle-orm";
+ import {
+   boolean,
++  check,
+   customType,
+   index,
+   integer,
+@@ -57,6 +58,21 @@ export const reportStatusEnum = pgEnum("report_status", [
+   "open",
+   "resolved_kept",
+   "resolved_removed",
++  // O próprio autor da denúncia retirou-a. A linha fica (evidência), mas já não conta.
++  "withdrawn",
++]);
++// Categoria escolhida por quem denuncia; a gravidade deriva dela (coluna gerada).
++export const reportCategoryEnum = pgEnum("report_category", [
++  "spam",
++  "off_topic",
++  "offensive",
++  "doctrine",
++  "other",
++]);
++export const reportSeverityEnum = pgEnum("report_severity", [
++  "basic",
++  "medium",
++  "high",
+ ]);
+ export const moderationActionEnum = pgEnum("moderation_action", [
+   "approved",
+@@ -195,6 +211,12 @@ export const posts = pgTable(
+     // Conta em apagamento com «apagar partilhas»: guarda o estado anterior enquanto o post
+     // fica oculto (status = hidden). Nulo = o post não foi ocultado por esta razão.
+     suspendedStatus: postStatusEnum("suspended_status"),
++    // Sinais do filtro anti-spam que levaram o post a `pending_review` (ex.: "caps",
++    // "keywords"). Só para o moderador perceber porquê; nulo = não houve sinais.
++    reviewFlags: text("review_flags").array(),
++    // Apagado pelo autor: o post deixa de aparecer em qualquer leitura, mas a linha (e as
++    // denúncias e likes) ficam como evidência até à purga. Nulo = não apagado.
++    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+     createdAt: createdAt(),
+     publishedAt: timestamp("published_at", { withTimezone: true }),
+   },
+@@ -233,10 +255,21 @@ export const reports = pgTable(
+     reporterId: uuid("reporter_id")
+       .notNull()
+       .references(() => users.id, { onDelete: "cascade" }),
+-    reason: text("reason").notNull(),
++    // Obrigatória só para a categoria "other" (ver o CHECK abaixo).
++    reason: text("reason"),
++    // Sem default: a categoria tem de ser escolhida em cada denúncia.
++    category: reportCategoryEnum("category").notNull(),
++    // Derivada da categoria pelo Postgres: nunca pode ficar incoerente com ela.
++    // Mantém-se em sincronia com CATEGORY_TO_SEVERITY (@comunidade/shared); há um teste.
++    severity: reportSeverityEnum("severity")
++      .notNull()
++      .generatedAlwaysAs(
++        sql`CASE "category" WHEN 'offensive' THEN 'medium'::"report_severity" WHEN 'doctrine' THEN 'high'::"report_severity" ELSE 'basic'::"report_severity" END`,
++      ),
+     status: reportStatusEnum("status").notNull().default("open"),
+     createdAt: createdAt(),
+     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
++    withdrawnAt: timestamp("withdrawn_at", { withTimezone: true }),
+     resolvedBy: uuid("resolved_by").references(() => users.id, {
+       onDelete: "set null",
+     }),
+@@ -245,6 +278,15 @@ export const reports = pgTable(
+     uniqueIndex("reports_post_reporter_unique").on(t.postId, t.reporterId),
+     index("reports_post_status_idx").on(t.postId, t.status),
+     index("reports_reporter_status_idx").on(t.reporterId, t.status),
++    index("reports_post_category_status_idx").on(
++      t.postId,
++      t.category,
++      t.status,
++    ),
++    check(
++      "reports_other_requires_reason",
++      sql`${t.category} <> 'other' OR (${t.reason} IS NOT NULL AND btrim(${t.reason}) <> '')`,
++    ),
+   ],
+ );
+ 
+@@ -294,6 +336,9 @@ export const idempotencyKeys = pgTable(
+       .notNull()
+       .references(() => users.id, { onDelete: "cascade" }),
+     operation: text("operation").notNull(),
++    // SHA-256 do pedido (operação + corpo): a mesma chave com outro corpo é um conflito, não
++    // uma repetição. Nulo só em linhas anteriores a esta coluna.
++    requestHash: text("request_hash"),
+     response: jsonb("response").$type<Record<string, unknown>>().notNull(),
+     createdAt: createdAt(),
+     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index d4de0a4..e78dd27 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -121,6 +121,31 @@ const BaseEnvSchema = z.object({
+   // partilham o mesmo IP (CGNAT das operadoras móveis).
+   RATE_LIMIT_CARDS_MAX: z.coerce.number().int().positive().default(120),
+   RATE_LIMIT_CARDS_WINDOW_S: z.coerce.number().int().positive().default(60),
++  // Leitura do feed de partilhas: 1 balde por utilizador autenticado e outro por IP (anónimos).
++  // Folgado pelo mesmo motivo dos cards (IPs partilhados).
++  RATE_LIMIT_FEED_MAX: z.coerce.number().int().positive().default(120),
++  RATE_LIMIT_FEED_WINDOW_S: z.coerce.number().int().positive().default(60),
++  // Escritas, por utilizador. O /sync aplica os MESMOS limites, operação a operação, para não
++  // ser um atalho em volta do REST (ADR-013).
++  RATE_LIMIT_POSTS_CREATE_MAX: z.coerce.number().int().positive().default(10),
++  RATE_LIMIT_POSTS_CREATE_WINDOW_S: z.coerce
++    .number()
++    .int()
++    .positive()
++    .default(3600),
++  RATE_LIMIT_POSTS_DELETE_MAX: z.coerce.number().int().positive().default(30),
++  RATE_LIMIT_POSTS_DELETE_WINDOW_S: z.coerce
++    .number()
++    .int()
++    .positive()
++    .default(3600),
++  RATE_LIMIT_LIKES_MAX: z.coerce.number().int().positive().default(120),
++  RATE_LIMIT_LIKES_WINDOW_S: z.coerce.number().int().positive().default(3600),
++  RATE_LIMIT_REPORTS_MAX: z.coerce.number().int().positive().default(10),
++  RATE_LIMIT_REPORTS_WINDOW_S: z.coerce.number().int().positive().default(3600),
++  // Pedidos /sync por utilizador (cada um com até 20 operações, já limitadas acima).
++  RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
++  RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
+ });
+ 
+ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
+diff --git a/apps/api/src/repositories/reports.ts b/apps/api/src/repositories/reports.ts
+index 8fc4f9c..cdd5a65 100644
+--- a/apps/api/src/repositories/reports.ts
++++ b/apps/api/src/repositories/reports.ts
+@@ -1,48 +1,86 @@
+ import { and, count, desc, eq, lte, sql } from "drizzle-orm";
++import type { ReportCategory, ReportSeverity } from "@comunidade/shared";
+ import type { Database } from "../db/client.js";
+ import { moderationLog, posts, reports, users } from "../db/schema.js";
+ import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
+ 
+-/** Nº de denúncias válidas e abertas a partir do qual o post passa a "Em revisão". */
+-export const REPORT_THRESHOLD = 10;
++/**
++ * Nº de denúncias válidas e abertas, POR GRAVIDADE, a partir do qual o post passa a
++ * "Em revisão" (ADR-013). Cada gravidade conta em separado: não se somam entre si, por isso
++ * 9 «spam» + 4 «ofensivo» não escalam. Quanto mais grave a categoria, menos denúncias
++ * bastam; a de doutrina é a mais sensível a contas combinadas, daí exigir 3 (e o reportador
++ * ter uma partilha publicada — ver `countValidOpenBySeverity`).
++ */
++export const REPORT_THRESHOLDS: Readonly<Record<ReportSeverity, number>> = {
++  basic: 10,
++  medium: 5,
++  high: 3,
++};
++/** Limiar da gravidade básica (a das categorias spam, fora do tema e outro). */
++export const REPORT_THRESHOLD = REPORT_THRESHOLDS.basic;
+ /** Idade mínima da conta de quem denuncia para a denúncia contar para o limiar. */
+ export const REPORTER_MIN_AGE_DAYS = 7;
+ 
++/** Da mais grave para a menos grave: a escalada regista a primeira que passou o limiar. */
++const SEVERITIES_BY_GRAVITY: readonly ReportSeverity[] = [
++  "high",
++  "medium",
++  "basic",
++];
++
+ type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+ 
+ export interface ReportRules {
+-  threshold?: number;
++  /** Limiares por gravidade (os que faltarem usam `REPORT_THRESHOLDS`). */
++  thresholds?: Partial<Record<ReportSeverity, number>>;
+   minAgeDays?: number;
+ }
+ 
++export interface FileReportArgs {
++  postId: string;
++  reporterId: string;
++  category: ReportCategory;
++  /** Obrigatório para a categoria "other" (a base de dados também o exige). */
++  reason?: string | null;
++}
++
+ export type FileReportResult =
+-  /** O post não existe ou não está publicado (não é visível para quem denuncia). */
++  /** O post não existe, foi apagado ou não está publicado (não é visível para quem denuncia). */
+   | { outcome: "post_not_found" }
+   | { outcome: "own_post" }
+-  /** Já existe uma denúncia deste utilizador para este post (aberta ou resolvida). */
++  /**
++   * Já existe uma denúncia deste utilizador para este post, em qualquer estado (aberta,
++   * resolvida ou retirada): uma por utilizador e post, para não se poder denunciar, retirar
++   * e denunciar de novo a repor o contador.
++   */
+   | { outcome: "duplicate" }
+   | {
+       outcome: "created";
+       report: Report;
+       /** Denúncias abertas deste post (todas). */
+       reportsCount: number;
+-      /** Denúncias abertas que contam para o limiar. */
++      /** Denúncias abertas que contam para o limiar (soma das gravidades). */
+       validReports: number;
++      /** O mesmo, por gravidade (é por aqui que se decide a escalada). */
++      validReportsBySeverity: Record<ReportSeverity, number>;
+       /** Esta denúncia fez o post passar a "Em revisão". */
+       escalated: boolean;
++      /** Gravidade que passou o limiar (só quando `escalated`). */
++      escalatedBy: ReportSeverity | null;
+     };
+ 
+ /**
+- * Denúncias abertas que contam para o limiar: a conta tem a idade mínima e já fez pelo
+- * menos uma partilha (anti-abuso: contas novas ou sem partilhas não contam).
++ * Denúncias abertas que contam para o limiar, por gravidade. Só contam as de quem tem conta
++ * com a idade mínima E pelo menos uma partilha PUBLICADA e não apagada (anti-abuso: contas
++ * novas, sem partilhas, ou só com partilhas pendentes/ocultas/rejeitadas não contam).
+  */
+-async function countValidOpen(
++async function countValidOpenBySeverity(
+   tx: Tx,
+   postId: string,
+   minAgeDays: number,
+-): Promise<number> {
+-  const [row] = await tx
+-    .select({ c: count() })
++): Promise<Record<ReportSeverity, number>> {
++  const rows = await tx
++    .select({ severity: reports.severity, c: count() })
+     .from(reports)
+     .innerJoin(users, eq(users.id, reports.reporterId))
+     .where(
+@@ -53,10 +91,23 @@ async function countValidOpen(
+           users.createdAt,
+           sql`now() - make_interval(days => ${minAgeDays}::int)`,
+         ),
+-        sql`EXISTS (SELECT 1 FROM ${posts} WHERE ${posts.authorId} = ${users.id})`,
++        sql`EXISTS (
++          SELECT 1 FROM ${posts}
++          WHERE ${posts.authorId} = ${users.id}
++            AND ${posts.status} = 'published'
++            AND ${posts.deletedAt} IS NULL
++        )`,
+       ),
+-    );
+-  return Number(row?.c ?? 0);
++    )
++    .groupBy(reports.severity);
++
++  const bySeverity: Record<ReportSeverity, number> = {
++    basic: 0,
++    medium: 0,
++    high: 0,
++  };
++  for (const row of rows) bySeverity[row.severity] = Number(row.c);
++  return bySeverity;
+ }
+ 
+ export function reportsRepo(db: Database) {
+@@ -105,24 +156,29 @@ export function reportsRepo(db: Database) {
+      * serializar denúncias concorrentes ao mesmo post: o contador e o limiar nunca se perdem
+      * e só uma denúncia pode ser a que escala o post.
+      *
+-     * Regras: só posts publicados; sem auto-denúncia; uma denúncia por utilizador e post;
+-     * ao atingir o limiar de denúncias válidas, o post passa a `pending_review`.
++     * Regras: só posts publicados e não apagados; sem auto-denúncia; uma denúncia por
++     * utilizador e post (em qualquer estado); quando uma gravidade atingir o seu limiar de
++     * denúncias válidas, o post passa a `pending_review` (e fica registado porquê).
+      */
+     async file(
+-      args: { postId: string; reporterId: string; reason: string },
++      args: FileReportArgs,
+       rules: ReportRules = {},
+     ): Promise<FileReportResult> {
+-      const threshold = rules.threshold ?? REPORT_THRESHOLD;
++      const thresholds = { ...REPORT_THRESHOLDS, ...rules.thresholds };
+       const minAgeDays = rules.minAgeDays ?? REPORTER_MIN_AGE_DAYS;
+ 
+       return db.transaction(async (tx) => {
+         const [post] = await tx
+-          .select({ status: posts.status, authorId: posts.authorId })
++          .select({
++            status: posts.status,
++            authorId: posts.authorId,
++            deletedAt: posts.deletedAt,
++          })
+           .from(posts)
+           .where(eq(posts.id, args.postId))
+           .for("no key update")
+           .limit(1);
+-        if (!post || post.status !== "published") {
++        if (!post || post.deletedAt !== null || post.status !== "published") {
+           return { outcome: "post_not_found" as const };
+         }
+         if (post.authorId === args.reporterId) {
+@@ -134,7 +190,8 @@ export function reportsRepo(db: Database) {
+           .values({
+             postId: args.postId,
+             reporterId: args.reporterId,
+-            reason: args.reason,
++            category: args.category,
++            reason: args.reason ?? null,
+           })
+           .onConflictDoNothing()
+           .returning();
+@@ -146,13 +203,26 @@ export function reportsRepo(db: Database) {
+           .where(eq(posts.id, args.postId))
+           .returning({ reportsCount: posts.reportsCount });
+ 
+-        const validReports = await countValidOpen(tx, args.postId, minAgeDays);
++        const bySeverity = await countValidOpenBySeverity(
++          tx,
++          args.postId,
++          minAgeDays,
++        );
++        const validReports =
++          bySeverity.basic + bySeverity.medium + bySeverity.high;
++
++        const triggered = SEVERITIES_BY_GRAVITY.find(
++          (severity) => bySeverity[severity] >= thresholds[severity],
++        );
+         let escalated = false;
+-        if (validReports >= threshold) {
++        if (triggered) {
+           // Só sai de "published": nunca ressuscita um post oculto ou rejeitado.
+           const moved = await tx
+             .update(posts)
+-            .set({ status: "pending_review" })
++            .set({
++              status: "pending_review",
++              reviewFlags: sql`array_append(coalesce(${posts.reviewFlags}, ARRAY[]::text[]), ${`reports_${triggered}`}::text)`,
++            })
+             .where(
+               and(eq(posts.id, args.postId), eq(posts.status, "published")),
+             )
+@@ -165,15 +235,18 @@ export function reportsRepo(db: Database) {
+           report,
+           reportsCount: counted?.reportsCount ?? 0,
+           validReports,
++          validReportsBySeverity: bySeverity,
+           escalated,
++          escalatedBy: escalated && triggered ? triggered : null,
+         };
+       });
+     },
+ 
+     /**
+-     * Cancela uma denúncia ABERTA do próprio utilizador e actualiza o contador. Uma denúncia
+-     * já resolvida não se cancela. Cancelar não tira o post de "Em revisão": quem decide é o
+-     * admin.
++     * Retira uma denúncia ABERTA do próprio utilizador: passa a `withdrawn` (a linha fica
++     * como registo, mas deixa de contar) e o contador desce. Uma denúncia já resolvida ou
++     * retirada não se retira outra vez. Retirar não tira o post de "Em revisão": quem decide
++     * é o admin.
+      */
+     async cancel(id: string, userId: string): Promise<boolean> {
+       return db.transaction(async (tx) => {
+@@ -191,15 +264,16 @@ export function reportsRepo(db: Database) {
+         if (!own) return false;
+ 
+         // Mesma ordem de bloqueios que `file` (post primeiro): evita deadlock se o mesmo
+-        // utilizador cancelar e voltar a denunciar em simultâneo.
++        // utilizador retirar e voltar a denunciar em simultâneo.
+         await tx
+           .select({ id: posts.id })
+           .from(posts)
+           .where(eq(posts.id, own.postId))
+           .for("no key update");
+ 
+-        const removed = await tx
+-          .delete(reports)
++        const withdrawn = await tx
++          .update(reports)
++          .set({ status: "withdrawn", withdrawnAt: new Date() })
+           .where(
+             and(
+               eq(reports.id, id),
+@@ -208,7 +282,7 @@ export function reportsRepo(db: Database) {
+             ),
+           )
+           .returning({ id: reports.id });
+-        if (removed.length === 0) return false;
++        if (withdrawn.length === 0) return false;
+ 
+         await tx
+           .update(posts)
+@@ -218,12 +292,14 @@ export function reportsRepo(db: Database) {
+       });
+     },
+ 
+-    async listByReporter(reporterId: string): Promise<Report[]> {
++    /** As mais recentes primeiro, limitadas (nunca uma lista sem fim). */
++    async listByReporter(reporterId: string, limit = 100): Promise<Report[]> {
+       return db
+         .select()
+         .from(reports)
+         .where(eq(reports.reporterId, reporterId))
+-        .orderBy(desc(reports.createdAt));
++        .orderBy(desc(reports.createdAt))
++        .limit(limit);
+     },
+ 
+     async resolveAllForPost(
+diff --git a/apps/api/test/auth/rate-limit.test.ts b/apps/api/test/auth/rate-limit.test.ts
+index 0ff22dc..a72cdc3 100644
+--- a/apps/api/test/auth/rate-limit.test.ts
++++ b/apps/api/test/auth/rate-limit.test.ts
+@@ -114,6 +114,57 @@ describe("rate limit — gospel cards (leitura pública)", () => {
+   });
+ });
+ 
++describe("rate limit — feed de partilhas", () => {
++  it("autenticado: balde por utilizador (IP partilhado não se afecta)", async () => {
++    const rl = make({ RATE_LIMIT_FEED_MAX: 1 });
++    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(true);
++    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(false);
++    // Outro utilizador no mesmo IP (CGNAT) tem o seu próprio balde.
++    expect((await rl.checkReadFeed("1.1.1.1", "user-b")).allowed).toBe(true);
++  });
++
++  it("anónimo: balde por IP, separado do dos utilizadores", async () => {
++    const rl = make({ RATE_LIMIT_FEED_MAX: 1 });
++    expect((await rl.checkReadFeed("1.1.1.1")).allowed).toBe(true);
++    const blocked = await rl.checkReadFeed("1.1.1.1");
++    expect(blocked.allowed).toBe(false);
++    expect(blocked.retryAfter).toBeGreaterThan(0);
++    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(true);
++    expect((await rl.checkReadFeed("2.2.2.2")).allowed).toBe(true);
++  });
++});
++
++describe("rate limit — escritas por utilizador", () => {
++  const cases = [
++    ["checkPostsCreate", "RATE_LIMIT_POSTS_CREATE_MAX"],
++    ["checkPostsDelete", "RATE_LIMIT_POSTS_DELETE_MAX"],
++    ["checkLikes", "RATE_LIMIT_LIKES_MAX"],
++    ["checkReports", "RATE_LIMIT_REPORTS_MAX"],
++    ["checkSyncBatch", "RATE_LIMIT_SYNC_MAX"],
++  ] as const;
++
++  it.each(cases)(
++    "%s bloqueia ao exceder e isola utilizadores",
++    async (method, envKey) => {
++      const rl = make({ [envKey]: 2 } as Partial<Env>);
++      expect((await rl[method]("user-a")).allowed).toBe(true);
++      expect((await rl[method]("user-a")).allowed).toBe(true);
++      const blocked = await rl[method]("user-a");
++      expect(blocked.allowed).toBe(false);
++      expect(blocked.retryAfter).toBeGreaterThan(0);
++      expect((await rl[method]("user-b")).allowed).toBe(true);
++    },
++  );
++
++  it("os tipos de operação têm baldes independentes", async () => {
++    const rl = make({ RATE_LIMIT_REPORTS_MAX: 1 });
++    expect((await rl.checkReports("user-a")).allowed).toBe(true);
++    expect((await rl.checkReports("user-a")).allowed).toBe(false);
++    expect((await rl.checkLikes("user-a")).allowed).toBe(true);
++    expect((await rl.checkPostsCreate("user-a")).allowed).toBe(true);
++  });
++});
++
+ describe("rate limit — Redis indisponível", () => {
+   it("continua a limitar em memória (não falha em aberto)", async () => {
+     // Porta 1: ligação recusada. Sem fila offline, cada comando falha de imediato.
+diff --git a/apps/api/test/repositories/account-deletion.test.ts b/apps/api/test/repositories/account-deletion.test.ts
+index 1689b6d..573cc05 100644
+--- a/apps/api/test/repositories/account-deletion.test.ts
++++ b/apps/api/test/repositories/account-deletion.test.ts
+@@ -302,12 +302,14 @@ describe("accountDeletionRepo.purgeDue", () => {
+     const filed = await reportsRepo(db).file({
+       postId: post.id,
+       reporterId: leaver.id,
++      category: "other",
+       reason: "x",
+     });
+     expect(filed.outcome).toBe("created");
+     await reportsRepo(db).file({
+       postId: post.id,
+       reporterId: other.id,
++      category: "other",
+       reason: "x",
+     });
+     expect((await postRow(post.id))?.likesCount).toBe(2);
+@@ -331,7 +333,12 @@ describe("accountDeletionRepo.purgeDue", () => {
+     const author = await makeUser();
+     const post = await makePost(author.id);
+     const rr = reportsRepo(db);
+-    await rr.file({ postId: post.id, reporterId: leaver.id, reason: "x" });
++    await rr.file({
++      postId: post.id,
++      reporterId: leaver.id,
++      category: "other",
++      reason: "x",
++    });
+     await rr.resolveAllForPost(post.id, "resolved_kept", admin.id);
+     expect((await postRow(post.id))?.reportsCount).toBe(0);
+ 
+diff --git a/apps/api/test/repositories/reports.rules.test.ts b/apps/api/test/repositories/reports.rules.test.ts
+index 3078d0b..d79c66b 100644
+--- a/apps/api/test/repositories/reports.rules.test.ts
++++ b/apps/api/test/repositories/reports.rules.test.ts
+@@ -1,7 +1,7 @@
+ import { eq } from "drizzle-orm";
+ import { uuidv7 } from "uuidv7";
+ import { afterAll, beforeEach, describe, expect, it } from "vitest";
+-import { posts } from "../../src/db/schema.js";
++import { posts, reports } from "../../src/db/schema.js";
+ import type { User } from "../../src/db/schema.js";
+ import {
+   REPORT_THRESHOLD,
+@@ -47,6 +47,7 @@ describe("reportsRepo.file — regras básicas", () => {
+     const result = await reportsRepo(db).file({
+       postId: post.id,
+       reporterId: reporter.id,
++      category: "other",
+       reason: "conteúdo impróprio",
+     });
+ 
+@@ -63,6 +64,7 @@ describe("reportsRepo.file — regras básicas", () => {
+     const result = await reportsRepo(db).file({
+       postId: uuidv7(),
+       reporterId: reporter.id,
++      category: "other",
+       reason: "x",
+     });
+     expect(result.outcome).toBe("post_not_found");
+@@ -78,6 +80,7 @@ describe("reportsRepo.file — regras básicas", () => {
+       const result = await reportsRepo(db).file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+       expect(result.outcome).toBe("post_not_found");
+@@ -92,6 +95,7 @@ describe("reportsRepo.file — regras básicas", () => {
+     const result = await reportsRepo(db).file({
+       postId: post.id,
+       reporterId: author.id,
++      category: "other",
+       reason: "x",
+     });
+     expect(result.outcome).toBe("own_post");
+@@ -105,7 +109,12 @@ describe("reportsRepo.file — regras básicas", () => {
+     const reporter = await makeUser();
+     const post = await makePost(author.id);
+     const repo = reportsRepo(db);
+-    const args = { postId: post.id, reporterId: reporter.id, reason: "x" };
++    const args = {
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "other",
++      reason: "x",
++    };
+ 
+     expect((await repo.file(args)).outcome).toBe("created");
+     expect((await repo.file(args)).outcome).toBe("duplicate");
+@@ -119,7 +128,12 @@ describe("reportsRepo.file — regras básicas", () => {
+     const admin = await makeUser({ role: "admin" });
+     const post = await makePost(author.id);
+     const repo = reportsRepo(db);
+-    const args = { postId: post.id, reporterId: reporter.id, reason: "x" };
++    const args = {
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "other",
++      reason: "x",
++    };
+ 
+     await repo.file(args);
+     await repo.resolveAllForPost(post.id, "resolved_kept", admin.id);
+@@ -139,6 +153,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+       const result = await repo.file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+       expect(result.outcome).toBe("created");
+@@ -164,6 +179,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+       await repo.file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+     }
+@@ -182,6 +198,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+       const r = await repo.file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+       expect(r.outcome).toBe("created");
+@@ -205,6 +222,7 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+       const r = await repo.file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+       if (r.outcome === "created") expect(r.validReports).toBe(0);
+@@ -212,21 +230,21 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+     expect((await postRow(post.id)).status).toBe("published");
+   });
+ 
+-  it("limiar configurável (rules.threshold)", async () => {
++  it("limiar configurável (rules.thresholds)", async () => {
+     const db = await getTestDb();
+     const author = await makeUser();
+     const post = await makePost(author.id);
+     const repo = reportsRepo(db);
+-    const rules = { threshold: 2 };
++    const rules = { thresholds: { basic: 2 } };
+ 
+     const a = await makeValidReporter();
+     const b = await makeValidReporter();
+     const first = await repo.file(
+-      { postId: post.id, reporterId: a.id, reason: "x" },
++      { postId: post.id, reporterId: a.id, category: "other", reason: "x" },
+       rules,
+     );
+     const second = await repo.file(
+-      { postId: post.id, reporterId: b.id, reason: "x" },
++      { postId: post.id, reporterId: b.id, category: "other", reason: "x" },
+       rules,
+     );
+     expect(first.outcome === "created" && first.escalated).toBe(false);
+@@ -245,7 +263,12 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+     }
+     const results = await Promise.all(
+       reporters.map((r) =>
+-        repo.file({ postId: post.id, reporterId: r.id, reason: "x" }),
++        repo.file({
++          postId: post.id,
++          reporterId: r.id,
++          category: "other",
++          reason: "x",
++        }),
+       ),
+     );
+ 
+@@ -260,8 +283,8 @@ describe("reportsRepo.file — limiar e anti-abuso", () => {
+   });
+ });
+ 
+-describe("reportsRepo.cancel — só abertas, com contador", () => {
+-  it("cancela a própria denúncia aberta e decrementa o contador", async () => {
++describe("reportsRepo.cancel — retira só abertas, com contador", () => {
++  it("retira a própria denúncia aberta (withdrawn) e decrementa o contador", async () => {
+     const db = await getTestDb();
+     const author = await makeUser();
+     const reporter = await makeUser();
+@@ -270,6 +293,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
+     const result = await repo.file({
+       postId: post.id,
+       reporterId: reporter.id,
++      category: "other",
+       reason: "x",
+     });
+     if (result.outcome !== "created") throw new Error("esperava created");
+@@ -277,16 +301,25 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
+     expect(await repo.cancel(result.report.id, reporter.id)).toBe(true);
+     expect((await postRow(post.id)).reportsCount).toBe(0);
+     expect(await repo.countOpenByPost(post.id)).toBe(0);
+-    // Pode denunciar de novo depois de cancelar.
++    // A linha fica como registo (withdrawn), não é apagada.
++    const [row] = await db
++      .select()
++      .from(reports)
++      .where(eq(reports.id, result.report.id));
++    expect(row?.status).toBe("withdrawn");
++    expect(row?.withdrawnAt).not.toBeNull();
++    // Retirar e denunciar de novo não repõe nada: continua a ser a mesma denúncia.
+     expect(
+       (
+         await repo.file({
+           postId: post.id,
+           reporterId: reporter.id,
++          category: "other",
+           reason: "x",
+         })
+       ).outcome,
+-    ).toBe("created");
++    ).toBe("duplicate");
++    expect((await postRow(post.id)).reportsCount).toBe(0);
+   });
+ 
+   it("não cancela denúncia de outro utilizador", async () => {
+@@ -299,6 +332,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
+     const result = await repo.file({
+       postId: post.id,
+       reporterId: r1.id,
++      category: "other",
+       reason: "x",
+     });
+     if (result.outcome !== "created") throw new Error("esperava created");
+@@ -317,6 +351,7 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
+     const result = await repo.file({
+       postId: post.id,
+       reporterId: reporter.id,
++      category: "other",
+       reason: "x",
+     });
+     if (result.outcome !== "created") throw new Error("esperava created");
+@@ -333,10 +368,15 @@ describe("reportsRepo.cancel — só abertas, com contador", () => {
+     const author = await makeUser();
+     const post = await makePost(author.id);
+     const repo = reportsRepo(db);
+-    const rules = { threshold: 1 };
++    const rules = { thresholds: { basic: 1 } };
+     const reporter = await makeValidReporter();
+     const result = await repo.file(
+-      { postId: post.id, reporterId: reporter.id, reason: "x" },
++      {
++        postId: post.id,
++        reporterId: reporter.id,
++        category: "other",
++        reason: "x",
++      },
+       rules,
+     );
+     if (result.outcome !== "created") throw new Error("esperava created");
+@@ -359,6 +399,7 @@ describe("reportsRepo.resolveAllForPost", () => {
+       await repo.file({
+         postId: post.id,
+         reporterId: reporter.id,
++        category: "other",
+         reason: "x",
+       });
+     }
+diff --git a/apps/api/test/repositories/reports.severity.test.ts b/apps/api/test/repositories/reports.severity.test.ts
+new file mode 100644
+index 0000000..52be764
+--- /dev/null
++++ b/apps/api/test/repositories/reports.severity.test.ts
+@@ -0,0 +1,306 @@
++import { eq, sql } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { CATEGORY_TO_SEVERITY, ReportCategory } from "@comunidade/shared";
++import { posts, reports } from "../../src/db/schema.js";
++import type { User } from "../../src/db/schema.js";
++import {
++  REPORT_THRESHOLDS,
++  REPORTER_MIN_AGE_DAYS,
++  reportsRepo,
++} from "../../src/repositories/reports.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makePost, makeUser } from "../helpers/factories.js";
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++beforeEach(async () => {
++  await truncateAll();
++});
++
++afterAll(async () => {
++  await closeTestDb();
++});
++
++/** Conta com a idade mínima e uma partilha publicada: a denúncia conta para o limiar. */
++async function makeValidReporter(): Promise<User> {
++  const user = await makeUser({
++    createdAt: new Date(Date.now() - (REPORTER_MIN_AGE_DAYS + 1) * DAY_MS),
++  });
++  await makePost(user.id);
++  return user;
++}
++
++async function postRow(id: string) {
++  const db = await getTestDb();
++  const [row] = await db.select().from(posts).where(eq(posts.id, id));
++  return row!;
++}
++
++describe("severidade gerada pelo Postgres", () => {
++  it.each(ReportCategory.options)(
++    "categoria %s → gravidade igual a CATEGORY_TO_SEVERITY",
++    async (category) => {
++      const db = await getTestDb();
++      const author = await makeUser();
++      const reporter = await makeUser();
++      const post = await makePost(author.id);
++      const created = await reportsRepo(db).file({
++        postId: post.id,
++        reporterId: reporter.id,
++        category,
++        reason: "motivo",
++      });
++      if (created.outcome !== "created") throw new Error("esperava created");
++      expect(created.report.severity).toBe(CATEGORY_TO_SEVERITY[category]);
++    },
++  );
++
++  it("a gravidade não se pode escrever à mão", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    await expect(
++      db.execute(sql`
++        INSERT INTO reports (id, post_id, reporter_id, category, severity)
++        VALUES (gen_random_uuid(), ${post.id}, ${reporter.id}, 'spam', 'high')
++      `),
++    ).rejects.toThrow();
++  });
++});
++
++describe("motivo e categoria", () => {
++  it("«other» sem motivo é recusado pela base de dados (CHECK)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    await expect(
++      reportsRepo(db).file({
++        postId: post.id,
++        reporterId: reporter.id,
++        category: "other",
++      }),
++    ).rejects.toThrow();
++    // A transacção reverteu: o contador não mudou.
++    expect((await postRow(post.id)).reportsCount).toBe(0);
++  });
++
++  it("«other» com motivo só de espaços também é recusado", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    await expect(
++      reportsRepo(db).file({
++        postId: post.id,
++        reporterId: reporter.id,
++        category: "other",
++        reason: "   ",
++      }),
++    ).rejects.toThrow();
++  });
++
++  it("categorias que não são «other» não precisam de motivo", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    const result = await reportsRepo(db).file({
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "spam",
++    });
++    expect(result.outcome).toBe("created");
++    if (result.outcome === "created") expect(result.report.reason).toBeNull();
++  });
++});
++
++describe("limiares por gravidade", () => {
++  it("limiares: basic 10, medium 5, high 3", () => {
++    expect(REPORT_THRESHOLDS).toEqual({ basic: 10, medium: 5, high: 3 });
++  });
++
++  it.each([
++    ["spam", "basic"],
++    ["offensive", "medium"],
++    ["doctrine", "high"],
++  ] as const)(
++    "%s escala exactamente ao atingir o limiar da gravidade %s",
++    async (category, severity) => {
++      const db = await getTestDb();
++      const author = await makeUser();
++      const post = await makePost(author.id);
++      const repo = reportsRepo(db);
++      const limit = REPORT_THRESHOLDS[severity];
++
++      for (let i = 1; i <= limit; i++) {
++        const reporter = await makeValidReporter();
++        const result = await repo.file({
++          postId: post.id,
++          reporterId: reporter.id,
++          category,
++        });
++        if (result.outcome !== "created") throw new Error("esperava created");
++        expect(result.validReportsBySeverity[severity]).toBe(i);
++        expect(result.escalated).toBe(i === limit);
++        expect(result.escalatedBy).toBe(i === limit ? severity : null);
++      }
++
++      const row = await postRow(post.id);
++      expect(row.status).toBe("pending_review");
++      expect(row.reviewFlags).toEqual([`reports_${severity}`]);
++    },
++  );
++
++  it("as gravidades não se somam: 9 básicas + 4 médias + 2 graves não escalam", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const repo = reportsRepo(db);
++    const plan = [
++      ...Array<ReportCategory>(9).fill("spam"),
++      ...Array<ReportCategory>(4).fill("offensive"),
++      ...Array<ReportCategory>(2).fill("doctrine"),
++    ];
++    for (const category of plan) {
++      const reporter = await makeValidReporter();
++      const result = await repo.file({
++        postId: post.id,
++        reporterId: reporter.id,
++        category,
++      });
++      if (result.outcome !== "created") throw new Error("esperava created");
++      expect(result.escalated).toBe(false);
++    }
++    expect((await postRow(post.id)).status).toBe("published");
++  });
++
++  it("depois de escalar, o post deixa de ser denunciável (sem dupla escalada)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const repo = reportsRepo(db);
++    const rules = { thresholds: { high: 1 } };
++    const first = await repo.file(
++      {
++        postId: post.id,
++        reporterId: (await makeValidReporter()).id,
++        category: "doctrine",
++      },
++      rules,
++    );
++    expect(first.outcome === "created" && first.escalated).toBe(true);
++    // O post já não está publicado: novas denúncias são post_not_found.
++    const second = await repo.file(
++      {
++        postId: post.id,
++        reporterId: (await makeValidReporter()).id,
++        category: "doctrine",
++      },
++      rules,
++    );
++    expect(second.outcome).toBe("post_not_found");
++  });
++});
++
++describe("reportador válido", () => {
++  it("só com partilhas pendentes, ocultas ou rejeitadas não conta", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const repo = reportsRepo(db);
++
++    for (const status of ["pending_review", "hidden", "rejected"] as const) {
++      const reporter = await makeUser({
++        createdAt: new Date(Date.now() - 30 * DAY_MS),
++      });
++      await makePost(reporter.id, { status });
++      const result = await repo.file({
++        postId: post.id,
++        reporterId: reporter.id,
++        category: "doctrine",
++      });
++      if (result.outcome !== "created") throw new Error("esperava created");
++      expect(result.validReports).toBe(0);
++    }
++    expect((await postRow(post.id)).status).toBe("published");
++  });
++
++  it("partilha apagada pelo autor deixa de contar", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const reporter = await makeUser({
++      createdAt: new Date(Date.now() - 30 * DAY_MS),
++    });
++    const own = await makePost(reporter.id);
++    await db
++      .update(posts)
++      .set({ deletedAt: new Date() })
++      .where(eq(posts.id, own.id));
++
++    const result = await reportsRepo(db).file({
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "spam",
++    });
++    if (result.outcome !== "created") throw new Error("esperava created");
++    expect(result.validReports).toBe(0);
++  });
++});
++
++describe("posts apagados e denúncias retiradas", () => {
++  it("post apagado não é denunciável (post_not_found)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    await db
++      .update(posts)
++      .set({ deletedAt: new Date() })
++      .where(eq(posts.id, post.id));
++    const result = await reportsRepo(db).file({
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "spam",
++    });
++    expect(result.outcome).toBe("post_not_found");
++  });
++
++  it("denúncia retirada não conta para o limiar nem pode ser retirada outra vez", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const repo = reportsRepo(db);
++    const reporter = await makeValidReporter();
++    const result = await repo.file({
++      postId: post.id,
++      reporterId: reporter.id,
++      category: "doctrine",
++    });
++    if (result.outcome !== "created") throw new Error("esperava created");
++
++    expect(await repo.cancel(result.report.id, reporter.id)).toBe(true);
++    expect(await repo.cancel(result.report.id, reporter.id)).toBe(false);
++
++    const [row] = await db
++      .select()
++      .from(reports)
++      .where(eq(reports.id, result.report.id));
++    expect(row?.status).toBe("withdrawn");
++
++    // Duas válidas novas: 2 < 3, e a retirada não conta como terceira.
++    for (let i = 0; i < 2; i++) {
++      const other = await makeValidReporter();
++      const r = await repo.file({
++        postId: post.id,
++        reporterId: other.id,
++        category: "doctrine",
++      });
++      if (r.outcome !== "created") throw new Error("esperava created");
++      expect(r.escalated).toBe(false);
++      expect(r.validReportsBySeverity.high).toBe(i + 1);
++    }
++  });
++});
+diff --git a/apps/api/test/repositories/reports.test.ts b/apps/api/test/repositories/reports.test.ts
+index cd7f0ff..435cebf 100644
+--- a/apps/api/test/repositories/reports.test.ts
++++ b/apps/api/test/repositories/reports.test.ts
+@@ -24,12 +24,14 @@ describe("reportsRepo", () => {
+     const first = await repo.create({
+       postId: p.id,
+       reporterId: reporter.id,
++      category: "other",
+       reason: "conteúdo impróprio",
+     });
+     expect(first).not.toBeNull();
+     const dup = await repo.create({
+       postId: p.id,
+       reporterId: reporter.id,
++      category: "other",
+       reason: "outro motivo",
+     });
+     expect(dup).toBeNull();
+@@ -45,6 +47,7 @@ describe("reportsRepo", () => {
+     const report = await repo.create({
+       postId: p.id,
+       reporterId: r1.id,
++      category: "other",
+       reason: "x",
+     });
+     expect(await repo.cancel(report!.id, r2.id)).toBe(false);
+@@ -58,7 +61,12 @@ describe("reportsRepo", () => {
+     const repo = reportsRepo(db);
+     for (let i = 0; i < 3; i++) {
+       const r = await makeUser();
+-      await repo.create({ postId: p.id, reporterId: r.id, reason: "x" });
++      await repo.create({
++        postId: p.id,
++        reporterId: r.id,
++        category: "other",
++        reason: "x",
++      });
+     }
+     expect(await repo.countOpenByPost(p.id)).toBe(3);
+     await repo.resolveAllForPost(p.id, "resolved_kept", author.id);
+diff --git a/apps/api/test/setup.ts b/apps/api/test/setup.ts
+index cb0486c..772eba4 100644
+--- a/apps/api/test/setup.ts
++++ b/apps/api/test/setup.ts
+@@ -15,6 +15,12 @@ process.env.RATE_LIMIT_RECOVER_IP_MAX = "1000";
+ process.env.RATE_LIMIT_RECOVER_ACCOUNT_QUESTIONS_MAX = "1000";
+ process.env.RATE_LIMIT_RECOVER_ACCOUNT_CODE_MAX = "1000";
+ process.env.RATE_LIMIT_CARDS_MAX = "1000";
++process.env.RATE_LIMIT_FEED_MAX = "1000";
++process.env.RATE_LIMIT_POSTS_CREATE_MAX = "1000";
++process.env.RATE_LIMIT_POSTS_DELETE_MAX = "1000";
++process.env.RATE_LIMIT_LIKES_MAX = "1000";
++process.env.RATE_LIMIT_REPORTS_MAX = "1000";
++process.env.RATE_LIMIT_SYNC_MAX = "1000";
+ 
+ // Chaves JWT efémeras por run (nunca reutilizar)
+ if (!process.env.JWT_PRIVATE_JWK || !process.env.JWT_PUBLIC_JWK) {
+diff --git a/apps/api/test/shared/content-filter.test.ts b/apps/api/test/shared/content-filter.test.ts
+new file mode 100644
+index 0000000..29ded0e
+--- /dev/null
++++ b/apps/api/test/shared/content-filter.test.ts
+@@ -0,0 +1,152 @@
++import { describe, expect, it } from "vitest";
++import { checkContent, flagCodes } from "@comunidade/shared";
++
++const rejectedAs = (text: string, title = "Título") => {
++  const result = checkContent(title, text);
++  return result.reject ? result.violations[0]?.code : null;
++};
++
++describe("checkContent — ligações rejeitadas", () => {
++  it.each([
++    "veja igreja.org",
++    "acesse sitedaigreja.net",
++    "https://exemplo.pt/pagina",
++    "wa.me/grupo-igreja",
++    "t.me/canal",
++    "youtu.be/abc123",
++    "linktr.ee/igreja",
++    "bit.ly/xyz",
++    "igreja.com.br",
++    "WWW . igreja . net",
++    "hxxp://exemplo",
++    "igreja . com",
++    "igreja [.] com",
++    "igreja(.)com",
++    "igreja dot com",
++    "igreja[dot]com",
++    "visite igreja ponto com",
++    "visite igreja ponto com.",
++    "igreja​.com", // zero-width
++    "igreja．com", // ponto de largura total
++    "igreja.cоm", // «о» cirílico
++  ])("rejeita %j como link", (text) => {
++    expect(rejectedAs(text)).toBe("link");
++  });
++
++  it("apanha o link também no título", () => {
++    expect(rejectedAs("texto normal", "veja igreja.org")).toBe("link");
++  });
++});
++
++describe("checkContent — contactos rejeitados", () => {
++  it.each([
++    "ligue 912345678", // PT
++    "ligue +351 912 345 678",
++    "ligue +258 84 123 4567", // MZ
++    "ligue 84 123 4567",
++    "ligue 82-123-4567",
++    "ligue 923456789", // AO
++    "zap: (11) 91234-5678", // BR
++    "ligue +27 82 123 4567", // internacional explícito
++    "9 1 2 3 4 5 6 7 8", // dígitos separados
++    "whatsapp 99887766", // mensageiro + número de formato desconhecido
++    "wa.me/258841234567", // ligação que já traz o número
++    "email: joao@gmail.com",
++    "joao (at) gmail . com",
++    "joao arroba gmail",
++    "joao @ gmail . com",
++    "IP 192.168.0.1",
++    "host 2001:db8::1",
++  ])("rejeita %j como contacto", (text) => {
++    expect(rejectedAs(text)).toBe("contact");
++  });
++});
++
++describe("checkContent — texto legítimo passa", () => {
++  it.each([
++    "Amém, Deus é bom.",
++    "O culto é às 10:30:15 de domingo",
++    "A versão 1.2.3.4 do estudo",
++    "Salmo 91 verso 2345678",
++    "João 3:16-17 e Mateus 5.3",
++    "esse ponto com certeza é importante",
++    "Jesus é o Senhor. Com ele tudo é possível",
++    "Em 2026, 1.5 milhões de pessoas",
++    "Gênesis 1.1 diz que",
++    "Ex.: entendimento de Rm 8.28",
++    "Capítulo 12.3.4 do livro",
++    "Deus.é amor",
++    "@joao respondeu bem", // menção sem email
++    "Obrigado @maria pela partilha",
++  ])("aceita %j", (text) => {
++    const result = checkContent("Reflexão", text);
++    expect(result.reject).toBe(false);
++  });
++
++  it("«AMÉM ALELUIA» curto não é sinal de caps (ADR-013: len > 50)", () => {
++    const result = checkContent("Louvor", "AMÉM ALELUIA");
++    expect(result.reject).toBe(false);
++    expect(flagCodes(result)).toEqual([]);
++  });
++});
++
++describe("checkContent — sinais de spam (não rejeitam)", () => {
++  it("caps: texto longo com mais de 50 % de maiúsculas", () => {
++    const text =
++      "GLÓRIA A DEUS PARA SEMPRE, SENHOR NOSSO CRIADOR E PAI DE TODOS";
++    const result = checkContent("Louvor", text);
++    expect(result.reject).toBe(false);
++    expect(flagCodes(result)).toContain("caps");
++  });
++
++  it("repetição, pontuação, palavras de spam e pedido de contacto", () => {
++    const result = checkContent(
++      "Oferta",
++      "ganhe dinheiro rápido!!!!! aaaaaaaaaaaa chama no whatsapp",
++    );
++    expect(result.reject).toBe(false);
++    expect(flagCodes(result)).toEqual([
++      "repetition",
++      "punctuation",
++      "keywords",
++      "contact_solicitation",
++    ]);
++  });
++
++  it("palavras de spam sem acentos e no plural", () => {
++    const result = checkContent("x", "Prémios e sorteios de bitcoins");
++    expect(flagCodes(result)).toContain("keywords");
++  });
++
++  it("mistura de alfabetos na mesma palavra", () => {
++    const result = checkContent("x", "palavra mistuаda"); // «а» cirílico
++    expect(flagCodes(result)).toContain("mixed_script");
++  });
++
++  it("texto limpo não tem sinais", () => {
++    const result = checkContent(
++      "Entendimento",
++      "Hoje li Romanos 8 e fiquei em paz.",
++    );
++    expect(result).toEqual({ reject: false, flags: [] });
++  });
++});
++
++describe("checkContent — desempenho em entradas adversariais", () => {
++  const MAX_MS = 250; // folgado: serve para apanhar regressões quadráticas, não micro-variações
++  it.each([
++    ["pontos repetidos", "a.".repeat(2500)],
++    ["espaços", "a ".repeat(2500)],
++    ["dígitos", "1".repeat(5000)],
++    ["arrobas", "a@".repeat(2500)],
++    ["dígitos separados", "9 ".repeat(2500)],
++    ["uma palavra enorme", "a".repeat(5000)],
++    ["dois-pontos", "x:".repeat(2500)],
++    ["hífens", "a-".repeat(2500)],
++    ["pontos com espaços", "a .".repeat(1600)],
++  ])("%s", (_name, text) => {
++    const start = performance.now();
++    checkContent("t", text);
++    expect(performance.now() - start).toBeLessThan(MAX_MS);
++  });
++});
+diff --git a/docs/registos/E4a-base-posts-denuncias.md b/docs/registos/E4a-base-posts-denuncias.md
+new file mode 100644
+index 0000000..294804c
+--- /dev/null
++++ b/docs/registos/E4a-base-posts-denuncias.md
+@@ -0,0 +1,117 @@
++# E4-a — Base de posts, denúncias e filtro (schema, shared, denúncias)
++
++Data: 2026-11-12 · Branch de origem: `feat` do E4/E4.5/E4.6/E4.7 (criada sobre a versão antiga do
++E2). **Não foi feito merge**: a branch foi comparada ficheiro a ficheiro com o `dev` (F1–F8) e só
++se aproveitaram os deltas do E4, reescritos sobre o `dev`.
++
++Este bloco é só a **base**: schema, contratos partilhados, filtro de conteúdo, limites e o
++repositório de denúncias. Serviços de posts, rotas, cache do feed e `/sync` ficam para E4-b e E4-c;
++documentação (ADR-012/006, `api.md`, spec) para E4-d.
++
++## 1. Contexto
++
++O E4 acrescenta partilhas (posts), likes, denúncias e sincronização offline. A branch trazia 3
++fases de trabalho (E4, E4.5+E5, E4.6+E4.7) e uma base antiga: faltavam F2–F8 e as duas branches
++tinham criado uma migração `0003` diferente.
++
++## 2. Check — o que se encontrou (resumo; revisão completa feita em conversa)
++
++| #   | Problema                                                                                              | Gravidade |
++| --- | ----------------------------------------------------------------------------------------------------- | --------- |
++| 1   | `reports.ts` do E4 regredia o F1: `FOR UPDATE` (deadlock com likes), ordem de locks, sem `minAgeDays` | Crítica   |
++| 2   | Retirar uma denúncia apagava-a: destruía evidência e deixava repor o contador em ciclos               | Crítica   |
++| 3   | Conflito de migração (`0003` nos dois lados)                                                          | Alta      |
++| 4   | `severity` guardada ao lado de `category`: podia ficar incoerente                                     | Alta      |
++| 5   | Reportador «válido» contava qualquer partilha (pendente, oculta, rejeitada)                           | Alta      |
++| 6   | Filtro: contornos (`.org/.net/.pt`, `wa.me`, `t.me`, `youtu.be`, `dot com`, homóglifos cirílicos)     | Alta      |
++| 7   | Filtro: telefones só de Portugal; falsos positivos («às 10:30:15», «versão 1.2.3.4», «AMÉM ALELUIA»)  | Média     |
++| 8   | Filtro: regex quadrática (35–50 ms em 5000 caracteres)                                                | Média     |
++| 9   | Posts sem trim, sem guarda de NUL (erro 22021 → 500), cursor sem validação                            | Média     |
++| 10  | Cursor por `createdAt` em milissegundos: saltava linhas (o Postgres guarda microssegundos)            | Média     |
++| 11  | `PostPublic` devolvia `authorId` mesmo com autor apagado/anónimo (anulava o F5)                       | Alta      |
++| 12  | Corpo `{outcome}` em respostas 400/404 de denúncias (viola o formato de erro único do F2)             | Média     |
++| 13  | CI do `dev`: serviço Postgres publicado em 5430 mas `DATABASE_URL` aponta para 5432                   | Média     |
++
++Os pontos 11 e 12 são resolvidos aqui nos contratos (`shared`); a sua aplicação nas rotas é E4-c.
++Os restantes achados da revisão (idempotência com corrida, transacções, `feed-cache` com `SCAN`,
++`GET /posts/:id` sem visibilidade, `/sync` sem limites por operação, etc.) ficam para E4-b/E4-c.
++
++## 3. Decisões
++
++Tomadas pelo responsável do projecto em 2026-11-12.
++
++| Tema                    | Escolha                                                                                                    |
++| ----------------------- | ---------------------------------------------------------------------------------------------------------- |
++| Estratégia              | Comparar e aproveitar; **sem merge** da branch                                                             |
++| Filtro de conteúdo      | Mais TLDs, telefones PT/MZ/AO/BR, normalização de ofuscação, homóglifos; ADR-013 prevalece sobre a spec    |
++| Retirar denúncia        | Estado `withdrawn` (a linha fica); **uma denúncia por utilizador e post, em qualquer estado**              |
++| Apagar post             | Soft delete (`posts.deleted_at`)                                                                           |
++| `severity`              | **Coluna gerada** pelo Postgres a partir de `category`                                                     |
++| Limiares                | basic 10, medium 5, high **3** (era 2); só contam reportadores com conta ≥ 7 dias e partilha **publicada** |
++| Denúncias antigas       | Migram como `other`, com o `reason` já preenchido                                                          |
++| `authorId` nos posts    | Não sai da API: `author: { username } \| null` + `isMine`                                                  |
++| Cursor                  | Composto `(timestamp exacto, id)`, opaco e validado; `top` e `liked` também paginam                        |
++| Limites de escrita      | Por utilizador e por operação, configuráveis; o `/sync` aplica os mesmos (E4-c)                            |
++| Spec vs ADR             | Prevalece o ADR-013: sem «pendente por conta nova», limiares e palavras-chave no código                    |
++| `/users/me/*`, password | Fase própria                                                                                               |
++
++## 4. Alterações
++
++- `apps/api/drizzle/0004_report_categories_soft_delete.sql` (+ snapshot e journal). A `0003` do E4
++  foi descartada. **Escrita à mão** (o `drizzle-kit` não correu no ambiente de revisão): validada
++  contra um Postgres 16 real com dados antigos, mas convém correr `pnpm db:generate` e confirmar
++  que **não** gera diferenças.
++  - `report_status` + `withdrawn`; enums `report_category` e `report_severity`.
++  - `reports`: `reason` passa a opcional; `category` obrigatória (sem default); `severity` gerada;
++    `withdrawn_at`; `CHECK` «other» exige motivo não vazio; índice `(post_id, category, status)`.
++  - `posts`: `deleted_at` (soft delete) e `review_flags text[]` (porquê foi para `pending_review`).
++  - `idempotency_keys`: `request_hash` (nulo por agora; passa a ser escrito e comparado no E4-b).
++- `apps/api/src/db/schema.ts`: o que acima, com comentários.
++- `apps/api/src/db/client.ts`: tipos `DbTransaction` e `Executor`.
++- `apps/api/src/repositories/reports.ts`: parte do `reports.ts` do `dev` (F1) e acrescenta só o que
++  o E4.7 trazia, corrigido: `file({ category, reason? })`, limiares por gravidade sem somar entre
++  si, `withdrawn`, reportador válido com partilha publicada e não apagada, `review_flags`
++  (`reports_<gravidade>`) na escalada, `listByReporter` limitado e mais recentes primeiro.
++- `packages/shared/src/content-filter.ts` (novo), `posts.ts` (novo), `sync.ts` (novo), `index.ts`.
++- `apps/api/src/auth/rate-limit.ts`, `env.ts`, `.env.example`, `test/setup.ts`: limites de feed,
++  escritas e sync (todos configuráveis).
++- `.github/workflows/ci.yml`: o serviço Postgres publica em `5432:5432` (coerente com `DATABASE_URL`;
++  o `docker-compose.yml` local mantém `5430`).
++
++## 5. Segurança e privacidade
++
++- O filtro de conteúdo é uma defesa de produto, não um controlo de segurança: continua a ser
++  contornável por quem se esforce. A defesa em profundidade é a moderação, as denúncias e os limites.
++- Todas as expressões do filtro são lineares; há teste de carga com entradas adversariais.
++- `authorId` deixa de fazer parte do contrato público: não se pode usar para ligar partilhas
++  anónimas a uma conta apagada.
++- Cursor opaco, com tamanho e alfabeto validados: não permite injecção nem chaves arbitrárias.
++- Denúncias nunca são apagadas pelo utilizador: ficam como evidência de campanhas combinadas.
++- Falso positivo conhecido e aceite no filtro: «Jesus.Com» (falta o espaço depois do ponto) é
++  rejeitado como ligação; a mensagem de erro explica como corrigir.
++
++## 6. Testes
++
++- Novos: `test/repositories/reports.severity.test.ts` (gravidade gerada = `CATEGORY_TO_SEVERITY`,
++  CHECK de «other», limiares por gravidade sem soma, reportador válido, `withdrawn`),
++  `test/shared/content-filter.test.ts`, limites novos em `test/auth/rate-limit.test.ts`.
++- Actualizados: `reports.rules.test.ts`, `reports.test.ts`, `account-deletion.test.ts` (categoria
++  obrigatória; denunciar depois de retirar passa a ser `duplicate`).
++- Por cobrir (E4-b/E4-c): concorrência na idempotência, visibilidade de `GET /posts/:id`,
++  anonimização do autor, paginação por cursor, `/sync` com limites por operação.
++
++## 7. Operação
++
++- Aplicar a migração `0004` (`pnpm db:migrate`). É aditiva; as denúncias existentes ficam como
++  `other` com o motivo que tinham.
++- Variáveis novas (todas com default): `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`,
++  `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`.
++
++## 8. Pendente
++
++- E4-b: repositórios e serviços de posts (idempotência com reserva e hash do pedido, transacções,
++  soft delete, anonimização, cursor), `reports` dentro de transacção (`Executor`).
++- E4-c: rotas, cache do feed versionada, `/sync` com limites por operação e registo no `server.ts`.
++- E4-d: ADR-012 (eliminação de conta) e actualização do ADR-006 na pasta `adr/`, `api.md`,
++  `arquitectura.md`, correcção da spec do filtro e dos testes 24, 25 e 29.
++- Primeiro admin: confirmar como é criado. Nomes reservados adicionais: a confirmar.
+diff --git a/packages/shared/src/content-filter.ts b/packages/shared/src/content-filter.ts
+new file mode 100644
+index 0000000..cb6e152
+--- /dev/null
++++ b/packages/shared/src/content-filter.ts
+@@ -0,0 +1,389 @@
++/**
++ * Filtro de conteúdo das partilhas (ADR-013).
++ *
++ * Duas camadas, ambas deterministas e sem I/O (corre igual no servidor e no cliente):
++ *  - REJEITA (`reject: true`): ligações externas e contactos (email, telefone, IP). A
++ *    comunidade partilha entendimento da Palavra, não divulga canais nem contactos.
++ *  - SINALIZA (`reject: false`, com `flags`): sinais de spam. O post não é rejeitado; vai
++ *    para `pending_review` e o moderador decide.
++ *
++ * Não há "pendente por conta nova" (ADR-013 §C).
++ *
++ * Desempenho: todas as expressões são lineares (quantificadores limitados, sem grupos
++ * aninhados com backtracking). O teste de carga cobre entradas adversariais de 5000
++ * caracteres.
++ */
++
++export type ContentRejectCode = "link" | "contact";
++export type ContentFlagCode =
++  | "caps"
++  | "repetition"
++  | "punctuation"
++  | "keywords"
++  | "contact_solicitation"
++  | "mixed_script";
++
++export interface ContentViolation {
++  kind: "link" | "contact" | "spam_signal";
++  code: ContentRejectCode | ContentFlagCode;
++  hint: string;
++}
++
++export type ContentCheckResult =
++  | { reject: true; violations: ContentViolation[] }
++  | { reject: false; flags: ContentViolation[] };
++
++// ---------- Normalização ----------
++
++/** Caracteres invisíveis/formatação (zero-width, bidi, soft hyphen…). */
++const INVISIBLES = /[\p{Cf}­]/gu;
++/** Pontos "disfarçados" que o NFKC não converte. */
++const DOT_VARIANTS = /[。｡․﹒։۔]/g;
++const BRACKET_DOT = /[[(]\s*\.\s*[\])]/g;
++const BRACKET_DOT_WORD = /[[(]\s*(?:dot|ponto)\s*[\])]/g;
++const WHITESPACE = /\s+/g;
++const ACCENTS = /[̀-ͯ]/g;
++
++/**
++ * Letras cirílicas/gregas visualmente idênticas a letras latinas. Só se usa no "esqueleto"
++ * de detecção de ligações/contactos, para `igreja.cоm` (com «о» cirílico) não escapar.
++ */
++const CONFUSABLES: Readonly<Record<string, string>> = {
++  а: "a",
++  в: "b",
++  е: "e",
++  к: "k",
++  м: "m",
++  н: "h",
++  о: "o",
++  р: "p",
++  с: "c",
++  т: "t",
++  у: "y",
++  х: "x",
++  і: "i",
++  ј: "j",
++  ѕ: "s",
++  ӏ: "l",
++  ԁ: "d",
++  ɡ: "g",
++  α: "a",
++  ε: "e",
++  ι: "i",
++  κ: "k",
++  ν: "v",
++  ο: "o",
++  ρ: "p",
++  τ: "t",
++  υ: "u",
++  χ: "x",
++};
++const CONFUSABLE_RE = new RegExp(
++  `[${Object.keys(CONFUSABLES).join("")}]`,
++  "gu",
++);
++
++function clean(text: string): string {
++  return text
++    .normalize("NFKC")
++    .replace(INVISIBLES, "")
++    .replace(DOT_VARIANTS, ".")
++    .replace(BRACKET_DOT, ".")
++    .replace(BRACKET_DOT_WORD, ".")
++    .replace(WHITESPACE, " ")
++    .trim();
++}
++
++function stripAccents(text: string): string {
++  return text.normalize("NFD").replace(ACCENTS, "").normalize("NFC");
++}
++
++// ---------- Ligações ----------
++
++/**
++ * TLDs que rejeitamos. Inclui os de uso geral, os baratos/abusados em spam, os encurtadores
++ * e os países lusófonos. Os códigos curtos só contam quando colados a um nome (`algo.pt`).
++ * Falso positivo conhecido e aceite: «Jesus.Com» (falta o espaço depois do ponto).
++ */
++const TLDS = [
++  // gerais
++  "com",
++  "net",
++  "org",
++  "info",
++  "biz",
++  "edu",
++  "gov",
++  "int",
++  "mil",
++  // novos gTLDs frequentes em links de spam/phishing/conteúdo
++  "app",
++  "dev",
++  "site",
++  "online",
++  "store",
++  "shop",
++  "live",
++  "link",
++  "click",
++  "club",
++  "vip",
++  "pro",
++  "fun",
++  "work",
++  "life",
++  "world",
++  "today",
++  "rest",
++  "cam",
++  "cyou",
++  "monster",
++  "quest",
++  "xyz",
++  "top",
++  "buzz",
++  "bond",
++  "sbs",
++  "cfd",
++  "icu",
++  "zip",
++  "mov",
++  "page",
++  "cloud",
++  "tech",
++  "space",
++  "website",
++  "digital",
++  "media",
++  "news",
++  "blog",
++  "church",
++  "faith",
++  "gives",
++  "love",
++  // países gratuitos/abusados e encurtadores (bit.ly, t.me, wa.me, youtu.be, linktr.ee…)
++  "tk",
++  "ml",
++  "ga",
++  "cf",
++  "gq",
++  "li",
++  "ly",
++  "me",
++  "to",
++  "tv",
++  "cc",
++  "ws",
++  "be",
++  "ee",
++  "gl",
++  "gd",
++  "co",
++  "io",
++  "ai",
++  "sh",
++  "fm",
++  "ru",
++  "cn",
++  "su",
++  // países com mais tráfego
++  "uk",
++  "us",
++  "de",
++  "fr",
++  "es",
++  "it",
++  "nl",
++  "ch",
++  "ie",
++  "ca",
++  "au",
++  "in",
++  // lusófonos
++  "pt",
++  "br",
++  "mz",
++  "ao",
++  "cv",
++  "gw",
++  "st",
++  "tl",
++] as const;
++
++const TLD_ALT = TLDS.join("|");
++/** Fim de etiqueta: nada que continue o nome (letra, dígito, hífen). */
++const LABEL_END = "(?![\\p{L}\\p{N}-])";
++
++/**
++ * `nome.tld`, `nome .tld` ou `nome . tld`. Com espaço só DEPOIS do ponto («Amém. Com isso»)
++ * não conta: é pontuação normal.
++ */
++const DOMAIN = new RegExp(
++  `[\\p{L}\\p{N}-]{1,63}(?:\\s+\\.\\s*|\\.)(?:${TLD_ALT})${LABEL_END}`,
++  "u",
++);
++const SCHEME = /\b(?:https?|hxxps?|ftps?|sftp|wss?)\s{0,2}:\s{0,2}\/{1,2}/u;
++const WWW = /\bwww\s{0,2}\./u;
++
++/** «igreja dot com» → «igreja.com». «ponto» só em contexto inequívoco (ver `deobfuscate`). */
++const DOT_WORD = new RegExp(`\\s+dot\\s+(?=(?:${TLD_ALT})${LABEL_END})`, "gu");
++const PONTO_WORD =
++  /\s+ponto\s+(?=(?:com|net|org|info|biz)(?:\s+(?:br|pt|mz|ao)\b)?(?=\s*(?:$|[^\p{L}\s])))/gu;
++
++function deobfuscate(text: string): string {
++  return text.replace(DOT_WORD, ".").replace(PONTO_WORD, ".");
++}
++
++function toSkeleton(lowerCleaned: string): string {
++  return deobfuscate(
++    lowerCleaned.replace(CONFUSABLE_RE, (c) => CONFUSABLES[c] ?? c),
++  );
++}
++
++// ---------- Contactos ----------
++
++/**
++ * `x@y`, `x @ y` (espaços dos dois lados), `x (at) y`, `x [at] y`, `x arroba y`. Uma menção
++ * social («obrigado @maria») tem espaço só antes do `@` e não conta.
++ */
++const EMAIL =
++  /[\p{L}\p{N}._%+-](?:@|\s{1,3}@\s{1,3}|\s{0,3}[[(]\s*at\s*[\])]\s{0,3}|\sarroba\s)[\p{L}\p{N}]/u;
++
++/** Sequência de dígitos com, no máximo, 2 separadores entre eles (7+ dígitos). */
++const DIGIT_RUN = /\+?\(?\d(?:[\s.\-()_,/|]{0,2}\d){6,}/gu;
++
++/** Números nacionais completos (com indicativo opcional). Ancorados: o número é a sequência toda. */
++const PHONE_NATIONAL: readonly RegExp[] = [
++  /^(?:00351|351)?9[1236]\d{7}$/, // Portugal
++  /^(?:00258|258)?8[2-7]\d{7}$/, // Moçambique
++  /^(?:00244|244)?9[1-5]\d{7}$/, // Angola
++  /^(?:0055|55)?[1-9]{2}9\d{8}$/, // Brasil (móvel: DDD + 9 + 8 dígitos)
++];
++
++function hasPhone(text: string): boolean {
++  for (const match of text.matchAll(DIGIT_RUN)) {
++    const run = match[0];
++    const digits = run.replace(/\D/g, "");
++    if (digits.length > 15) continue;
++    // Qualquer número internacional explícito (+indicativo) conta.
++    if (run.startsWith("+") && digits.length >= 8) return true;
++    if (PHONE_NATIONAL.some((re) => re.test(digits))) return true;
++  }
++  return false;
++}
++
++/** «whatsapp … 6+ dígitos»: apanha formatos de número que não conhecemos. */
++const MESSENGER_WITH_NUMBER =
++  /(?:whats\s?app|zap|telegram|signal|viber)\b.{0,40}?\d(?:[^\d]{0,2}\d){5,}/u;
++
++const IPV4_OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
++/** IPv4 válido, fora de uma versão de software («versão 1.2.3.4» não é um IP). */
++const IPV4 = new RegExp(
++  `(?<![\\d.])(?<!\\bv(?:ers[aã]o|ersion)?\\s{0,2})(?:${IPV4_OCTET}\\.){3}${IPV4_OCTET}(?![\\d]|\\.\\d)`,
++  "u",
++);
++/**
++ * IPv6: com `::`, ou 4+ grupos. Horas («10:30:15») têm 3 grupos e não entram.
++ */
++const IPV6 =
++  /(?<![\p{L}\p{N}:])(?:(?:[a-f0-9]{1,4}:){3,7}[a-f0-9]{1,4}|(?:[a-f0-9]{1,4}:){1,6}:[a-f0-9]{1,4}(?::[a-f0-9]{1,4}){0,5})(?![\p{L}\p{N}:])/u;
++
++// ---------- Sinais de spam (ADR-013 §B) ----------
++
++const CAPS_MIN_LENGTH = 50; // len > 50
++const CAPS_RATIO = 0.5; // > 50 % das letras em maiúsculas
++const REPETITION = /(.)\1{9,}/u;
++const PUNCTUATION_SPAM = /[!?]{5,}/u;
++const SPAM_KEYWORDS =
++  /\b(?:bitcoins?|criptomoedas?|investimento garantido|ganhe dinheiro|ganhos rapidos|clique aqui|premios?|sorteios?|renda extra|multiplica teu dinheiro)\b/u;
++const MESSENGER_WORD = /\b(?:whats\s?app|zap|telegram|signal|viber)\b/u;
++
++function hasMixedScript(text: string): boolean {
++  // Por palavra (linear): letras latinas misturadas com cirílico/grego na mesma palavra.
++  for (const token of text.split(" ")) {
++    if (
++      /\p{Script=Latin}/u.test(token) &&
++      /[\p{Script=Cyrillic}\p{Script=Greek}]/u.test(token)
++    ) {
++      return true;
++    }
++  }
++  return false;
++}
++
++function capsSignal(text: string): boolean {
++  if (text.length <= CAPS_MIN_LENGTH) return false;
++  const letters = text.match(/\p{L}/gu)?.length ?? 0;
++  if (letters === 0) return false;
++  const upper = text.match(/\p{Lu}/gu)?.length ?? 0;
++  return upper / letters > CAPS_RATIO;
++}
++
++const REJECT_LINK: ContentViolation = {
++  kind: "link",
++  code: "link",
++  hint: "não aceitamos ligações externas (se foi só falta de espaço depois do ponto, acrescenta-o)",
++};
++const REJECT_CONTACT: ContentViolation = {
++  kind: "contact",
++  code: "contact",
++  hint: "não aceitamos emails, telefones ou IPs",
++};
++
++/**
++ * Avalia título e conteúdo em conjunto (a ordem dos parâmetros segue o ADR-013).
++ * Contactos têm precedência sobre ligações (mensagem mais específica).
++ */
++export function checkContent(
++  title: string,
++  content: string,
++): ContentCheckResult {
++  const cleaned = clean(`${title} ${content}`);
++  const lower = cleaned.toLowerCase();
++  const skeleton = toSkeleton(lower);
++
++  if (
++    EMAIL.test(skeleton) ||
++    hasPhone(skeleton) ||
++    MESSENGER_WITH_NUMBER.test(skeleton) ||
++    IPV4.test(skeleton) ||
++    IPV6.test(skeleton)
++  ) {
++    return { reject: true, violations: [REJECT_CONTACT] };
++  }
++
++  if (SCHEME.test(skeleton) || WWW.test(skeleton) || DOMAIN.test(skeleton)) {
++    return { reject: true, violations: [REJECT_LINK] };
++  }
++
++  const flags: ContentViolation[] = [];
++  const signal = (code: ContentFlagCode, hint: string): void => {
++    flags.push({ kind: "spam_signal", code, hint });
++  };
++
++  if (capsSignal(cleaned)) signal("caps", "demasiadas maiúsculas");
++  if (REPETITION.test(lower)) {
++    signal("repetition", "repetição excessiva de caracteres");
++  }
++  if (PUNCTUATION_SPAM.test(lower))
++    signal("punctuation", "pontuação excessiva");
++  if (SPAM_KEYWORDS.test(stripAccents(lower))) {
++    signal("keywords", "palavras associadas a spam");
++  }
++  if (MESSENGER_WORD.test(skeleton)) {
++    signal("contact_solicitation", "pedido de contacto por mensagens privadas");
++  }
++  if (hasMixedScript(lower)) {
++    signal("mixed_script", "mistura de alfabetos na mesma palavra");
++  }
++
++  return { reject: false, flags };
++}
++
++/** Códigos dos sinais, para guardar em `posts.review_flags`. */
++export function flagCodes(result: ContentCheckResult): ContentFlagCode[] {
++  if (result.reject) return [];
++  return result.flags
++    .map((f) => f.code)
++    .filter((c): c is ContentFlagCode => c !== "link" && c !== "contact");
++}
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 241c190..545b354 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,8 +1,11 @@
+ import { z } from "zod";
+ export * from "./auth.js";
+ export * from "./cards.js";
++export * from "./content-filter.js";
+ export * from "./password-policy.js";
++export * from "./posts.js";
+ export * from "./reserved-usernames.js";
++export * from "./sync.js";
+ 
+ export const APP_NAME = "Comunidade Cristã" as const;
+ export const APP_AUTHOR = "Gekko Dreamers" as const;
+diff --git a/packages/shared/src/posts.ts b/packages/shared/src/posts.ts
+new file mode 100644
+index 0000000..47c21f6
+--- /dev/null
++++ b/packages/shared/src/posts.ts
+@@ -0,0 +1,254 @@
++import { z } from "zod";
++import { CardSlug } from "./cards.js";
++
++export const PostCategory = z.enum([
++  "entendimento",
++  "ensinamento",
++  "letra_cancao",
++]);
++export type PostCategory = z.infer<typeof PostCategory>;
++
++export const PostStatus = z.enum([
++  "published",
++  "pending_review",
++  "hidden",
++  "rejected",
++]);
++export type PostStatus = z.infer<typeof PostStatus>;
++
++export const FeedFilter = z.enum(["recent", "top", "liked"]);
++export type FeedFilter = z.infer<typeof FeedFilter>;
++
++export const IdempotencyKey = z
++  .string()
++  .min(16, "Idempotency-Key tem de ter pelo menos 16 caracteres")
++  .max(128, "Idempotency-Key tem no máximo 128 caracteres")
++  .regex(
++    /^[A-Za-z0-9_-]+$/,
++    "Idempotency-Key só aceita letras, números, hífen e underscore",
++  );
++
++/** O Postgres não guarda NUL em `text` (erro 22021 → 500): recusa-se à entrada. */
++const NO_NUL = (s: string): boolean => !s.includes("\u0000");
++
++/** Texto de utilizador: sem espaços nas pontas, não vazio, sem NUL. */
++function userText(min: number, max: number, label: string) {
++  return z
++    .string()
++    .trim()
++    .min(min, `${label} vazio`)
++    .max(max, `${label} demasiado longo`)
++    .refine(NO_NUL, `${label} tem caracteres inválidos`);
++}
++
++export const POST_TITLE_MAX = 120;
++export const POST_CONTENT_MAX = 5000;
++export const REPORT_REASON_MIN = 3;
++export const REPORT_REASON_MAX = 500;
++
++/**
++ * Autor visível. `null` quando a conta foi apagada, está em apagamento pendente ou o post foi
++ * mantido anónimo (F5): o cliente mostra «[removido]». O identificador interno do autor nunca
++ * sai da API; o cliente sabe que o post é seu através de `isMine`.
++ */
++export const PostAuthor = z.object({ username: z.string() });
++export type PostAuthor = z.infer<typeof PostAuthor>;
++
++export const PostPublic = z.object({
++  id: z.uuid(),
++  category: PostCategory,
++  title: z.string(),
++  content: z.string(),
++  status: PostStatus,
++  likesCount: z.number().int().nonnegative(),
++  isLiked: z.boolean(),
++  isMine: z.boolean(),
++  author: PostAuthor.nullable(),
++  gospelCardSlug: z.string().nullable(),
++  createdAt: z.iso.datetime(),
++  publishedAt: z.iso.datetime().nullable(),
++});
++export type PostPublic = z.infer<typeof PostPublic>;
++
++// ---------- Cursor de paginação (opaco para o cliente) ----------
++
++/**
++ * Cursor por chave composta, não por offset: não salta nem repete linhas quando há posts
++ * novos entre páginas. `t` é o timestamp EXACTO da linha (microssegundos, tal como o
++ * Postgres o devolve) — truncar a milissegundos saltaria linhas.
++ */
++const CursorTimestamp = z
++  .string()
++  .regex(
++    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}(?::?\d{2})?)$/,
++  );
++
++export const CursorPayload = z.discriminatedUnion("k", [
++  z.object({ k: z.literal("recent"), t: CursorTimestamp, id: z.uuid() }),
++  z.object({
++    k: z.literal("top"),
++    l: z.number().int().nonnegative(),
++    t: CursorTimestamp,
++    id: z.uuid(),
++  }),
++  /** `t` é o momento do like (não do post): a ordem é «curtidos mais recentemente». */
++  z.object({ k: z.literal("liked"), t: CursorTimestamp, id: z.uuid() }),
++]);
++export type CursorPayload = z.infer<typeof CursorPayload>;
++
++/** Tamanho máximo do texto do cursor (o payload real tem ~120 caracteres). */
++export const CURSOR_MAX_LENGTH = 256;
++
++function toBase64Url(json: string): string {
++  // O payload é ASCII (timestamp, uuid, inteiros): btoa é seguro e existe em Node e browsers.
++  return btoa(json).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
++}
++
++function fromBase64Url(text: string): string | null {
++  try {
++    const padded = text.replace(/-/g, "+").replace(/_/g, "/");
++    return atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
++  } catch {
++    return null;
++  }
++}
++
++export function encodeCursor(payload: CursorPayload): string {
++  return toBase64Url(JSON.stringify(CursorPayload.parse(payload)));
++}
++
++/**
++ * Devolve o payload se o cursor for válido E do tipo esperado para o filtro; `null` caso
++ * contrário (texto adulterado, de outro filtro, truncado…). Nunca lança.
++ */
++export function decodeCursor(
++  cursor: string,
++  expected: FeedFilter,
++): CursorPayload | null {
++  if (cursor.length === 0 || cursor.length > CURSOR_MAX_LENGTH) return null;
++  const json = fromBase64Url(cursor);
++  if (json === null) return null;
++  let raw: unknown;
++  try {
++    raw = JSON.parse(json);
++  } catch {
++    return null;
++  }
++  const parsed = CursorPayload.safeParse(raw);
++  if (!parsed.success || parsed.data.k !== expected) return null;
++  return parsed.data;
++}
++
++export const ListPostsQuery = z
++  .object({
++    gospelCardId: z.uuid().optional(),
++    category: PostCategory.optional(),
++    filter: FeedFilter.default("recent"),
++    cursor: z
++      .string()
++      .max(CURSOR_MAX_LENGTH)
++      .regex(/^[A-Za-z0-9_-]+$/, "cursor inválido")
++      .optional(),
++    limit: z.coerce.number().int().min(1).max(50).default(20),
++  })
++  .superRefine((q, ctx) => {
++    if (q.cursor !== undefined && decodeCursor(q.cursor, q.filter) === null) {
++      ctx.addIssue({
++        code: "custom",
++        path: ["cursor"],
++        message: "cursor inválido",
++      });
++    }
++  });
++export type ListPostsQuery = z.infer<typeof ListPostsQuery>;
++
++export const ListPostsResponse = z.object({
++  posts: z.array(PostPublic),
++  nextCursor: z.string().nullable(),
++});
++export type ListPostsResponse = z.infer<typeof ListPostsResponse>;
++
++export const CreatePostRequest = z.object({
++  category: PostCategory,
++  title: userText(1, POST_TITLE_MAX, "título"),
++  content: userText(1, POST_CONTENT_MAX, "conteúdo"),
++  gospelCardSlug: CardSlug.optional(),
++});
++export type CreatePostRequest = z.infer<typeof CreatePostRequest>;
++
++export const CreatePostResponse = z.object({
++  post: PostPublic,
++  status: PostStatus,
++});
++export type CreatePostResponse = z.infer<typeof CreatePostResponse>;
++
++export const PostIdParams = z.object({ id: z.uuid() });
++export type PostIdParams = z.infer<typeof PostIdParams>;
++
++export const LikeResponse = z.object({
++  likesCount: z.number().int().nonnegative(),
++  isLiked: z.boolean(),
++});
++export type LikeResponse = z.infer<typeof LikeResponse>;
++
++// ---------- Denúncias ----------
++
++export const ReportCategory = z.enum([
++  "spam",
++  "off_topic",
++  "offensive",
++  "doctrine",
++  "other",
++]);
++export type ReportCategory = z.infer<typeof ReportCategory>;
++
++export const ReportSeverity = z.enum(["basic", "medium", "high"]);
++export type ReportSeverity = z.infer<typeof ReportSeverity>;
++
++/**
++ * Fonte única da gravidade por categoria. A coluna `reports.severity` é GERADA pelo
++ * Postgres com a mesma regra (migração 0004); um teste garante que as duas concordam.
++ */
++export const CATEGORY_TO_SEVERITY: Readonly<
++  Record<ReportCategory, ReportSeverity>
++> = {
++  spam: "basic",
++  off_topic: "basic",
++  offensive: "medium",
++  doctrine: "high",
++  other: "basic",
++};
++
++export const ReportReason = userText(
++  REPORT_REASON_MIN,
++  REPORT_REASON_MAX,
++  "motivo",
++);
++
++/** Motivo: obrigatório só para «other» (a base de dados também o exige, por CHECK). */
++export const REASON_REQUIRED_FOR_OTHER = {
++  check: (d: { category: ReportCategory; reason?: string | undefined }) =>
++    d.category !== "other" || d.reason !== undefined,
++  params: {
++    message: 'o motivo é obrigatório para a categoria "outro"',
++    path: ["reason"] as PropertyKey[],
++  },
++} as const;
++
++export const ReportRequest = z
++  .object({
++    category: ReportCategory,
++    reason: ReportReason.optional(),
++  })
++  .refine(REASON_REQUIRED_FOR_OTHER.check, REASON_REQUIRED_FOR_OTHER.params);
++export type ReportRequest = z.infer<typeof ReportRequest>;
++
++/**
++ * Resultado de uma denúncia aceite. Os restantes casos (post inexistente, o próprio post)
++ * são erros HTTP no formato único `{ error, message? }`, não corpos 200.
++ */
++export const ReportOutcome = z.enum(["created", "duplicate"]);
++export type ReportOutcome = z.infer<typeof ReportOutcome>;
++
++export const ReportResponse = z.object({ outcome: ReportOutcome });
++export type ReportResponse = z.infer<typeof ReportResponse>;
+diff --git a/packages/shared/src/sync.ts b/packages/shared/src/sync.ts
+new file mode 100644
+index 0000000..e805689
+--- /dev/null
++++ b/packages/shared/src/sync.ts
+@@ -0,0 +1,169 @@
++import { z } from "zod";
++import {
++  CreatePostRequest,
++  CreatePostResponse,
++  IdempotencyKey,
++  LikeResponse,
++  PostPublic,
++  REASON_REQUIRED_FOR_OTHER,
++  ReportCategory,
++  ReportReason,
++  ReportResponse,
++} from "./posts.js";
++
++/** Operações por pedido `/sync`. Fixo (é o contrato com o cliente offline), não é uma env. */
++export const MAX_SYNC_BATCH_OPS = 20;
++
++const SyncOperationBase = z.object({
++  op_id: z.uuid(),
++  idempotency_key: IdempotencyKey,
++});
++
++const PostIdPayload = z.object({ postId: z.uuid() }).strict();
++
++export const SyncCreatePost = SyncOperationBase.extend({
++  type: z.literal("post.create"),
++  payload: CreatePostRequest.strict(),
++});
++
++export const SyncDeletePost = SyncOperationBase.extend({
++  type: z.literal("post.delete"),
++  payload: PostIdPayload,
++});
++
++export const SyncLikePost = SyncOperationBase.extend({
++  type: z.literal("post.like"),
++  payload: PostIdPayload,
++});
++
++export const SyncUnlikePost = SyncOperationBase.extend({
++  type: z.literal("post.unlike"),
++  payload: PostIdPayload,
++});
++
++export const SyncReportPost = SyncOperationBase.extend({
++  type: z.literal("post.report"),
++  payload: z
++    .object({
++      postId: z.uuid(),
++      category: ReportCategory,
++      reason: ReportReason.optional(),
++    })
++    .strict()
++    .refine(REASON_REQUIRED_FOR_OTHER.check, REASON_REQUIRED_FOR_OTHER.params),
++});
++
++export const SyncUnreportPost = SyncOperationBase.extend({
++  type: z.literal("post.unreport"),
++  payload: PostIdPayload,
++});
++
++export const SyncOperation = z.discriminatedUnion("type", [
++  SyncCreatePost,
++  SyncDeletePost,
++  SyncLikePost,
++  SyncUnlikePost,
++  SyncReportPost,
++  SyncUnreportPost,
++]);
++export type SyncOperation = z.infer<typeof SyncOperation>;
++export type SyncOperationType = SyncOperation["type"];
++
++export const SyncRequest = z.object({
++  operations: z.array(SyncOperation).min(1).max(MAX_SYNC_BATCH_OPS),
++});
++export type SyncRequest = z.infer<typeof SyncRequest>;
++
++export const SyncStatus = z.enum([
++  /** Aplicada agora. */
++  "applied",
++  /** Já tinha sido aplicada antes (mesma chave de idempotência): resultado repetido. */
++  "duplicate",
++  /** Recusada de forma definitiva: não vale a pena o cliente tentar de novo. */
++  "rejected",
++  /** Não chegou a ser tentada (tempo do lote esgotado ou limite): tentar de novo mais tarde. */
++  "deferred",
++]);
++export type SyncStatus = z.infer<typeof SyncStatus>;
++
++export const SyncErrorCode = z.enum([
++  "not_found",
++  "forbidden",
++  "own_post",
++  "idempotency_key_conflict",
++  "gospel_card_not_found",
++  "contains_link",
++  "contains_contact",
++  "rate_limited",
++  "internal",
++]);
++export type SyncErrorCode = z.infer<typeof SyncErrorCode>;
++
++/** Resultado de cada tipo de operação (o `type` do pedido diz qual). */
++export const SyncOpResult = z.union([
++  CreatePostResponse,
++  LikeResponse,
++  ReportResponse,
++  z.object({ deleted: z.literal(true) }),
++  z.object({ withdrawn: z.literal(true) }),
++]);
++export type SyncOpResult = z.infer<typeof SyncOpResult>;
++
++export const SyncResult = z.object({
++  op_id: z.string(),
++  status: SyncStatus,
++  result: SyncOpResult.optional(),
++  error: z
++    .object({
++      code: SyncErrorCode,
++      message: z.string().optional(),
++      /** Só em `rate_limited`: segundos até poder tentar de novo. */
++      retryAfter: z.number().int().positive().optional(),
++    })
++    .optional(),
++});
++export type SyncResult = z.infer<typeof SyncResult>;
++
++export const SyncResponse = z.object({
++  results: z.array(SyncResult),
++  serverTime: z.iso.datetime(),
++});
++export type SyncResponse = z.infer<typeof SyncResponse>;
++
++export const SyncBootstrapResponse = z.object({
++  serverTime: z.iso.datetime(),
++  user: z.object({
++    id: z.uuid(),
++    username: z.string(),
++    role: z.enum(["user", "admin"]),
++    createdAt: z.iso.datetime(),
++  }),
++  cards: z.array(
++    z.object({
++      slug: z.string(),
++      title: z.string(),
++      gospelReference: z.string(),
++      summary: z.string(),
++      otReferences: z.array(z.string()),
++      ntReferences: z.array(z.string()),
++      orderIndex: z.number(),
++    }),
++  ),
++  recentPosts: z.object({
++    posts: z.array(PostPublic),
++    nextCursor: z.string().nullable(),
++  }),
++  myPosts: z.array(PostPublic),
++  myLikedPostIds: z.array(z.uuid()),
++  myReports: z.array(
++    z.object({
++      id: z.uuid(),
++      postId: z.uuid(),
++      category: ReportCategory,
++      reason: z.string().nullable(),
++      status: z.enum(["open", "resolved_kept", "resolved_removed"]),
++      createdAt: z.iso.datetime(),
++    }),
++  ),
++});
++export type SyncBootstrapResponse = z.infer<typeof SyncBootstrapResponse>;

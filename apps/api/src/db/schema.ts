@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   customType,
   index,
   integer,
@@ -57,6 +58,21 @@ export const reportStatusEnum = pgEnum("report_status", [
   "open",
   "resolved_kept",
   "resolved_removed",
+  // O próprio autor da denúncia retirou-a. A linha fica (evidência), mas já não conta.
+  "withdrawn",
+]);
+// Categoria escolhida por quem denuncia; a gravidade deriva dela (coluna gerada).
+export const reportCategoryEnum = pgEnum("report_category", [
+  "spam",
+  "off_topic",
+  "offensive",
+  "doctrine",
+  "other",
+]);
+export const reportSeverityEnum = pgEnum("report_severity", [
+  "basic",
+  "medium",
+  "high",
 ]);
 export const moderationActionEnum = pgEnum("moderation_action", [
   "approved",
@@ -85,9 +101,6 @@ export const users = pgTable(
     updatedAt: updatedAt(),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
-    // Pedido de apagamento: a conta fica «pendente» (sem sessões, sem acesso) e um login com
-    // a palavra-passe correcta nos 30 dias seguintes reactiva-a. Passado o prazo, um job
-    // apaga-a de vez. Nulo = conta activa.
     deletionRequestedAt: timestamp("deletion_requested_at", {
       withTimezone: true,
     }),
@@ -189,12 +202,10 @@ export const posts = pgTable(
     status: postStatusEnum("status").notNull().default("published"),
     likesCount: integer("likes_count").notNull().default(0),
     reportsCount: integer("reports_count").notNull().default(0),
-    // Conta em apagamento com «manter anónimas»: a partilha continua visível mas sem autor.
-    // Volta a falso se a conta for reactivada.
     authorHidden: boolean("author_hidden").notNull().default(false),
-    // Conta em apagamento com «apagar partilhas»: guarda o estado anterior enquanto o post
-    // fica oculto (status = hidden). Nulo = o post não foi ocultado por esta razão.
     suspendedStatus: postStatusEnum("suspended_status"),
+    reviewFlags: text("review_flags").array(),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: createdAt(),
     publishedAt: timestamp("published_at", { withTimezone: true }),
   },
@@ -233,10 +244,17 @@ export const reports = pgTable(
     reporterId: uuid("reporter_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    reason: text("reason").notNull(),
+    reason: text("reason"),
+    category: reportCategoryEnum("category").notNull(),
+    severity: reportSeverityEnum("severity")
+      .notNull()
+      .generatedAlwaysAs(
+        sql`CASE "category" WHEN 'offensive' THEN 'medium'::"report_severity" WHEN 'doctrine' THEN 'high'::"report_severity" ELSE 'basic'::"report_severity" END`,
+      ),
     status: reportStatusEnum("status").notNull().default("open"),
     createdAt: createdAt(),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    withdrawnAt: timestamp("withdrawn_at", { withTimezone: true }),
     resolvedBy: uuid("resolved_by").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -245,6 +263,15 @@ export const reports = pgTable(
     uniqueIndex("reports_post_reporter_unique").on(t.postId, t.reporterId),
     index("reports_post_status_idx").on(t.postId, t.status),
     index("reports_reporter_status_idx").on(t.reporterId, t.status),
+    index("reports_post_category_status_idx").on(
+      t.postId,
+      t.category,
+      t.status,
+    ),
+    check(
+      "reports_other_requires_reason",
+      sql`${t.category} <> 'other' OR (${t.reason} IS NOT NULL AND btrim(${t.reason}) <> '')`,
+    ),
   ],
 );
 
@@ -294,6 +321,7 @@ export const idempotencyKeys = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     operation: text("operation").notNull(),
+    requestHash: text("request_hash"),
     response: jsonb("response").$type<Record<string, unknown>>().notNull(),
     createdAt: createdAt(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),

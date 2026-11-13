@@ -114,6 +114,57 @@ describe("rate limit — gospel cards (leitura pública)", () => {
   });
 });
 
+describe("rate limit — feed de partilhas", () => {
+  it("autenticado: balde por utilizador (IP partilhado não se afecta)", async () => {
+    const rl = make({ RATE_LIMIT_FEED_MAX: 1 });
+    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(true);
+    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(false);
+    // Outro utilizador no mesmo IP (CGNAT) tem o seu próprio balde.
+    expect((await rl.checkReadFeed("1.1.1.1", "user-b")).allowed).toBe(true);
+  });
+
+  it("anónimo: balde por IP, separado do dos utilizadores", async () => {
+    const rl = make({ RATE_LIMIT_FEED_MAX: 1 });
+    expect((await rl.checkReadFeed("1.1.1.1")).allowed).toBe(true);
+    const blocked = await rl.checkReadFeed("1.1.1.1");
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfter).toBeGreaterThan(0);
+    expect((await rl.checkReadFeed("1.1.1.1", "user-a")).allowed).toBe(true);
+    expect((await rl.checkReadFeed("2.2.2.2")).allowed).toBe(true);
+  });
+});
+
+describe("rate limit — escritas por utilizador", () => {
+  const cases = [
+    ["checkPostsCreate", "RATE_LIMIT_POSTS_CREATE_MAX"],
+    ["checkPostsDelete", "RATE_LIMIT_POSTS_DELETE_MAX"],
+    ["checkLikes", "RATE_LIMIT_LIKES_MAX"],
+    ["checkReports", "RATE_LIMIT_REPORTS_MAX"],
+    ["checkSyncBatch", "RATE_LIMIT_SYNC_MAX"],
+  ] as const;
+
+  it.each(cases)(
+    "%s bloqueia ao exceder e isola utilizadores",
+    async (method, envKey) => {
+      const rl = make({ [envKey]: 2 } as Partial<Env>);
+      expect((await rl[method]("user-a")).allowed).toBe(true);
+      expect((await rl[method]("user-a")).allowed).toBe(true);
+      const blocked = await rl[method]("user-a");
+      expect(blocked.allowed).toBe(false);
+      expect(blocked.retryAfter).toBeGreaterThan(0);
+      expect((await rl[method]("user-b")).allowed).toBe(true);
+    },
+  );
+
+  it("os tipos de operação têm baldes independentes", async () => {
+    const rl = make({ RATE_LIMIT_REPORTS_MAX: 1 });
+    expect((await rl.checkReports("user-a")).allowed).toBe(true);
+    expect((await rl.checkReports("user-a")).allowed).toBe(false);
+    expect((await rl.checkLikes("user-a")).allowed).toBe(true);
+    expect((await rl.checkPostsCreate("user-a")).allowed).toBe(true);
+  });
+});
+
 describe("rate limit — Redis indisponível", () => {
   it("continua a limitar em memória (não falha em aberto)", async () => {
     // Porta 1: ligação recusada. Sem fila offline, cada comando falha de imediato.
