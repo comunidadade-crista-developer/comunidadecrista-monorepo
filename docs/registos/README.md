@@ -22,4 +22,5 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 | Fase | Assunto                                                | Estado |
 | ---- | ------------------------------------------------------ | ------ |
 | E3   | [Gospel cards e cache](E3-gospel-cards-cache.md)       | Feito  |
-| E4-a | [Base de posts, denúncias e filtro](E4a-base-posts-denuncias.md) | Feito  |   
+| E4-a | [Base de posts, denúncias e filtro](E4a-base-posts-denuncias.md) | Feito  |
+   

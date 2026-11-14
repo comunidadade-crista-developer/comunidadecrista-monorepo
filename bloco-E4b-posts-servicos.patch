@@ -1,0 +1,2435 @@
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index e78dd27..7f7cc0f 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -48,6 +48,14 @@ const BaseEnvSchema = z.object({
+     .max(365)
+     .default(30),
+   MAINTENANCE_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
++  // Dias que uma partilha apagada pelo autor se conserva (com denúncias e likes, como
++  // evidência para a moderação) antes de ser eliminada de vez.
++  POSTS_DELETED_RETENTION_DAYS: z.coerce
++    .number()
++    .int()
++    .min(1)
++    .max(365)
++    .default(30),
+ 
+   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
+   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
+diff --git a/apps/api/src/maintenance.ts b/apps/api/src/maintenance.ts
+index 6f82c06..8d66cf9 100644
+--- a/apps/api/src/maintenance.ts
++++ b/apps/api/src/maintenance.ts
+@@ -2,11 +2,16 @@ import type { Database } from "./db/client.js";
+ import type { Env } from "./env.js";
+ import { accountDeletionRepo } from "./repositories/account-deletion.js";
+ import { idempotencyKeysRepo, outboxRepo } from "./repositories/outbox.js";
++import { postsRepo } from "./repositories/posts.js";
+ import { refreshTokensRepo } from "./repositories/users.js";
+ 
+ const DAY_MS = 24 * 60 * 60 * 1000;
+ const OUTBOX_DONE_RETENTION_DAYS = 7;
+ const STARTUP_DELAY_MS = 30_000;
++const DEFAULT_POSTS_DELETED_RETENTION_DAYS = 30;
++/** Lotes de purga de posts apagados por execução: limita o trabalho de um tick. */
++const POSTS_PURGE_BATCH = 500;
++const POSTS_PURGE_MAX_BATCHES = 20;
+ 
+ export interface MaintenanceSummary {
+   idempotencyKeys: number;
+@@ -15,6 +20,8 @@ export interface MaintenanceSummary {
+   accounts: number;
+   postsDeleted: number;
+   failedAccounts: number;
++  /** Partilhas apagadas pelo autor cuja retenção terminou (eliminadas de vez). */
++  softDeletedPosts: number;
+ }
+ 
+ export interface MaintenanceLogger {
+@@ -24,7 +31,12 @@ export interface MaintenanceLogger {
+ 
+ export async function runMaintenance(
+   db: Database,
+-  opts: { now?: Date; accountGraceDays: number; accountBatch?: number },
++  opts: {
++    now?: Date;
++    accountGraceDays: number;
++    accountBatch?: number;
++    postsDeletedRetentionDays?: number;
++  },
+ ): Promise<MaintenanceSummary> {
+   const now = opts.now ?? new Date();
+ 
+@@ -41,6 +53,16 @@ export async function runMaintenance(
+     ...(opts.accountBatch !== undefined ? { batch: opts.accountBatch } : {}),
+   });
+ 
++  const retentionDays =
++    opts.postsDeletedRetentionDays ?? DEFAULT_POSTS_DELETED_RETENTION_DAYS;
++  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
++  let softDeletedPosts = 0;
++  for (let i = 0; i < POSTS_PURGE_MAX_BATCHES; i++) {
++    const removed = await postsRepo(db).purgeDeleted(cutoff, POSTS_PURGE_BATCH);
++    softDeletedPosts += removed;
++    if (removed < POSTS_PURGE_BATCH) break;
++  }
++
+   return {
+     idempotencyKeys: idempotency,
+     outboxDone,
+@@ -48,6 +70,7 @@ export async function runMaintenance(
+     accounts: accounts.accounts,
+     postsDeleted: accounts.postsDeleted,
+     failedAccounts: accounts.failed,
++    softDeletedPosts,
+   };
+ }
+ 
+@@ -55,7 +78,9 @@ export function startMaintenance(args: {
+   db: Database;
+   env: Pick<
+     Env,
+-    "ACCOUNT_DELETION_GRACE_DAYS" | "MAINTENANCE_INTERVAL_MINUTES"
++    | "ACCOUNT_DELETION_GRACE_DAYS"
++    | "MAINTENANCE_INTERVAL_MINUTES"
++    | "POSTS_DELETED_RETENTION_DAYS"
+   >;
+   log: MaintenanceLogger;
+ }): () => void {
+@@ -68,6 +93,7 @@ export function startMaintenance(args: {
+     try {
+       const summary = await runMaintenance(db, {
+         accountGraceDays: env.ACCOUNT_DELETION_GRACE_DAYS,
++        postsDeletedRetentionDays: env.POSTS_DELETED_RETENTION_DAYS,
+       });
+       log.info({ ...summary }, "maintenance done");
+     } catch (err) {
+diff --git a/apps/api/src/repositories/cards.ts b/apps/api/src/repositories/cards.ts
+index c71a406..febd1fd 100644
+--- a/apps/api/src/repositories/cards.ts
++++ b/apps/api/src/repositories/cards.ts
+@@ -1,9 +1,9 @@
+ import { asc, eq, inArray } from "drizzle-orm";
+-import type { Database } from "../db/client.js";
++import type { Executor } from "../db/client.js";
+ import { gospelCards } from "../db/schema.js";
+ import type { GospelCard, NewGospelCard } from "../db/schema.js";
+ 
+-export function cardsRepo(db: Database) {
++export function cardsRepo(db: Executor) {
+   return {
+     async list(): Promise<GospelCard[]> {
+       return db.select().from(gospelCards).orderBy(asc(gospelCards.orderIndex));
+@@ -18,6 +18,11 @@ export function cardsRepo(db: Database) {
+       return row ?? null;
+     },
+ 
++    async findByIds(ids: string[]): Promise<GospelCard[]> {
++      if (ids.length === 0) return [];
++      return db.select().from(gospelCards).where(inArray(gospelCards.id, ids));
++    },
++
+     async findBySlugs(slugs: string[]): Promise<GospelCard[]> {
+       if (slugs.length === 0) return [];
+       return db
+diff --git a/apps/api/src/repositories/outbox.ts b/apps/api/src/repositories/outbox.ts
+index 2f7df04..694280c 100644
+--- a/apps/api/src/repositories/outbox.ts
++++ b/apps/api/src/repositories/outbox.ts
+@@ -1,5 +1,5 @@
+-import { and, eq, gt, lt, sql } from "drizzle-orm";
+-import type { Database } from "../db/client.js";
++import { and, eq, gt, lt, lte, sql } from "drizzle-orm";
++import type { Executor } from "../db/client.js";
+ import { idempotencyKeys, outbox } from "../db/schema.js";
+ import type {
+   IdempotencyKey,
+@@ -7,6 +7,9 @@ import type {
+   OutboxEvent,
+ } from "../db/schema.js";
+ 
++/** Quanto tempo uma chave de idempotência vale (o cliente pode repetir durante este prazo). */
++export const IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
++
+ type OutboxRow = {
+   id: string;
+   aggregate_type: string;
+@@ -35,7 +38,7 @@ function toOutboxEvent(row: OutboxRow): OutboxEvent {
+   };
+ }
+ 
+-export function outboxRepo(db: Database) {
++export function outboxRepo(db: Executor) {
+   return {
+     async enqueue(data: NewOutboxEvent): Promise<OutboxEvent> {
+       const [row] = await db.insert(outbox).values(data).returning();
+@@ -99,7 +102,7 @@ export function outboxRepo(db: Database) {
+   };
+ }
+ 
+-export function idempotencyKeysRepo(db: Database) {
++export function idempotencyKeysRepo(db: Executor) {
+   return {
+     /** Só devolve chaves do próprio utilizador e ainda não expiradas. */
+     async get(userId: string, key: string): Promise<IdempotencyKey | null> {
+@@ -117,12 +120,68 @@ export function idempotencyKeysRepo(db: Database) {
+       return row ?? null;
+     },
+ 
++    /**
++     * Reserva a chave ANTES de fazer o trabalho (dentro da mesma transacção que o faz).
++     * `reserved`: a chave é nossa. `exists`: já havia uma chave viva (de um pedido anterior
++     * ou de um pedido concorrente que entretanto fez commit — o INSERT espera por ele).
++     * Uma chave expirada é reaproveitada.
++     */
++    async reserve(args: {
++      userId: string;
++      key: string;
++      operation: string;
++      requestHash: string;
++      ttlMs?: number;
++    }): Promise<"reserved" | "exists"> {
++      const now = new Date();
++      const expiresAt = new Date(
++        now.getTime() + (args.ttlMs ?? IDEMPOTENCY_TTL_MS),
++      );
++      const rows = await db
++        .insert(idempotencyKeys)
++        .values({
++          key: args.key,
++          userId: args.userId,
++          operation: args.operation,
++          requestHash: args.requestHash,
++          response: {},
++          expiresAt,
++        })
++        .onConflictDoUpdate({
++          target: [idempotencyKeys.userId, idempotencyKeys.key],
++          set: {
++            operation: args.operation,
++            requestHash: args.requestHash,
++            response: {},
++            createdAt: now,
++            expiresAt,
++          },
++          setWhere: lte(idempotencyKeys.expiresAt, now),
++        })
++        .returning({ key: idempotencyKeys.key });
++      return rows.length > 0 ? "reserved" : "exists";
++    },
++
++    /** Guarda a resposta na chave reservada (na mesma transacção que a reservou). */
++    async complete(
++      userId: string,
++      key: string,
++      response: Record<string, unknown>,
++    ): Promise<void> {
++      await db
++        .update(idempotencyKeys)
++        .set({ response })
++        .where(
++          and(eq(idempotencyKeys.userId, userId), eq(idempotencyKeys.key, key)),
++        );
++    },
++
+     async set(
+       key: string,
+       userId: string,
+       operation: string,
+       response: Record<string, unknown>,
+-      ttlMs = 7 * 24 * 60 * 60 * 1000,
++      ttlMs = IDEMPOTENCY_TTL_MS,
+     ): Promise<void> {
+       const expiresAt = new Date(Date.now() + ttlMs);
+       await db
+diff --git a/apps/api/src/repositories/posts.ts b/apps/api/src/repositories/posts.ts
+index 3c858e3..50cd228 100644
+--- a/apps/api/src/repositories/posts.ts
++++ b/apps/api/src/repositories/posts.ts
+@@ -1,13 +1,35 @@
+-import { and, count, desc, eq, sql } from "drizzle-orm";
+-import type { Database } from "../db/client.js";
++import {
++  and,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNotNull,
++  isNull,
++  lt,
++  sql,
++} from "drizzle-orm";
++import { decodeCursor, encodeCursor } from "@comunidade/shared";
++import type { FeedFilter, PostCategory, PostStatus } from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
+ import { postLikes, posts } from "../db/schema.js";
+ import type { NewPost, Post } from "../db/schema.js";
+ 
+-export type FeedFilter = "recent" | "top" | "liked";
++export type { FeedFilter };
++
++/** O cursor recebido não é válido para este filtro (a rota valida antes; isto é a rede). */
++export class InvalidCursorError extends Error {
++  constructor() {
++    super("invalid cursor");
++    this.name = "InvalidCursorError";
++  }
++}
+ 
+ export interface ListOptions {
+-  category?: "entendimento" | "ensinamento" | "letra_cancao";
++  gospelCardId?: string;
++  category?: PostCategory;
+   filter?: FeedFilter;
++  /** Cursor opaco devolvido por uma chamada anterior (`nextCursor`). */
+   cursor?: string;
+   limit?: number;
+   viewerId?: string;
+@@ -18,7 +40,15 @@ export interface ListResult {
+   nextCursor: string | null;
+ }
+ 
+-export function postsRepo(db: Database) {
++/**
++ * Timestamp EXACTO (microssegundos) como texto ISO, para o cursor. Um `Date` do JavaScript
++ * só tem milissegundos: usá-lo no cursor saltaria linhas criadas no mesmo milissegundo.
++ */
++function exactTs(column: typeof posts.createdAt | typeof postLikes.createdAt) {
++  return sql<string>`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
++}
++
++export function postsRepo(db: Executor) {
+   return {
+     async create(data: NewPost): Promise<Post> {
+       const now = new Date();
+@@ -30,19 +60,106 @@ export function postsRepo(db: Database) {
+       return row!;
+     },
+ 
+-    async findById(id: string): Promise<Post | null> {
++    /**
++     * O último post do autor (por defeito só publicado ou em revisão) — usado para o autor ver
++     * a sua partilha acabada de criar mesmo que ainda esteja em revisão. Nunca apagados.
++     */
++    async findLatestByAuthorInFilter(
++      authorId: string,
++      opts: {
++        gospelCardId?: string;
++        category?: PostCategory;
++        statuses?: PostStatus[];
++      } = {},
++    ): Promise<Post | null> {
++      const conds = [eq(posts.authorId, authorId), isNull(posts.deletedAt)];
++      if (opts.gospelCardId) {
++        conds.push(eq(posts.gospelCardId, opts.gospelCardId));
++      }
++      if (opts.category) conds.push(eq(posts.category, opts.category));
++      conds.push(
++        inArray(posts.status, opts.statuses ?? ["published", "pending_review"]),
++      );
+       const [row] = await db
+         .select()
+         .from(posts)
+-        .where(eq(posts.id, id))
++        .where(and(...conds))
++        .orderBy(desc(posts.createdAt), desc(posts.id))
+         .limit(1);
+       return row ?? null;
+     },
+ 
++    /**
++     * Por defeito não devolve posts apagados pelo autor (falha fechada). Os serviços que
++     * precisam de os ver (apagar de novo é idempotente) pedem `includeDeleted`.
++     */
++    async findById(
++      id: string,
++      opts: { includeDeleted?: boolean } = {},
++    ): Promise<Post | null> {
++      const conds = [eq(posts.id, id)];
++      if (!opts.includeDeleted) conds.push(isNull(posts.deletedAt));
++      const [row] = await db
++        .select()
++        .from(posts)
++        .where(and(...conds))
++        .limit(1);
++      return row ?? null;
++    },
++
++    /**
++     * Apagar pelo autor: soft delete. A linha (com as denúncias e likes) fica como evidência até
++     * à purga (`purgeDeleted`). `true` só se este pedido foi o que apagou.
++     */
++    async softDelete(id: string, authorId: string): Promise<boolean> {
++      const rows = await db
++        .update(posts)
++        .set({ deletedAt: sql`now()` })
++        .where(
++          and(
++            eq(posts.id, id),
++            eq(posts.authorId, authorId),
++            isNull(posts.deletedAt),
++          ),
++        )
++        .returning({ id: posts.id });
++      return rows.length > 0;
++    },
++
++    /**
++     * Apaga DE VEZ (com likes e denúncias, por cascata) os posts apagados pelo autor há mais
++     * de `olderThan`. Em lotes, para não bloquear a base de dados.
++     */
++    async purgeDeleted(olderThan: Date, batch = 500): Promise<number> {
++      const due = await db
++        .select({ id: posts.id })
++        .from(posts)
++        .where(and(isNotNull(posts.deletedAt), lt(posts.deletedAt, olderThan)))
++        .limit(batch);
++      if (due.length === 0) return 0;
++      const removed = await db
++        .delete(posts)
++        .where(
++          inArray(
++            posts.id,
++            due.map((r) => r.id),
++          ),
++        )
++        .returning({ id: posts.id });
++      return removed.length;
++    },
++
++    /** Apaga de vez (sem passar por soft delete): testes e limpezas internas. */
+     async delete(id: string): Promise<void> {
+       await db.delete(posts).where(eq(posts.id, id));
+     },
+ 
++    /**
++     * Feed público: só `published` e não apagados. Paginação por chave composta (cursor
++     * opaco), estável mesmo com posts novos ou criados no mesmo instante. No filtro `top` a
++     * chave inclui `likesCount`, que muda entre páginas: o resultado é aproximado (pode, raramente,
++     * repetir ou saltar um post quando os likes mudam a meio).
++     */
+     async list(opts: ListOptions = {}): Promise<ListResult> {
+       const {
+         category,
+@@ -51,66 +168,125 @@ export function postsRepo(db: Database) {
+         limit = 20,
+         viewerId,
+       } = opts;
+-      const conditions = [eq(posts.status, "published")];
++
++      const parsed = cursor === undefined ? null : decodeCursor(cursor, filter);
++      if (cursor !== undefined && parsed === null)
++        throw new InvalidCursorError();
++
++      const conditions = [
++        eq(posts.status, "published"),
++        isNull(posts.deletedAt),
++      ];
+       if (category) conditions.push(eq(posts.category, category));
++      if (opts.gospelCardId) {
++        conditions.push(eq(posts.gospelCardId, opts.gospelCardId));
++      }
+ 
+       if (filter === "recent") {
+-        if (cursor) {
+-          const cursorDate = new Date(cursor);
+-          conditions.push(sql`${posts.createdAt} < ${cursorDate}`);
++        if (parsed?.k === "recent") {
++          conditions.push(
++            sql`(${posts.createdAt}, ${posts.id}) < (${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
++          );
+         }
+         const rows = await db
+-          .select()
++          .select({ post: posts, ts: exactTs(posts.createdAt) })
+           .from(posts)
+           .where(and(...conditions))
+-          .orderBy(desc(posts.createdAt))
++          .orderBy(desc(posts.createdAt), desc(posts.id))
+           .limit(limit + 1);
+-        const hasMore = rows.length > limit;
+-        const items = hasMore ? rows.slice(0, limit) : rows;
++        const page = rows.slice(0, limit);
++        const last = page[page.length - 1];
+         return {
+-          items,
+-          nextCursor: hasMore
+-            ? items[items.length - 1]!.createdAt.toISOString()
+-            : null,
++          items: page.map((r) => r.post),
++          nextCursor:
++            rows.length > limit && last
++              ? encodeCursor({ k: "recent", t: last.ts, id: last.post.id })
++              : null,
+         };
+       }
+ 
+       if (filter === "top") {
++        if (parsed?.k === "top") {
++          conditions.push(
++            sql`(${posts.likesCount}, ${posts.createdAt}, ${posts.id}) < (${parsed.l}::int, ${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
++          );
++        }
+         const rows = await db
+-          .select()
++          .select({ post: posts, ts: exactTs(posts.createdAt) })
+           .from(posts)
+           .where(and(...conditions))
+-          .orderBy(desc(posts.likesCount), desc(posts.createdAt))
+-          .limit(limit);
+-        return { items: rows, nextCursor: null };
++          .orderBy(
++            desc(posts.likesCount),
++            desc(posts.createdAt),
++            desc(posts.id),
++          )
++          .limit(limit + 1);
++        const page = rows.slice(0, limit);
++        const last = page[page.length - 1];
++        return {
++          items: page.map((r) => r.post),
++          nextCursor:
++            rows.length > limit && last
++              ? encodeCursor({
++                  k: "top",
++                  l: last.post.likesCount,
++                  t: last.ts,
++                  id: last.post.id,
++                })
++              : null,
++        };
+       }
+ 
+-      // filter === 'liked'
++      // filter === "liked": os que o viewer curtiu, do like mais recente para o mais antigo.
+       if (!viewerId) return { items: [], nextCursor: null };
++      conditions.push(eq(postLikes.userId, viewerId));
++      if (parsed?.k === "liked") {
++        conditions.push(
++          sql`(${postLikes.createdAt}, ${postLikes.postId}) < (${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
++        );
++      }
+       const rows = await db
+-        .select({ post: posts })
++        .select({ post: posts, ts: exactTs(postLikes.createdAt) })
+         .from(posts)
+         .innerJoin(postLikes, eq(postLikes.postId, posts.id))
+-        .where(and(...conditions, eq(postLikes.userId, viewerId)))
+-        .orderBy(desc(posts.createdAt))
+-        .limit(limit);
+-      return { items: rows.map((r) => r.post), nextCursor: null };
++        .where(and(...conditions))
++        .orderBy(desc(postLikes.createdAt), desc(postLikes.postId))
++        .limit(limit + 1);
++      const page = rows.slice(0, limit);
++      const last = page[page.length - 1];
++      return {
++        items: page.map((r) => r.post),
++        nextCursor:
++          rows.length > limit && last
++            ? encodeCursor({ k: "liked", t: last.ts, id: last.post.id })
++            : null,
++      };
+     },
+ 
++    /** Os posts do próprio autor (qualquer estado, menos apagados), mais recentes primeiro. */
+     async listByAuthor(authorId: string, limit = 50): Promise<Post[]> {
+       return db
+         .select()
+         .from(posts)
+-        .where(eq(posts.authorId, authorId))
+-        .orderBy(desc(posts.createdAt))
++        .where(and(eq(posts.authorId, authorId), isNull(posts.deletedAt)))
++        .orderBy(desc(posts.createdAt), desc(posts.id))
+         .limit(limit);
+     },
+ 
++    /**
++     * Muda o estado de moderação. Ao aprovar (`published`) preenche `publishedAt` se ainda
++     * não tinha (um post que esteve em revisão nunca foi publicado).
++     */
+     async setStatus(id: string, status: Post["status"]): Promise<Post | null> {
+       const [row] = await db
+         .update(posts)
+-        .set({ status })
+-        .where(eq(posts.id, id))
++        .set({
++          status,
++          ...(status === "published"
++            ? { publishedAt: sql`coalesce(${posts.publishedAt}, now())` }
++            : {}),
++        })
++        .where(and(eq(posts.id, id), isNull(posts.deletedAt)))
+         .returning();
+       return row ?? null;
+     },
+@@ -135,17 +311,18 @@ export function postsRepo(db: Database) {
+       return row?.reportsCount ?? 0;
+     },
+ 
++    /** Quantos posts (não apagados) o autor tem, em qualquer estado. */
+     async countByAuthor(authorId: string): Promise<number> {
+       const [row] = await db
+         .select({ c: count() })
+         .from(posts)
+-        .where(eq(posts.authorId, authorId));
++        .where(and(eq(posts.authorId, authorId), isNull(posts.deletedAt)));
+       return Number(row?.c ?? 0);
+     },
+   };
+ }
+ 
+-export function postLikesRepo(db: Database) {
++export function postLikesRepo(db: Executor) {
+   return {
+     async like(postId: string, userId: string): Promise<boolean> {
+       const result = await db
+@@ -163,5 +340,40 @@ export function postLikesRepo(db: Database) {
+         .returning({ postId: postLikes.postId });
+       return result.length > 0;
+     },
++
++    /** Dos `postIds` dados, quais o utilizador curtiu (decorar uma página do feed). */
++    async findLikedPostIds(
++      userId: string,
++      postIds: string[],
++    ): Promise<string[]> {
++      if (postIds.length === 0) return [];
++      const rows = await db
++        .select({ postId: postLikes.postId })
++        .from(postLikes)
++        .where(
++          and(eq(postLikes.userId, userId), inArray(postLikes.postId, postIds)),
++        );
++      return rows.map((r) => r.postId);
++    },
++
++    /**
++     * Os likes mais recentes do utilizador, com limite. `truncated` diz se havia mais (o
++     * cliente não fica com uma lista cortada em silêncio).
++     */
++    async listLikedPostIds(
++      userId: string,
++      limit = 500,
++    ): Promise<{ ids: string[]; truncated: boolean }> {
++      const rows = await db
++        .select({ postId: postLikes.postId })
++        .from(postLikes)
++        .where(eq(postLikes.userId, userId))
++        .orderBy(desc(postLikes.createdAt), desc(postLikes.postId))
++        .limit(limit + 1);
++      return {
++        ids: rows.slice(0, limit).map((r) => r.postId),
++        truncated: rows.length > limit,
++      };
++    },
+   };
+ }
+diff --git a/apps/api/src/repositories/users.ts b/apps/api/src/repositories/users.ts
+index 9432e83..8fa2e33 100644
+--- a/apps/api/src/repositories/users.ts
++++ b/apps/api/src/repositories/users.ts
+@@ -1,5 +1,5 @@
+-import { and, eq, isNull, lt } from "drizzle-orm";
+-import type { Database } from "../db/client.js";
++import { and, eq, inArray, isNull, lt } from "drizzle-orm";
++import type { Database, Executor } from "../db/client.js";
+ import { refreshTokens, users } from "../db/schema.js";
+ import type {
+   NewRefreshToken,
+@@ -14,7 +14,7 @@ export type RotateResult =
+   | { status: "reuse_detected"; familyId: string }
+   | { status: "expired" };
+ 
+-export function usersRepo(db: Database) {
++export function usersRepo(db: Executor) {
+   return {
+     async findById(id: string): Promise<User | null> {
+       const [row] = await db
+@@ -25,6 +25,15 @@ export function usersRepo(db: Database) {
+       return row ?? null;
+     },
+ 
++    /**
++     * Vários utilizadores de uma vez (apresentação de listas). Inclui contas apagadas ou em
++     * apagamento: quem apresenta decide como as mostrar (anónimas).
++     */
++    async findManyByIds(ids: string[]): Promise<User[]> {
++      if (ids.length === 0) return [];
++      return db.select().from(users).where(inArray(users.id, ids));
++    },
++
+     async findByUsername(username: string): Promise<User | null> {
+       const [row] = await db
+         .select()
+diff --git a/apps/api/src/services/post-presenter.ts b/apps/api/src/services/post-presenter.ts
+new file mode 100644
+index 0000000..c4417cc
+--- /dev/null
++++ b/apps/api/src/services/post-presenter.ts
+@@ -0,0 +1,96 @@
++import type { PostPublic } from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
++import type { Post, User } from "../db/schema.js";
++import { cardsRepo } from "../repositories/cards.js";
++import { postLikesRepo } from "../repositories/posts.js";
++import { usersRepo } from "../repositories/users.js";
++
++/**
++ * O autor só é mostrado se a conta existe e está activa e o post não foi mantido anónimo
++ * (F5). Em qualquer outro caso o cliente recebe `null` («[removido]»): nem o nome nem o
++ * identificador interno saem da API.
++ */
++function visibleAuthor(
++  post: Post,
++  author: User | undefined,
++): { username: string } | null {
++  if (post.authorHidden || post.authorId === null) return null;
++  if (!author) return null;
++  if (author.deletedAt !== null || author.deletionRequestedAt !== null) {
++    return null;
++  }
++  return { username: author.username };
++}
++
++/**
++ * Converte posts da base de dados no formato público. Corre na mesma ligação/transacção
++ * que o chamador (`exec`) e faz no máximo 3 consultas por página, seja qual for o tamanho:
++ * autores, cards e (se houver `viewerId`) likes do espectador.
++ */
++export async function presentPosts(
++  posts: Post[],
++  exec: Executor,
++  viewerId?: string,
++): Promise<PostPublic[]> {
++  if (posts.length === 0) return [];
++
++  const authorIds = [
++    ...new Set(
++      posts
++        .filter((p) => !p.authorHidden)
++        .map((p) => p.authorId)
++        .filter((id): id is string => id !== null),
++    ),
++  ];
++  const cardIds = [
++    ...new Set(
++      posts
++        .map((p) => p.gospelCardId)
++        .filter((id): id is string => id !== null),
++    ),
++  ];
++
++  const [authors, cards, likedIds] = await Promise.all([
++    usersRepo(exec).findManyByIds(authorIds),
++    cardsRepo(exec).findByIds(cardIds),
++    viewerId
++      ? postLikesRepo(exec).findLikedPostIds(
++          viewerId,
++          posts.map((p) => p.id),
++        )
++      : Promise.resolve<string[]>([]),
++  ]);
++
++  const authorById = new Map(authors.map((a) => [a.id, a]));
++  const slugByCardId = new Map(cards.map((c) => [c.id, c.slug]));
++  const liked = new Set(likedIds);
++
++  return posts.map((p) => ({
++    id: p.id,
++    category: p.category,
++    title: p.title,
++    content: p.content,
++    status: p.status,
++    likesCount: p.likesCount,
++    isLiked: liked.has(p.id),
++    isMine: viewerId !== undefined && p.authorId === viewerId,
++    author: visibleAuthor(
++      p,
++      p.authorId ? authorById.get(p.authorId) : undefined,
++    ),
++    gospelCardSlug: p.gospelCardId
++      ? (slugByCardId.get(p.gospelCardId) ?? null)
++      : null,
++    createdAt: p.createdAt.toISOString(),
++    publishedAt: p.publishedAt?.toISOString() ?? null,
++  }));
++}
++
++export async function presentOne(
++  post: Post,
++  exec: Executor,
++  viewerId?: string,
++): Promise<PostPublic> {
++  const [result] = await presentPosts([post], exec, viewerId);
++  return result!;
++}
+diff --git a/apps/api/src/services/posts.ts b/apps/api/src/services/posts.ts
+new file mode 100644
+index 0000000..059f1a4
+--- /dev/null
++++ b/apps/api/src/services/posts.ts
+@@ -0,0 +1,420 @@
++import { createHash } from "node:crypto";
++import {
++  checkContent,
++  CreatePostResponse,
++  flagCodes,
++} from "@comunidade/shared";
++import type {
++  PostCategory,
++  ReportCategory,
++  ReportOutcome,
++  ReportSeverity,
++} from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
++import { cardsRepo } from "../repositories/cards.js";
++import { idempotencyKeysRepo, outboxRepo } from "../repositories/outbox.js";
++import { postLikesRepo, postsRepo } from "../repositories/posts.js";
++import { reportsRepo } from "../repositories/reports.js";
++import { usersRepo } from "../repositories/users.js";
++import { presentOne } from "./post-presenter.js";
++
++export interface ServicesDeps {
++  /**
++   * O pool ou uma transacção já aberta. Cada serviço corre na sua própria transacção (dentro
++   * de uma transacção aberta passa a ser um savepoint): tudo o que o serviço escreve — post,
++   * chave de idempotência, evento de outbox, contadores — fica ou desaparece junto.
++   */
++  db: Executor;
++}
++
++export type ServiceError =
++  | { code: "not_found"; status: 404 }
++  | { code: "forbidden"; status: 403 }
++  /** A conta está em apagamento (ou já foi apagada): não pode escrever. */
++  | { code: "account_inactive"; status: 403 }
++  | { code: "own_post"; status: 400 }
++  | { code: "idempotency_key_conflict"; status: 409 }
++  | { code: "gospel_card_not_found"; status: 400 }
++  | { code: "contains_link"; status: 400 }
++  | { code: "contains_contact"; status: 400 }
++  | { code: "reason_required"; status: 400 };
++
++export type ServiceResult<T, E extends ServiceError = ServiceError> =
++  | { ok: true; data: T }
++  | { ok: false; error: E };
++
++type ErrorOf<C extends ServiceError["code"]> = Extract<
++  ServiceError,
++  { code: C }
++>;
++
++function fail<C extends ServiceError["code"]>(
++  code: C,
++): { ok: false; error: ErrorOf<C> } {
++  const status = {
++    not_found: 404,
++    forbidden: 403,
++    account_inactive: 403,
++    own_post: 400,
++    idempotency_key_conflict: 409,
++    gospel_card_not_found: 400,
++    contains_link: 400,
++    contains_contact: 400,
++    reason_required: 400,
++  }[code];
++  return { ok: false, error: { code, status } as ErrorOf<C> };
++}
++
++/**
++ * Escrever exige conta activa: sem apagamento pendente e não apagada. É uma leitura por chave
++ * primária, feita a cada escrita (as leituras públicas não pagam este custo), por isso o
++ * bloqueio é imediato — não espera pela expiração do token de acesso.
++ */
++async function isAccountActive(
++  exec: Executor,
++  userId: string,
++): Promise<boolean> {
++  const user = await usersRepo(exec).findById(userId);
++  return user !== null && user.deletionRequestedAt === null;
++}
++
++// ---------- Criar ----------
++
++export interface CreatePostInput {
++  category: PostCategory;
++  title: string;
++  content: string;
++  gospelCardSlug?: string | undefined;
++}
++
++/** `replayed`: a resposta veio de um pedido anterior com a mesma chave (nada foi criado agora). */
++export type CreatePostData = CreatePostResponse & { replayed: boolean };
++
++type CreatePostError = ErrorOf<
++  | "account_inactive"
++  | "gospel_card_not_found"
++  | "idempotency_key_conflict"
++  | "contains_link"
++  | "contains_contact"
++>;
++
++const CREATE_OPERATION = "post.create";
++
++/** SHA-256 da operação e do corpo, com as chaves em ordem fixa. */
++function hashCreateRequest(input: CreatePostInput): string {
++  return createHash("sha256")
++    .update(
++      JSON.stringify([
++        CREATE_OPERATION,
++        input.category,
++        input.title,
++        input.content,
++        input.gospelCardSlug ?? null,
++      ]),
++    )
++    .digest("hex");
++}
++
++/**
++ * A chave já existe: é uma repetição (mesma operação e mesmo corpo → repete a resposta) ou
++ * um erro do cliente (mesma chave, outro pedido → 409). Nunca cria nada.
++ */
++async function resolveExistingKey(
++  exec: Executor,
++  userId: string,
++  key: string,
++  requestHash: string,
++): Promise<ServiceResult<CreatePostData, CreatePostError> | null> {
++  const row = await idempotencyKeysRepo(exec).get(userId, key);
++  if (!row) return null;
++  if (row.operation !== CREATE_OPERATION || row.requestHash !== requestHash) {
++    return fail("idempotency_key_conflict");
++  }
++  // Guardámo-la nós, mas valida-se na mesma: um valor estragado dá 500, nunca uma resposta falsa.
++  const stored = CreatePostResponse.parse(row.response);
++  return { ok: true, data: { ...stored, replayed: true } };
++}
++
++export async function createPostService(
++  deps: ServicesDeps,
++  userId: string,
++  input: CreatePostInput,
++  idempotencyKey: string,
++): Promise<ServiceResult<CreatePostData, CreatePostError>> {
++  return deps.db.transaction<ServiceResult<CreatePostData, CreatePostError>>(
++    async (tx) => {
++      if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++      const requestHash = hashCreateRequest(input);
++      const earlier = await resolveExistingKey(
++        tx,
++        userId,
++        idempotencyKey,
++        requestHash,
++      );
++      if (earlier) return earlier;
++
++      const check = checkContent(input.title, input.content);
++      if (check.reject) {
++        const code =
++          check.violations[0]?.kind === "link"
++            ? "contains_link"
++            : "contains_contact";
++        return fail(code);
++      }
++      const flags = flagCodes(check);
++
++      let gospelCardId: string | null = null;
++      if (input.gospelCardSlug) {
++        const card = await cardsRepo(tx).findBySlug(input.gospelCardSlug);
++        if (!card) return fail("gospel_card_not_found");
++        gospelCardId = card.id;
++      }
++
++      // Reserva ANTES de criar: dois pedidos concorrentes com a mesma chave não criam dois posts.
++      // O segundo espera aqui pelo primeiro e, quando este faz commit, vê a chave como existente.
++      const reservation = await idempotencyKeysRepo(tx).reserve({
++        userId,
++        key: idempotencyKey,
++        operation: CREATE_OPERATION,
++        requestHash,
++      });
++      if (reservation === "exists") {
++        const concurrent = await resolveExistingKey(
++          tx,
++          userId,
++          idempotencyKey,
++          requestHash,
++        );
++        return concurrent ?? fail("idempotency_key_conflict");
++      }
++
++      const post = await postsRepo(tx).create({
++        authorId: userId,
++        category: input.category,
++        title: input.title,
++        content: input.content,
++        status: flags.length > 0 ? "pending_review" : "published",
++        reviewFlags: flags.length > 0 ? flags : null,
++        gospelCardId,
++      });
++
++      const response: CreatePostResponse = {
++        post: await presentOne(post, tx, userId),
++        status: post.status,
++      };
++      await idempotencyKeysRepo(tx).complete(userId, idempotencyKey, response);
++      await outboxRepo(tx).enqueue({
++        aggregateType: "post",
++        aggregateId: post.id,
++        eventType: "post.created",
++        payload: { postId: post.id, authorId: userId, status: post.status },
++      });
++
++      return { ok: true, data: { ...response, replayed: false } };
++    },
++  );
++}
++
++// ---------- Apagar ----------
++
++type DeletePostError = ErrorOf<"not_found" | "account_inactive">;
++
++/**
++ * Apaga (soft delete) um post do próprio autor. Idempotente: apagar outra vez devolve
++ * sucesso com `changed: false`. Quem não é o autor recebe o mesmo `not_found` que um post
++ * inexistente — não se confirma a existência de posts alheios.
++ */
++export async function deletePostService(
++  deps: ServicesDeps,
++  userId: string,
++  postId: string,
++): Promise<
++  ServiceResult<{ deleted: true; changed: boolean }, DeletePostError>
++> {
++  return deps.db.transaction<
++    ServiceResult<{ deleted: true; changed: boolean }, DeletePostError>
++  >(async (tx) => {
++    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++    const posts = postsRepo(tx);
++    const post = await posts.findById(postId, { includeDeleted: true });
++    if (!post || post.authorId !== userId) return fail("not_found");
++
++    const changed = await posts.softDelete(postId, userId);
++    if (changed) {
++      await outboxRepo(tx).enqueue({
++        aggregateType: "post",
++        aggregateId: postId,
++        eventType: "post.deleted",
++        payload: { postId },
++      });
++    }
++    return { ok: true, data: { deleted: true, changed } };
++  });
++}
++
++// ---------- Likes ----------
++
++export interface LikeData {
++  likesCount: number;
++  isLiked: boolean;
++  /** `false` quando já estava assim (curtir um post já curtido, descurtir um não curtido). */
++  changed: boolean;
++}
++
++type LikeError = ErrorOf<"not_found" | "account_inactive">;
++
++export async function likePostService(
++  deps: ServicesDeps,
++  userId: string,
++  postId: string,
++): Promise<ServiceResult<LikeData, LikeError>> {
++  return deps.db.transaction<ServiceResult<LikeData, LikeError>>(async (tx) => {
++    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++    const posts = postsRepo(tx);
++    const post = await posts.findById(postId);
++    if (!post || post.status !== "published") return fail("not_found");
++
++    const inserted = await postLikesRepo(tx).like(postId, userId);
++    // O contador sobe na mesma transacção que o like: nunca fica desalinhado.
++    const likesCount = inserted
++      ? await posts.incrementLikes(postId, 1)
++      : post.likesCount;
++    if (inserted) {
++      await outboxRepo(tx).enqueue({
++        aggregateType: "post",
++        aggregateId: postId,
++        eventType: "post.liked",
++        payload: { postId, userId },
++      });
++    }
++    return { ok: true, data: { likesCount, isLiked: true, changed: inserted } };
++  });
++}
++
++export async function unlikePostService(
++  deps: ServicesDeps,
++  userId: string,
++  postId: string,
++): Promise<ServiceResult<LikeData, LikeError>> {
++  return deps.db.transaction<ServiceResult<LikeData, LikeError>>(async (tx) => {
++    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++    const posts = postsRepo(tx);
++    // Descurtir é permitido em qualquer estado (o utilizador pode querer retirar o like de um
++    // post entretanto oculto), mas não num post apagado.
++    const post = await posts.findById(postId);
++    if (!post) return fail("not_found");
++
++    const removed = await postLikesRepo(tx).unlike(postId, userId);
++    const likesCount = removed
++      ? await posts.incrementLikes(postId, -1)
++      : post.likesCount;
++    if (removed) {
++      await outboxRepo(tx).enqueue({
++        aggregateType: "post",
++        aggregateId: postId,
++        eventType: "post.unliked",
++        payload: { postId, userId },
++      });
++    }
++    return {
++      ok: true,
++      data: { likesCount, isLiked: false, changed: removed },
++    };
++  });
++}
++
++// ---------- Denúncias ----------
++
++type ReportPostError = ErrorOf<
++  "own_post" | "not_found" | "reason_required" | "account_inactive"
++>;
++
++export async function reportPostService(
++  deps: ServicesDeps,
++  userId: string,
++  postId: string,
++  category: ReportCategory,
++  reason: string | undefined,
++): Promise<
++  ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
++> {
++  // Rede de segurança: o schema da rota já exige o motivo para «other».
++  const trimmed = reason?.trim();
++  if (category === "other" && (!trimmed || trimmed.length < 3)) {
++    return fail("reason_required");
++  }
++
++  return deps.db.transaction<
++    ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
++  >(async (tx) => {
++    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++    const result = await reportsRepo(tx).file({
++      postId,
++      reporterId: userId,
++      category,
++      reason: trimmed ?? null,
++    });
++
++    switch (result.outcome) {
++      case "created": {
++        await outboxRepo(tx).enqueue({
++          aggregateType: "post",
++          aggregateId: postId,
++          eventType: "post.reported",
++          payload: { postId, reporterId: userId, category },
++        });
++        if (result.escalated && result.escalatedBy) {
++          const severity: ReportSeverity = result.escalatedBy;
++          await outboxRepo(tx).enqueue({
++            aggregateType: "post",
++            aggregateId: postId,
++            eventType: "post.escalated",
++            payload: { postId, severity },
++          });
++        }
++        return { ok: true, data: { outcome: "created", changed: true } };
++      }
++      case "duplicate":
++        return { ok: true, data: { outcome: "duplicate", changed: false } };
++      case "own_post":
++        return fail("own_post");
++      case "post_not_found":
++        return fail("not_found");
++    }
++  });
++}
++
++type UnreportPostError = ErrorOf<"not_found" | "account_inactive">;
++
++/**
++ * Retira a denúncia do próprio utilizador. Idempotente: se já estava retirada (ou resolvida
++ * pelo moderador) devolve sucesso com `changed: false`; só é `not_found` se nunca denunciou.
++ */
++export async function unreportPostService(
++  deps: ServicesDeps,
++  userId: string,
++  postId: string,
++): Promise<
++  ServiceResult<{ withdrawn: true; changed: boolean }, UnreportPostError>
++> {
++  return deps.db.transaction<
++    ServiceResult<{ withdrawn: true; changed: boolean }, UnreportPostError>
++  >(async (tx) => {
++    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++    const reports = reportsRepo(tx);
++    const open = await reports.findOpenByPostAndReporter(postId, userId);
++    if (open) {
++      const changed = await reports.cancel(open.id, userId);
++      return { ok: true, data: { withdrawn: true, changed } };
++    }
++    const earlier = await reports.findByPostAndReporter(postId, userId);
++    if (earlier) return { ok: true, data: { withdrawn: true, changed: false } };
++    return fail("not_found");
++  });
++}
+diff --git a/apps/api/test/maintenance.test.ts b/apps/api/test/maintenance.test.ts
+index 00c9105..45762d3 100644
+--- a/apps/api/test/maintenance.test.ts
++++ b/apps/api/test/maintenance.test.ts
+@@ -1,8 +1,9 @@
+-import { eq } from "drizzle-orm";
++import { eq, sql } from "drizzle-orm";
+ import { afterAll, beforeEach, describe, expect, it } from "vitest";
+ import {
+   idempotencyKeys,
+   outbox,
++  posts,
+   refreshTokens,
+   users,
+ } from "../src/db/schema.js";
+@@ -11,7 +12,7 @@ import { accountDeletionRepo } from "../src/repositories/account-deletion.js";
+ import { idempotencyKeysRepo, outboxRepo } from "../src/repositories/outbox.js";
+ import { refreshTokensRepo } from "../src/repositories/users.js";
+ import { closeTestDb, getTestDb, truncateAll } from "./helpers/db.js";
+-import { makeUser } from "./helpers/factories.js";
++import { makePost, makeUser } from "./helpers/factories.js";
+ import { uuidv7 } from "uuidv7";
+ 
+ const DAY_MS = 24 * 60 * 60 * 1000;
+@@ -131,3 +132,32 @@ describe("runMaintenance", () => {
+     );
+   });
+ });
++
++describe("runMaintenance — posts apagados pelo autor", () => {
++  it("elimina de vez só os apagados há mais do que o prazo (configurável)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const old = await makePost(author.id, { title: "Velho" });
++    const recent = await makePost(author.id, { title: "Recente" });
++    const live = await makePost(author.id, { title: "Vivo" });
++    await db.execute(
++      sql`UPDATE posts SET deleted_at = now() - interval '31 days' WHERE id = ${old.id}`,
++    );
++    await db.execute(
++      sql`UPDATE posts SET deleted_at = now() - interval '5 days' WHERE id = ${recent.id}`,
++    );
++
++    const first = await runMaintenance(db, { accountGraceDays: 30 });
++    expect(first.softDeletedPosts).toBe(1);
++    const left = await db.select().from(posts);
++    expect(left.map((p) => p.id).sort()).toEqual([recent.id, live.id].sort());
++
++    // Com um prazo de 3 dias, o «recente» também vai.
++    const second = await runMaintenance(db, {
++      accountGraceDays: 30,
++      postsDeletedRetentionDays: 3,
++    });
++    expect(second.softDeletedPosts).toBe(1);
++    expect((await db.select().from(posts)).map((p) => p.id)).toEqual([live.id]);
++  });
++});
+diff --git a/apps/api/test/repositories/idempotency.test.ts b/apps/api/test/repositories/idempotency.test.ts
+new file mode 100644
+index 0000000..ca78582
+--- /dev/null
++++ b/apps/api/test/repositories/idempotency.test.ts
+@@ -0,0 +1,133 @@
++import { eq, sql } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { idempotencyKeys } from "../../src/db/schema.js";
++import { idempotencyKeysRepo } from "../../src/repositories/outbox.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makeUser } from "../helpers/factories.js";
++
++beforeEach(async () => {
++  await truncateAll();
++});
++
++afterAll(async () => {
++  await closeTestDb();
++});
++
++const KEY = "chave-de-teste-0123456789";
++
++describe("idempotencyKeysRepo.reserve", () => {
++  it("a primeira reserva é nossa; a segunda vê que já existe", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const repo = idempotencyKeysRepo(db);
++    const args = {
++      userId: user.id,
++      key: KEY,
++      operation: "post.create",
++      requestHash: "h1",
++    };
++    expect(await repo.reserve(args)).toBe("reserved");
++    expect(await repo.reserve(args)).toBe("exists");
++    const row = await repo.get(user.id, KEY);
++    expect(row?.requestHash).toBe("h1");
++    expect(row?.response).toEqual({});
++  });
++
++  it("complete guarda a resposta", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const repo = idempotencyKeysRepo(db);
++    await repo.reserve({
++      userId: user.id,
++      key: KEY,
++      operation: "post.create",
++      requestHash: "h1",
++    });
++    await repo.complete(user.id, KEY, { ok: true });
++    expect((await repo.get(user.id, KEY))?.response).toEqual({ ok: true });
++  });
++
++  it("a chave é por utilizador: o mesmo texto de outro utilizador é independente", async () => {
++    const db = await getTestDb();
++    const a = await makeUser();
++    const b = await makeUser();
++    const repo = idempotencyKeysRepo(db);
++    const base = { key: KEY, operation: "post.create", requestHash: "h" };
++    expect(await repo.reserve({ ...base, userId: a.id })).toBe("reserved");
++    expect(await repo.reserve({ ...base, userId: b.id })).toBe("reserved");
++  });
++
++  it("uma chave expirada é reaproveitada, com o novo pedido", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const repo = idempotencyKeysRepo(db);
++    await repo.reserve({
++      userId: user.id,
++      key: KEY,
++      operation: "post.create",
++      requestHash: "antigo",
++    });
++    await db
++      .update(idempotencyKeys)
++      .set({ expiresAt: new Date(Date.now() - 1000) })
++      .where(eq(idempotencyKeys.userId, user.id));
++    expect(await repo.get(user.id, KEY)).toBeNull();
++
++    expect(
++      await repo.reserve({
++        userId: user.id,
++        key: KEY,
++        operation: "post.create",
++        requestHash: "novo",
++      }),
++    ).toBe("reserved");
++    expect((await repo.get(user.id, KEY))?.requestHash).toBe("novo");
++  });
++
++  it("duas transacções concorrentes: só uma reserva; a outra espera e vê 'exists'", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const run = () =>
++      db.transaction(async (tx) => {
++        const result = await idempotencyKeysRepo(tx).reserve({
++          userId: user.id,
++          key: KEY,
++          operation: "post.create",
++          requestHash: "h",
++        });
++        // Segura a transacção aberta para a outra ter de esperar.
++        await new Promise((r) => setTimeout(r, 80));
++        return result;
++      });
++    const results = await Promise.all([run(), run()]);
++    expect([...results].sort()).toEqual(["exists", "reserved"]);
++    const rows = await db.execute(
++      sql`SELECT count(*)::int AS c FROM idempotency_keys`,
++    );
++    expect(rows.rows[0]).toEqual({ c: 1 });
++  });
++
++  it("se a transacção que reservou desfaz, a chave fica livre", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    await expect(
++      db.transaction(async (tx) => {
++        await idempotencyKeysRepo(tx).reserve({
++          userId: user.id,
++          key: KEY,
++          operation: "post.create",
++          requestHash: "h",
++        });
++        throw new Error("falhou a meio");
++      }),
++    ).rejects.toThrow("falhou a meio");
++    expect(
++      await idempotencyKeysRepo(db).reserve({
++        userId: user.id,
++        key: KEY,
++        operation: "post.create",
++        requestHash: "h",
++      }),
++    ).toBe("reserved");
++  });
++});
+diff --git a/apps/api/test/repositories/posts.test.ts b/apps/api/test/repositories/posts.test.ts
+index 992ce1c..56593d3 100644
+--- a/apps/api/test/repositories/posts.test.ts
++++ b/apps/api/test/repositories/posts.test.ts
+@@ -1,5 +1,12 @@
++import { eq, sql } from "drizzle-orm";
+ import { afterAll, beforeEach, describe, expect, it } from "vitest";
+-import { postLikesRepo, postsRepo } from "../../src/repositories/posts.js";
++import { posts, reports } from "../../src/db/schema.js";
++import {
++  InvalidCursorError,
++  postLikesRepo,
++  postsRepo,
++} from "../../src/repositories/posts.js";
++import { reportsRepo } from "../../src/repositories/reports.js";
+ import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
+ import { makeLike, makePost, makeUser } from "../helpers/factories.js";
+ 
+@@ -143,3 +150,291 @@ describe("postLikesRepo", () => {
+     expect(await repo.unlike(p.id, viewer.id)).toBe(false);
+   });
+ });
++
++/** Fixa o created_at de um post com precisão de microssegundos (o Date do JS só tem ms). */
++async function setCreatedAt(id: string, iso: string): Promise<void> {
++  const db = await getTestDb();
++  await db.execute(
++    sql`UPDATE posts SET created_at = ${iso}::timestamptz WHERE id = ${id}`,
++  );
++}
++
++describe("postsRepo — soft delete", () => {
++  it("esconde o post de findById, do feed e das contagens, mas a linha fica", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const keep = await makePost(author.id, { title: "Fica" });
++    const gone = await makePost(author.id, { title: "Apagado" });
++    const repo = postsRepo(db);
++
++    expect(await repo.softDelete(gone.id, author.id)).toBe(true);
++
++    expect(await repo.findById(gone.id)).toBeNull();
++    expect((await repo.findById(gone.id, { includeDeleted: true }))?.id).toBe(
++      gone.id,
++    );
++    expect((await repo.list()).items.map((p) => p.id)).toEqual([keep.id]);
++    expect((await repo.listByAuthor(author.id)).map((p) => p.id)).toEqual([
++      keep.id,
++    ]);
++    expect(await repo.countByAuthor(author.id)).toBe(1);
++    expect(
++      await repo.findLatestByAuthorInFilter(author.id, {
++        statuses: ["published"],
++      }),
++    ).toMatchObject({ id: keep.id });
++    // A linha continua na base de dados (evidência até à purga).
++    const [row] = await db.select().from(posts).where(eq(posts.id, gone.id));
++    expect(row?.deletedAt).toBeInstanceOf(Date);
++  });
++
++  it("só o autor apaga, e só uma vez", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const other = await makeUser();
++    const post = await makePost(author.id);
++    const repo = postsRepo(db);
++
++    expect(await repo.softDelete(post.id, other.id)).toBe(false);
++    expect(await repo.softDelete(post.id, author.id)).toBe(true);
++    expect(await repo.softDelete(post.id, author.id)).toBe(false);
++  });
++
++  it("setStatus não actua em posts apagados", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const repo = postsRepo(db);
++    await repo.softDelete(post.id, author.id);
++    expect(await repo.setStatus(post.id, "published")).toBeNull();
++  });
++
++  it("o feed 'liked' também não mostra posts apagados", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const post = await makePost(author.id);
++    await makeLike(post.id, viewer.id);
++    await postsRepo(db).softDelete(post.id, author.id);
++    const { items } = await postsRepo(db).list({
++      filter: "liked",
++      viewerId: viewer.id,
++    });
++    expect(items).toEqual([]);
++  });
++});
++
++describe("postsRepo.purgeDeleted", () => {
++  it("elimina de vez só os apagados há mais do que o prazo, com likes e denúncias", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const liker = await makeUser();
++    const reporter = await makeUser();
++    const old = await makePost(author.id, { title: "Velho" });
++    const recent = await makePost(author.id, { title: "Recente" });
++    const live = await makePost(author.id, { title: "Vivo" });
++    await makeLike(old.id, liker.id);
++    await reportsRepo(db).file({
++      postId: old.id,
++      reporterId: reporter.id,
++      category: "spam",
++    });
++    const repo = postsRepo(db);
++    await repo.softDelete(old.id, author.id);
++    await repo.softDelete(recent.id, author.id);
++    await db.execute(
++      sql`UPDATE posts SET deleted_at = now() - interval '40 days' WHERE id = ${old.id}`,
++    );
++
++    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
++    expect(await repo.purgeDeleted(cutoff)).toBe(1);
++
++    expect(
++      await db.select().from(posts).where(eq(posts.id, old.id)),
++    ).toHaveLength(0);
++    expect(await db.select().from(reports)).toHaveLength(0);
++    expect(
++      (await db.select().from(posts).where(eq(posts.id, recent.id))).length,
++    ).toBe(1);
++    expect(
++      (await db.select().from(posts).where(eq(posts.id, live.id))).length,
++    ).toBe(1);
++  });
++
++  it("respeita o tamanho do lote", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const repo = postsRepo(db);
++    for (let i = 0; i < 3; i++) {
++      const p = await makePost(author.id);
++      await repo.softDelete(p.id, author.id);
++    }
++    const future = new Date(Date.now() + 60_000);
++    expect(await repo.purgeDeleted(future, 2)).toBe(2);
++    expect(await repo.purgeDeleted(future, 2)).toBe(1);
++    expect(await repo.purgeDeleted(future, 2)).toBe(0);
++  });
++});
++
++describe("postsRepo — cursor composto", () => {
++  it("não salta linhas criadas a microssegundos de distância", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const a = await makePost(author.id, { title: "A" });
++    const b = await makePost(author.id, { title: "B" });
++    const c = await makePost(author.id, { title: "C" });
++    await setCreatedAt(a.id, "2026-01-01T00:00:00.123100Z");
++    await setCreatedAt(b.id, "2026-01-01T00:00:00.123500Z");
++    await setCreatedAt(c.id, "2026-01-01T00:00:00.123900Z");
++
++    const repo = postsRepo(db);
++    const seen: string[] = [];
++    let cursor: string | undefined;
++    for (let i = 0; i < 5; i++) {
++      const page = await repo.list({
++        filter: "recent",
++        limit: 1,
++        ...(cursor !== undefined ? { cursor } : {}),
++      });
++      seen.push(...page.items.map((p) => p.title));
++      if (!page.nextCursor) break;
++      cursor = page.nextCursor;
++    }
++    expect(seen).toEqual(["C", "B", "A"]);
++  });
++
++  it("posts com o mesmo created_at não se repetem nem se perdem", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const ids: string[] = [];
++    for (let i = 0; i < 5; i++) {
++      const p = await makePost(author.id, { title: `P${i}` });
++      await setCreatedAt(p.id, "2026-01-01T00:00:00.500000Z");
++      ids.push(p.id);
++    }
++    const repo = postsRepo(db);
++    const seen: string[] = [];
++    let cursor: string | undefined;
++    for (let i = 0; i < 10; i++) {
++      const page = await repo.list({
++        filter: "recent",
++        limit: 2,
++        ...(cursor !== undefined ? { cursor } : {}),
++      });
++      seen.push(...page.items.map((p) => p.id));
++      if (!page.nextCursor) break;
++      cursor = page.nextCursor;
++    }
++    expect(seen).toHaveLength(5);
++    expect(new Set(seen)).toEqual(new Set(ids));
++  });
++
++  it("cursor inválido, adulterado ou de outro filtro → InvalidCursorError", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    for (let i = 0; i < 3; i++) await makePost(author.id);
++    const repo = postsRepo(db);
++    const page = await repo.list({ filter: "recent", limit: 1 });
++    expect(page.nextCursor).not.toBeNull();
++
++    await expect(
++      repo.list({ filter: "recent", cursor: "lixo" }),
++    ).rejects.toBeInstanceOf(InvalidCursorError);
++    await expect(
++      repo.list({ filter: "recent", cursor: page.nextCursor!.slice(0, -3) }),
++    ).rejects.toBeInstanceOf(InvalidCursorError);
++    // O cursor do «recent» não serve para o «top».
++    await expect(
++      repo.list({ filter: "top", cursor: page.nextCursor! }),
++    ).rejects.toBeInstanceOf(InvalidCursorError);
++  });
++
++  it("top pagina por likes, depois por data", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const titles = ["zero", "um", "dois", "tres"];
++    for (const [i, title] of titles.entries()) {
++      const p = await makePost(author.id, { title });
++      await db.update(posts).set({ likesCount: i }).where(eq(posts.id, p.id));
++    }
++    const repo = postsRepo(db);
++    const first = await repo.list({ filter: "top", limit: 2 });
++    expect(first.items.map((p) => p.title)).toEqual(["tres", "dois"]);
++    const second = await repo.list({
++      filter: "top",
++      limit: 2,
++      cursor: first.nextCursor!,
++    });
++    expect(second.items.map((p) => p.title)).toEqual(["um", "zero"]);
++    expect(second.nextCursor).toBeNull();
++  });
++
++  it("liked pagina pelo momento do like (mais recente primeiro)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const a = await makePost(author.id, { title: "A" });
++    const b = await makePost(author.id, { title: "B" });
++    const c = await makePost(author.id, { title: "C" });
++    // Curtidos por ordem B, A, C — a ordem do feed é a inversa: C, A, B.
++    for (const post of [b, a, c]) {
++      await makeLike(post.id, viewer.id);
++      await new Promise((r) => setTimeout(r, 3));
++    }
++    const repo = postsRepo(db);
++    const first = await repo.list({
++      filter: "liked",
++      viewerId: viewer.id,
++      limit: 2,
++    });
++    expect(first.items.map((p) => p.title)).toEqual(["C", "A"]);
++    const second = await repo.list({
++      filter: "liked",
++      viewerId: viewer.id,
++      limit: 2,
++      cursor: first.nextCursor!,
++    });
++    expect(second.items.map((p) => p.title)).toEqual(["B"]);
++    expect(second.nextCursor).toBeNull();
++  });
++});
++
++describe("postsRepo.setStatus — publishedAt", () => {
++  it("aprovar um post em revisão preenche publishedAt, uma só vez", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const repo = postsRepo(db);
++    expect(post.publishedAt).toBeNull();
++
++    const approved = await repo.setStatus(post.id, "published");
++    expect(approved?.publishedAt).toBeInstanceOf(Date);
++
++    await repo.setStatus(post.id, "hidden");
++    const again = await repo.setStatus(post.id, "published");
++    // Não volta a mudar: a data da primeira publicação mantém-se.
++    expect(again?.publishedAt?.getTime()).toBe(
++      approved?.publishedAt?.getTime(),
++    );
++  });
++});
++
++describe("postLikesRepo.listLikedPostIds", () => {
++  it("devolve os mais recentes e diz quando cortou", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    for (let i = 0; i < 3; i++) {
++      const p = await makePost(author.id);
++      await makeLike(p.id, viewer.id);
++    }
++    const repo = postLikesRepo(db);
++    const all = await repo.listLikedPostIds(viewer.id, 3);
++    expect(all.ids).toHaveLength(3);
++    expect(all.truncated).toBe(false);
++    const cut = await repo.listLikedPostIds(viewer.id, 2);
++    expect(cut.ids).toHaveLength(2);
++    expect(cut.truncated).toBe(true);
++    expect(await repo.findLikedPostIds(viewer.id, [])).toEqual([]);
++  });
++});
+diff --git a/apps/api/test/services/post-presenter.test.ts b/apps/api/test/services/post-presenter.test.ts
+new file mode 100644
+index 0000000..733639b
+--- /dev/null
++++ b/apps/api/test/services/post-presenter.test.ts
+@@ -0,0 +1,143 @@
++import { eq } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { posts, users } from "../../src/db/schema.js";
++import { cardsRepo } from "../../src/repositories/cards.js";
++import { usersRepo } from "../../src/repositories/users.js";
++import { presentOne, presentPosts } from "../../src/services/post-presenter.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makeLike, makePost, makeUser } from "../helpers/factories.js";
++
++beforeEach(async () => {
++  await truncateAll();
++});
++
++afterAll(async () => {
++  await closeTestDb();
++});
++
++describe("presentPosts", () => {
++  it("lista vazia → lista vazia (sem consultas)", async () => {
++    const db = await getTestDb();
++    expect(await presentPosts([], db)).toEqual([]);
++  });
++
++  it("devolve o autor pelo nome e NUNCA o identificador interno", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const view = await presentOne(post, db);
++    expect(view.author).toEqual({ username: author.username });
++    expect("authorId" in view).toBe(false);
++    expect(JSON.stringify(view)).not.toContain(author.id);
++  });
++
++  it("isMine e isLiked dependem de quem vê", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const liked = await makePost(author.id, { title: "Curtido" });
++    const plain = await makePost(author.id, { title: "Simples" });
++    await makeLike(liked.id, viewer.id);
++
++    const asViewer = await presentPosts([liked, plain], db, viewer.id);
++    expect(asViewer.map((p) => [p.title, p.isLiked, p.isMine])).toEqual([
++      ["Curtido", true, false],
++      ["Simples", false, false],
++    ]);
++    const asAuthor = await presentPosts([liked], db, author.id);
++    expect(asAuthor[0]).toMatchObject({ isMine: true, isLiked: false });
++    const anonymous = await presentPosts([liked], db);
++    expect(anonymous[0]).toMatchObject({ isMine: false, isLiked: false });
++  });
++
++  it("autor com apagamento pendente, apagado ou post anónimo → author null", async () => {
++    const db = await getTestDb();
++    const pending = await makeUser({ deletionRequestedAt: new Date() });
++    const deleted = await makeUser({ deletedAt: new Date() });
++    const hiddenAuthor = await makeUser();
++    const orphan = await makeUser();
++
++    const p1 = await makePost(pending.id);
++    const p2 = await makePost(deleted.id);
++    const p3 = await makePost(hiddenAuthor.id, { authorHidden: true });
++    const p4 = await makePost(orphan.id);
++    await db.update(posts).set({ authorId: null }).where(eq(posts.id, p4.id));
++    const [row4] = await db.select().from(posts).where(eq(posts.id, p4.id));
++
++    const views = await presentPosts([p1, p2, p3, row4!], db);
++    expect(views.map((v) => v.author)).toEqual([null, null, null, null]);
++    const text = JSON.stringify(views);
++    for (const u of [pending, deleted, hiddenAuthor]) {
++      expect(text).not.toContain(u.username);
++      expect(text).not.toContain(u.id);
++    }
++  });
++
++  it("o próprio autor de um post anónimo continua a vê-lo como seu (isMine)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id, { authorHidden: true });
++    const [view] = await presentPosts([post], db, author.id);
++    expect(view).toMatchObject({ author: null, isMine: true });
++  });
++
++  it("liga o slug do card sem carregar a tabela toda", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const repo = cardsRepo(db);
++    const card = await repo.create({
++      slug: "natividade",
++      title: "Natividade",
++      gospelReference: "Mateus 2",
++      summary: "Resumo.",
++      otReferences: [],
++      ntReferences: [],
++      orderIndex: 1,
++    });
++    await repo.create({
++      slug: "outro",
++      title: "Outro",
++      gospelReference: "Lucas 1",
++      summary: "Resumo.",
++      otReferences: [],
++      ntReferences: [],
++      orderIndex: 2,
++    });
++    const withCard = await makePost(author.id, { gospelCardId: card.id });
++    const without = await makePost(author.id);
++    const views = await presentPosts([withCard, without], db);
++    expect(views.map((v) => v.gospelCardSlug)).toEqual(["natividade", null]);
++  });
++});
++
++describe("repositórios de apoio", () => {
++  it("usersRepo.findManyByIds devolve os pedidos (inclui contas apagadas) e aceita lista vazia", async () => {
++    const db = await getTestDb();
++    const a = await makeUser();
++    const b = await makeUser({ deletedAt: new Date() });
++    await makeUser();
++    const found = await usersRepo(db).findManyByIds([a.id, b.id]);
++    expect(found.map((u) => u.id).sort()).toEqual([a.id, b.id].sort());
++    expect(await usersRepo(db).findManyByIds([])).toEqual([]);
++    expect(await db.select().from(users)).toHaveLength(3);
++  });
++
++  it("cardsRepo.findByIds devolve só os pedidos e aceita lista vazia", async () => {
++    const db = await getTestDb();
++    const repo = cardsRepo(db);
++    const mk = (slug: string, orderIndex: number) =>
++      repo.create({
++        slug,
++        title: slug,
++        gospelReference: "Mateus 2",
++        summary: "Resumo.",
++        otReferences: [],
++        ntReferences: [],
++        orderIndex,
++      });
++    const a = await mk("a", 1);
++    await mk("b", 2);
++    expect((await repo.findByIds([a.id])).map((c) => c.slug)).toEqual(["a"]);
++    expect(await repo.findByIds([])).toEqual([]);
++  });
++});
+diff --git a/apps/api/test/services/posts.test.ts b/apps/api/test/services/posts.test.ts
+new file mode 100644
+index 0000000..b8bff7b
+--- /dev/null
++++ b/apps/api/test/services/posts.test.ts
+@@ -0,0 +1,492 @@
++import { eq } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import {
++  idempotencyKeys,
++  outbox,
++  posts,
++  reports,
++} from "../../src/db/schema.js";
++import { cardsRepo } from "../../src/repositories/cards.js";
++import { REPORTER_MIN_AGE_DAYS } from "../../src/repositories/reports.js";
++import {
++  createPostService,
++  deletePostService,
++  likePostService,
++  reportPostService,
++  unlikePostService,
++  unreportPostService,
++} from "../../src/services/posts.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makeLike, makePost, makeUser } from "../helpers/factories.js";
++
++beforeEach(async () => {
++  await truncateAll();
++});
++
++afterAll(async () => {
++  await closeTestDb();
++});
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++const KEY = () => `chave-${crypto.randomUUID()}`;
++const INPUT = {
++  category: "entendimento" as const,
++  title: "Título",
++  content: "Conteúdo da partilha.",
++};
++
++async function eventsOf(type: string) {
++  const db = await getTestDb();
++  return db.select().from(outbox).where(eq(outbox.eventType, type));
++}
++
++describe("createPostService", () => {
++  it("cria o post, devolve-o no formato público e regista o evento", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const result = await createPostService({ db }, user.id, INPUT, KEY());
++
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.data.status).toBe("published");
++    expect(result.data.replayed).toBe(false);
++    expect(result.data.post).toMatchObject({
++      title: "Título",
++      isMine: true,
++      isLiked: false,
++      author: { username: user.username },
++    });
++    expect("authorId" in result.data.post).toBe(false);
++    expect(await eventsOf("post.created")).toHaveLength(1);
++  });
++
++  it("mesma chave e mesmo corpo repete a resposta sem criar outro post", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const key = KEY();
++    const first = await createPostService({ db }, user.id, INPUT, key);
++    const second = await createPostService({ db }, user.id, INPUT, key);
++
++    expect(first.ok && second.ok).toBe(true);
++    if (!first.ok || !second.ok) return;
++    expect(second.data.post.id).toBe(first.data.post.id);
++    expect(second.data.replayed).toBe(true);
++    expect(await db.select().from(posts)).toHaveLength(1);
++    expect(await eventsOf("post.created")).toHaveLength(1);
++  });
++
++  it("mesma chave com OUTRO corpo é um conflito (409), não uma repetição", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const key = KEY();
++    await createPostService({ db }, user.id, INPUT, key);
++    const result = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, title: "Outro título" },
++      key,
++    );
++    expect(result.ok).toBe(false);
++    if (result.ok) return;
++    expect(result.error).toEqual({
++      code: "idempotency_key_conflict",
++      status: 409,
++    });
++    expect(await db.select().from(posts)).toHaveLength(1);
++  });
++
++  it("dois pedidos CONCORRENTES com a mesma chave criam um só post", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const key = KEY();
++    const [a, b] = await Promise.all([
++      createPostService({ db }, user.id, INPUT, key),
++      createPostService({ db }, user.id, INPUT, key),
++    ]);
++
++    expect(a.ok && b.ok).toBe(true);
++    if (!a.ok || !b.ok) return;
++    expect(a.data.post.id).toBe(b.data.post.id);
++    expect([a.data.replayed, b.data.replayed].sort()).toEqual([false, true]);
++    expect(await db.select().from(posts)).toHaveLength(1);
++  });
++
++  it("a chave é por utilizador", async () => {
++    const db = await getTestDb();
++    const a = await makeUser();
++    const b = await makeUser();
++    const key = KEY();
++    const first = await createPostService({ db }, a.id, INPUT, key);
++    const second = await createPostService({ db }, b.id, INPUT, key);
++    expect(first.ok && second.ok).toBe(true);
++    expect(await db.select().from(posts)).toHaveLength(2);
++  });
++
++  it("link ou contacto são rejeitados e não gastam a chave", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const key = KEY();
++    const link = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, content: "veja igreja.org" },
++      key,
++    );
++    expect(link.ok).toBe(false);
++    if (!link.ok) expect(link.error.code).toBe("contains_link");
++
++    const contact = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, content: "ligue 912345678" },
++      key,
++    );
++    expect(contact.ok).toBe(false);
++    if (!contact.ok) expect(contact.error.code).toBe("contains_contact");
++
++    expect(await db.select().from(idempotencyKeys)).toHaveLength(0);
++    // Corrigido, a mesma chave serve.
++    const fixed = await createPostService({ db }, user.id, INPUT, key);
++    expect(fixed.ok).toBe(true);
++  });
++
++  it("sinais de spam vão para pending_review e ficam registados", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const result = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, content: "ganhe dinheiro rápido com o nosso sorteio" },
++      KEY(),
++    );
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.data.status).toBe("pending_review");
++    const [row] = await db
++      .select()
++      .from(posts)
++      .where(eq(posts.id, result.data.post.id));
++    expect(row?.status).toBe("pending_review");
++    expect(row?.publishedAt).toBeNull();
++    expect(row?.reviewFlags).toEqual(["keywords"]);
++  });
++
++  it("conta nova NÃO vai para revisão só por ser nova (ADR-013)", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const result = await createPostService({ db }, user.id, INPUT, KEY());
++    expect(result.ok && result.data.status).toBe("published");
++  });
++
++  it("gospelCardSlug inexistente → 400; existente liga o card", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    const missing = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, gospelCardSlug: "nao-existe" },
++      KEY(),
++    );
++    expect(missing.ok).toBe(false);
++    if (!missing.ok) expect(missing.error.code).toBe("gospel_card_not_found");
++
++    await cardsRepo(db).create({
++      slug: "natividade",
++      title: "Natividade",
++      gospelReference: "Mateus 2",
++      summary: "Resumo.",
++      otReferences: [],
++      ntReferences: [],
++      orderIndex: 1,
++    });
++    const ok = await createPostService(
++      { db },
++      user.id,
++      { ...INPUT, gospelCardSlug: "natividade" },
++      KEY(),
++    );
++    expect(ok.ok && ok.data.post.gospelCardSlug).toBe("natividade");
++  });
++
++  it("é atómico: se a transacção de fora desfaz, não fica post, chave nem evento", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    await expect(
++      db.transaction(async (tx) => {
++        const result = await createPostService(
++          { db: tx },
++          user.id,
++          INPUT,
++          KEY(),
++        );
++        expect(result.ok).toBe(true);
++        throw new Error("desfazer");
++      }),
++    ).rejects.toThrow("desfazer");
++    expect(await db.select().from(posts)).toHaveLength(0);
++    expect(await db.select().from(idempotencyKeys)).toHaveLength(0);
++    expect(await db.select().from(outbox)).toHaveLength(0);
++  });
++});
++
++describe("conta em apagamento", () => {
++  it("não pode criar, apagar, curtir, descurtir, denunciar nem retirar denúncia", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const leaver = await makeUser({ deletionRequestedAt: new Date() });
++    const deps = { db };
++
++    const results = await Promise.all([
++      createPostService(deps, leaver.id, INPUT, KEY()),
++      deletePostService(deps, leaver.id, post.id),
++      likePostService(deps, leaver.id, post.id),
++      unlikePostService(deps, leaver.id, post.id),
++      reportPostService(deps, leaver.id, post.id, "spam", undefined),
++      unreportPostService(deps, leaver.id, post.id),
++    ]);
++    for (const result of results) {
++      expect(result.ok).toBe(false);
++      if (!result.ok) {
++        expect(result.error).toEqual({ code: "account_inactive", status: 403 });
++      }
++    }
++    expect(await db.select().from(reports)).toHaveLength(0);
++  });
++});
++
++describe("deletePostService", () => {
++  it("apaga (soft), é idempotente e não confirma posts alheios", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const other = await makeUser();
++    const post = await makePost(author.id);
++    const deps = { db };
++
++    const foreign = await deletePostService(deps, other.id, post.id);
++    expect(foreign).toEqual({
++      ok: false,
++      error: { code: "not_found", status: 404 },
++    });
++
++    const first = await deletePostService(deps, author.id, post.id);
++    expect(first).toEqual({ ok: true, data: { deleted: true, changed: true } });
++    const again = await deletePostService(deps, author.id, post.id);
++    expect(again).toEqual({
++      ok: true,
++      data: { deleted: true, changed: false },
++    });
++
++    const [row] = await db.select().from(posts).where(eq(posts.id, post.id));
++    expect(row?.deletedAt).toBeInstanceOf(Date);
++    expect(await eventsOf("post.deleted")).toHaveLength(1);
++
++    const missing = await deletePostService(
++      deps,
++      author.id,
++      crypto.randomUUID(),
++    );
++    expect(missing.ok).toBe(false);
++  });
++
++  it("um post apagado deixa de aceitar likes e denúncias", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const post = await makePost(author.id);
++    await deletePostService({ db }, author.id, post.id);
++
++    const like = await likePostService({ db }, viewer.id, post.id);
++    expect(like.ok).toBe(false);
++    const report = await reportPostService(
++      { db },
++      viewer.id,
++      post.id,
++      "spam",
++      undefined,
++    );
++    expect(report.ok).toBe(false);
++    if (!report.ok) expect(report.error.code).toBe("not_found");
++  });
++});
++
++describe("likes", () => {
++  it("curtir e descurtir mantêm o contador certo e são idempotentes", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const post = await makePost(author.id);
++    const deps = { db };
++
++    const first = await likePostService(deps, viewer.id, post.id);
++    expect(first).toEqual({
++      ok: true,
++      data: { likesCount: 1, isLiked: true, changed: true },
++    });
++    const again = await likePostService(deps, viewer.id, post.id);
++    expect(again).toEqual({
++      ok: true,
++      data: { likesCount: 1, isLiked: true, changed: false },
++    });
++    expect(await eventsOf("post.liked")).toHaveLength(1);
++
++    const off = await unlikePostService(deps, viewer.id, post.id);
++    expect(off).toEqual({
++      ok: true,
++      data: { likesCount: 0, isLiked: false, changed: true },
++    });
++    const offAgain = await unlikePostService(deps, viewer.id, post.id);
++    expect(offAgain).toEqual({
++      ok: true,
++      data: { likesCount: 0, isLiked: false, changed: false },
++    });
++  });
++
++  it("likes concorrentes de utilizadores diferentes somam todos", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    const viewers = await Promise.all([1, 2, 3, 4, 5].map(() => makeUser()));
++    await Promise.all(
++      viewers.map((v) => likePostService({ db }, v.id, post.id)),
++    );
++    const [row] = await db.select().from(posts).where(eq(posts.id, post.id));
++    expect(row?.likesCount).toBe(5);
++  });
++
++  it("só se curte um post publicado; descurtir permite-se noutros estados", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const viewer = await makeUser();
++    const hidden = await makePost(author.id, { status: "hidden" });
++    await makeLike(hidden.id, viewer.id);
++
++    const like = await likePostService({ db }, viewer.id, hidden.id);
++    expect(like.ok).toBe(false);
++    const unlike = await unlikePostService({ db }, viewer.id, hidden.id);
++    expect(unlike.ok).toBe(true);
++  });
++});
++
++describe("denúncias", () => {
++  it("«other» exige motivo", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    const result = await reportPostService(
++      { db },
++      reporter.id,
++      post.id,
++      "other",
++      "  ",
++    );
++    expect(result.ok).toBe(false);
++    if (!result.ok) expect(result.error.code).toBe("reason_required");
++  });
++
++  it("cria, repete (duplicate) e recusa o próprio post", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const post = await makePost(author.id);
++    const deps = { db };
++
++    const own = await reportPostService(
++      deps,
++      author.id,
++      post.id,
++      "spam",
++      undefined,
++    );
++    expect(own.ok).toBe(false);
++    if (!own.ok) expect(own.error.code).toBe("own_post");
++
++    const first = await reportPostService(
++      deps,
++      reporter.id,
++      post.id,
++      "spam",
++      undefined,
++    );
++    expect(first).toEqual({
++      ok: true,
++      data: { outcome: "created", changed: true },
++    });
++    const second = await reportPostService(
++      deps,
++      reporter.id,
++      post.id,
++      "spam",
++      undefined,
++    );
++    expect(second).toEqual({
++      ok: true,
++      data: { outcome: "duplicate", changed: false },
++    });
++    expect(await eventsOf("post.reported")).toHaveLength(1);
++  });
++
++  it("3 denúncias válidas de doutrina escalam o post e geram o evento", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++
++    for (let i = 0; i < 3; i++) {
++      const reporter = await makeUser({
++        createdAt: new Date(Date.now() - (REPORTER_MIN_AGE_DAYS + 1) * DAY_MS),
++      });
++      await makePost(reporter.id);
++      const result = await reportPostService(
++        { db },
++        reporter.id,
++        post.id,
++        "doctrine",
++        undefined,
++      );
++      expect(result.ok).toBe(true);
++    }
++
++    const [row] = await db.select().from(posts).where(eq(posts.id, post.id));
++    expect(row?.status).toBe("pending_review");
++    expect(row?.reviewFlags).toEqual(["reports_high"]);
++    const escalated = await eventsOf("post.escalated");
++    expect(escalated).toHaveLength(1);
++    expect(escalated[0]?.payload).toEqual({
++      postId: post.id,
++      severity: "high",
++    });
++  });
++
++  it("retirar a denúncia é idempotente; sem denúncia é not_found", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser();
++    const stranger = await makeUser();
++    const post = await makePost(author.id);
++    const deps = { db };
++    await reportPostService(deps, reporter.id, post.id, "spam", undefined);
++
++    const first = await unreportPostService(deps, reporter.id, post.id);
++    expect(first).toEqual({
++      ok: true,
++      data: { withdrawn: true, changed: true },
++    });
++    const again = await unreportPostService(deps, reporter.id, post.id);
++    expect(again).toEqual({
++      ok: true,
++      data: { withdrawn: true, changed: false },
++    });
++
++    const never = await unreportPostService(deps, stranger.id, post.id);
++    expect(never.ok).toBe(false);
++    if (!never.ok) expect(never.error.code).toBe("not_found");
++
++    // Retirada fica registada, não apagada, e o contador desceu.
++    const rows = await db.select().from(reports);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]?.status).toBe("withdrawn");
++    const [row] = await db.select().from(posts).where(eq(posts.id, post.id));
++    expect(row?.reportsCount).toBe(0);
++  });
++});
+diff --git a/docs/registos/E4b-servicos-posts.md b/docs/registos/E4b-servicos-posts.md
+new file mode 100644
+index 0000000..db2db34
+--- /dev/null
++++ b/docs/registos/E4b-servicos-posts.md
+@@ -0,0 +1,81 @@
++# E4-b — Repositórios e serviços de posts
++
++Data: 2026-11-14 · Segue o E4-a. Continua a **não haver merge** da branch do E4: os serviços e
++repositórios do E4 foram reescritos sobre o `dev` (F1–F8 + E4-a), corrigindo os achados da revisão.
++
++Este bloco é só a camada de dados e de regras. **Rotas, cache do feed e `/sync` ficam para o E4-c.**
++
++## 1. Check — o que a revisão encontrou e este bloco resolve
++
++| #   | Problema no E4                                                                                       | Gravidade |
++| --- | ---------------------------------------------------------------------------------------------------- | --------- |
++| 1   | Idempotência `get` → criar → `set`: dois pedidos concorrentes com a mesma chave criavam 2 posts      | Crítica   |
++| 2   | Mesma chave com outro corpo repetia a resposta antiga em silêncio (sem comparar o pedido)            | Alta      |
++| 3   | Caminho REST sem transacção: post + chave + outbox, e like + contador, não eram atómicos             | Crítica   |
++| 4   | `presentOne(post, db)` usava o pool com uma transacção aberta: 2 ligações por pedido (esgota o pool) | Alta      |
++| 5   | Apagar post era hard delete: o autor destruía a evidência de um post denunciado                      | Alta      |
++| 6   | Cursor por `createdAt` em ms: saltava linhas; cursor inválido → `Invalid Date` → 500                 | Média     |
++| 7   | `top` e `liked` sem paginação; `liked` truncado em silêncio nos 500                                  | Média     |
++| 8   | Apresentação devolvia `authorId` mesmo com autor apagado, em apagamento ou post anónimo (anulava F5) | Alta      |
++| 9   | Presenter carregava a tabela de cards inteira por chamada                                            | Média     |
++| 10  | Segundo apagar/retirar denúncia dava 404 (no `/sync`, «rejected» para algo já aplicado)              | Média     |
++| 11  | `setStatus` não preenchia `publishedAt` ao aprovar um post em revisão                                | Média     |
++| 12  | Contas em apagamento mantinham acesso de escrita até o token expirar (15 min)                        | Alta      |
++| 13  | O motivo de um post estar em revisão não ficava registado                                            | Média     |
++
++## 2. Decisões
++
++| Tema                       | Escolha                                                                                        |
++| -------------------------- | ---------------------------------------------------------------------------------------------- |
++| Retenção de posts apagados | 30 dias, configurável (`POSTS_DELETED_RETENTION_DAYS`); depois eliminação de vez (job)         |
++| Contas em apagamento (D6)  | Consulta à BD a cada escrita (por chave primária); bloqueio imediato; leituras não pagam custo |
++| Idempotência               | Reserva da chave antes do trabalho, na mesma transacção; hash do pedido; conflito → 409        |
++| Atomicidade                | Cada serviço corre numa transacção (savepoint se já houver uma): tudo ou nada                  |
++| Apagar de outro utilizador | `not_found` (não se confirma a existência de posts alheios)                                    |
++
++## 3. Alterações
++
++- `repositories/posts.ts` (reescrito sobre o do `dev`): `softDelete`, `purgeDeleted` (em lotes),
++  `findById` sem apagados por defeito (`includeDeleted`), `list` com cursor composto opaco para
++  `recent`/`top`/`liked` (timestamp exacto em microssegundos), `InvalidCursorError`,
++  `setStatus` com `publishedAt`, `listLikedPostIds` com `truncated`. Todas as leituras excluem apagados.
++- `repositories/outbox.ts`: `idempotencyKeysRepo.reserve` (reaproveita chaves expiradas) e `complete`;
++  `Executor` em vez de `Database`.
++- `repositories/{users,cards,reports}.ts`: `Executor`; `usersRepo.findManyByIds`, `cardsRepo.findByIds`,
++  `reportsRepo.findByPostAndReporter`.
++- `services/posts.ts` (novo): criar, apagar, curtir/descurtir, denunciar, retirar denúncia. Devolvem
++  `changed` (ou `replayed`) para o `/sync` distinguir `applied` de `duplicate`. Eventos no outbox:
++  `post.created/deleted/liked/unliked/reported/escalated`.
++- `services/post-presenter.ts` (novo): 3 consultas por página; `author: null` para conta apagada, em
++  apagamento ou post anónimo; nunca devolve `authorId`; `isMine`/`isLiked` por espectador.
++- `maintenance.ts` + `env.ts` + `.env.example`: purga dos posts apagados há mais de
++  `POSTS_DELETED_RETENTION_DAYS` (até 20 lotes de 500 por execução).
++
++## 4. Segurança e privacidade
++
++- Evidência preservada: apagar não destrói denúncias nem likes durante a retenção; depois, tudo
++  desaparece por cascata (direito a apagar respeitado, com prazo definido).
++- O texto de um post apagado fica guardado até 30 dias. Quem não precisar de evidência pode baixar o prazo.
++- Nenhuma resposta contém o identificador interno do autor.
++- Chaves de idempotência são por utilizador: ninguém repete (nem adivinha) a de outro.
++- Escritas bloqueadas imediatamente a contas em apagamento.
++
++## 5. Testes
++
++- Novos: `test/services/posts.test.ts` (idempotência, concorrência, atomicidade, conflito, filtro,
++  conta em apagamento, soft delete, likes, denúncias e escalada, retirada), `test/services/post-presenter.test.ts`
++  (anonimização, `isMine`/`isLiked`, cards), `test/repositories/idempotency.test.ts` (reserva, concorrência,
++  expiração, rollback).
++- Alargados: `test/repositories/posts.test.ts` (soft delete, purga, cursor a microssegundos e com empates,
++  `top`/`liked`, `publishedAt`), `test/maintenance.test.ts` (purga e prazo configurável).
++
++## 6. Operação
++
++- Variável nova (com default): `POSTS_DELETED_RETENTION_DAYS=30`.
++- Sem migrações novas (o schema veio no E4-a).
++
++## 7. Pendente
++
++- E4-c: rotas (`/posts`, likes, denúncias com erros no formato único, `GET /posts/:id` só com
++  visibilidade), cache do feed versionada, `/sync` com limites por operação e registo no `server.ts`.
++- E4-d: ADR-012/006, `api.md`, `arquitectura.md`, spec do filtro.
+diff --git a/docs/registos/README.md b/docs/registos/README.md

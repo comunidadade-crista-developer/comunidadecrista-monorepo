@@ -1,9 +1,9 @@
 import { asc, eq, inArray } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import type { Executor } from "../db/client.js";
 import { gospelCards } from "../db/schema.js";
 import type { GospelCard, NewGospelCard } from "../db/schema.js";
 
-export function cardsRepo(db: Database) {
+export function cardsRepo(db: Executor) {
   return {
     async list(): Promise<GospelCard[]> {
       return db.select().from(gospelCards).orderBy(asc(gospelCards.orderIndex));
@@ -16,6 +16,11 @@ export function cardsRepo(db: Database) {
         .where(eq(gospelCards.slug, slug))
         .limit(1);
       return row ?? null;
+    },
+
+    async findByIds(ids: string[]): Promise<GospelCard[]> {
+      if (ids.length === 0) return [];
+      return db.select().from(gospelCards).where(inArray(gospelCards.id, ids));
     },
 
     async findBySlugs(slugs: string[]): Promise<GospelCard[]> {

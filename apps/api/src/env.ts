@@ -48,6 +48,14 @@ const BaseEnvSchema = z.object({
     .max(365)
     .default(30),
   MAINTENANCE_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
+  // Dias que uma partilha apagada pelo autor se conserva (com denúncias e likes, como
+  // evidência para a moderação) antes de ser eliminada de vez.
+  POSTS_DELETED_RETENTION_DAYS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .default(30),
 
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),

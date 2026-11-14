@@ -1,5 +1,5 @@
-import { and, eq, isNull, lt } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import { and, eq, inArray, isNull, lt } from "drizzle-orm";
+import type { Database, Executor } from "../db/client.js";
 import { refreshTokens, users } from "../db/schema.js";
 import type {
   NewRefreshToken,
@@ -14,7 +14,7 @@ export type RotateResult =
   | { status: "reuse_detected"; familyId: string }
   | { status: "expired" };
 
-export function usersRepo(db: Database) {
+export function usersRepo(db: Executor) {
   return {
     async findById(id: string): Promise<User | null> {
       const [row] = await db
@@ -23,6 +23,15 @@ export function usersRepo(db: Database) {
         .where(and(eq(users.id, id), isNull(users.deletedAt)))
         .limit(1);
       return row ?? null;
+    },
+
+    /**
+     * Vários utilizadores de uma vez (apresentação de listas). Inclui contas apagadas ou em
+     * apagamento: quem apresenta decide como as mostrar (anónimas).
+     */
+    async findManyByIds(ids: string[]): Promise<User[]> {
+      if (ids.length === 0) return [];
+      return db.select().from(users).where(inArray(users.id, ids));
     },
 
     async findByUsername(username: string): Promise<User | null> {

@@ -1,11 +1,14 @@
-import { and, eq, gt, lt, sql } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import { and, eq, gt, lt, lte, sql } from "drizzle-orm";
+import type { Executor } from "../db/client.js";
 import { idempotencyKeys, outbox } from "../db/schema.js";
 import type {
   IdempotencyKey,
   NewOutboxEvent,
   OutboxEvent,
 } from "../db/schema.js";
+
+/** Quanto tempo uma chave de idempotência vale (o cliente pode repetir durante este prazo). */
+export const IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 type OutboxRow = {
   id: string;
@@ -35,7 +38,7 @@ function toOutboxEvent(row: OutboxRow): OutboxEvent {
   };
 }
 
-export function outboxRepo(db: Database) {
+export function outboxRepo(db: Executor) {
   return {
     async enqueue(data: NewOutboxEvent): Promise<OutboxEvent> {
       const [row] = await db.insert(outbox).values(data).returning();
@@ -99,7 +102,7 @@ export function outboxRepo(db: Database) {
   };
 }
 
-export function idempotencyKeysRepo(db: Database) {
+export function idempotencyKeysRepo(db: Executor) {
   return {
     /** Só devolve chaves do próprio utilizador e ainda não expiradas. */
     async get(userId: string, key: string): Promise<IdempotencyKey | null> {
@@ -117,12 +120,68 @@ export function idempotencyKeysRepo(db: Database) {
       return row ?? null;
     },
 
+    /**
+     * Reserva a chave ANTES de fazer o trabalho (dentro da mesma transacção que o faz).
+     * `reserved`: a chave é nossa. `exists`: já havia uma chave viva (de um pedido anterior
+     * ou de um pedido concorrente que entretanto fez commit — o INSERT espera por ele).
+     * Uma chave expirada é reaproveitada.
+     */
+    async reserve(args: {
+      userId: string;
+      key: string;
+      operation: string;
+      requestHash: string;
+      ttlMs?: number;
+    }): Promise<"reserved" | "exists"> {
+      const now = new Date();
+      const expiresAt = new Date(
+        now.getTime() + (args.ttlMs ?? IDEMPOTENCY_TTL_MS),
+      );
+      const rows = await db
+        .insert(idempotencyKeys)
+        .values({
+          key: args.key,
+          userId: args.userId,
+          operation: args.operation,
+          requestHash: args.requestHash,
+          response: {},
+          expiresAt,
+        })
+        .onConflictDoUpdate({
+          target: [idempotencyKeys.userId, idempotencyKeys.key],
+          set: {
+            operation: args.operation,
+            requestHash: args.requestHash,
+            response: {},
+            createdAt: now,
+            expiresAt,
+          },
+          setWhere: lte(idempotencyKeys.expiresAt, now),
+        })
+        .returning({ key: idempotencyKeys.key });
+      return rows.length > 0 ? "reserved" : "exists";
+    },
+
+    /** Guarda a resposta na chave reservada (na mesma transacção que a reservou). */
+    async complete(
+      userId: string,
+      key: string,
+      response: Record<string, unknown>,
+    ): Promise<void> {
+      await db
+        .update(idempotencyKeys)
+        .set({ response })
+        .where(
+          and(eq(idempotencyKeys.userId, userId), eq(idempotencyKeys.key, key)),
+        );
+    },
+
     async set(
       key: string,
       userId: string,
       operation: string,
       response: Record<string, unknown>,
-      ttlMs = 7 * 24 * 60 * 60 * 1000,
+      ttlMs = IDEMPOTENCY_TTL_MS,
     ): Promise<void> {
       const expiresAt = new Date(Date.now() + ttlMs);
       await db

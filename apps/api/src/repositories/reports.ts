@@ -1,6 +1,6 @@
 import { and, count, desc, eq, lte, sql } from "drizzle-orm";
 import type { ReportCategory, ReportSeverity } from "@comunidade/shared";
-import type { Database } from "../db/client.js";
+import type { DbTransaction, Executor } from "../db/client.js";   
 import { moderationLog, posts, reports, users } from "../db/schema.js";
 import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
 
@@ -18,7 +18,7 @@ const SEVERITIES_BY_GRAVITY: readonly ReportSeverity[] = [
   "basic",
 ];
 
-type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type Tx = DbTransaction;   
 
 export interface ReportRules {
   /** Limiares por gravidade (os que faltarem usam `REPORT_THRESHOLDS`). */
@@ -89,7 +89,7 @@ async function countValidOpenBySeverity(
   return bySeverity;
 }
 
-export function reportsRepo(db: Database) {
+export function reportsRepo(db: Executor) {   
   return {
     async create(data: NewReport): Promise<Report | null> {
       const result = await db
@@ -98,6 +98,20 @@ export function reportsRepo(db: Database) {
         .onConflictDoNothing()
         .returning();
       return result[0] ?? null;
+    },
+
+    async findByPostAndReporter(
+      postId: string,
+      reporterId: string,
+    ): Promise<Report | null> {
+      const [row] = await db
+        .select()
+        .from(reports)
+        .where(
+          and(eq(reports.postId, postId), eq(reports.reporterId, reporterId)),
+        )
+        .limit(1);
+      return row ?? null;
     },
 
     async findOpenByPostAndReporter(
@@ -287,7 +301,7 @@ export function reportsRepo(db: Database) {
   };
 }
 
-export function moderationLogRepo(db: Database) {
+export function moderationLogRepo(db: Executor) {   
   return {
     async create(
       data: typeof moderationLog.$inferInsert,
