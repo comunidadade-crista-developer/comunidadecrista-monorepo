@@ -68,9 +68,24 @@ export const SyncOperation = z.discriminatedUnion("type", [
 export type SyncOperation = z.infer<typeof SyncOperation>;
 export type SyncOperationType = SyncOperation["type"];
 
-export const SyncRequest = z.object({
-  operations: z.array(SyncOperation).min(1).max(MAX_SYNC_BATCH_OPS),
-});
+export const SyncRequest = z
+  .object({
+    operations: z.array(SyncOperation).min(1).max(MAX_SYNC_BATCH_OPS),
+  })
+  .superRefine((req, ctx) => {
+    // Os resultados vêm indexados por `op_id`: um repetido tornaria a resposta ambígua.
+    const seen = new Set<string>();
+    req.operations.forEach((op, i) => {
+      if (seen.has(op.op_id)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["operations", i, "op_id"],
+          message: "op_id repetido no mesmo lote",
+        });
+      }
+      seen.add(op.op_id);
+    });
+  });
 export type SyncRequest = z.infer<typeof SyncRequest>;
 
 export const SyncStatus = z.enum([
@@ -153,16 +168,26 @@ export const SyncBootstrapResponse = z.object({
     nextCursor: z.string().nullable(),
   }),
   myPosts: z.array(PostPublic),
+  /** Havia mais partilhas do que as devolvidas: o cliente não deve assumir que a lista é completa. */
+  myPostsTruncated: z.boolean(),
   myLikedPostIds: z.array(z.uuid()),
+  myLikedPostIdsTruncated: z.boolean(),
   myReports: z.array(
     z.object({
       id: z.uuid(),
       postId: z.uuid(),
       category: ReportCategory,
       reason: z.string().nullable(),
-      status: z.enum(["open", "resolved_kept", "resolved_removed"]),
+      status: z.enum([
+        "open",
+        "resolved_kept",
+        "resolved_removed",
+        /** O próprio utilizador retirou a denúncia (continua a contar como «já denunciou»). */
+        "withdrawn",
+      ]),
       createdAt: z.iso.datetime(),
     }),
   ),
+  myReportsTruncated: z.boolean(),
 });
 export type SyncBootstrapResponse = z.infer<typeof SyncBootstrapResponse>;

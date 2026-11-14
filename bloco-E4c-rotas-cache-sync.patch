@@ -1,0 +1,2861 @@
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index b23299a..bab2ee2 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -77,6 +77,13 @@ RATE_LIMIT_REPORTS_WINDOW_S=3600
+ # Pedidos /sync por utilizador (até 20 operações cada)
+ RATE_LIMIT_SYNC_MAX=60
+ RATE_LIMIT_SYNC_WINDOW_S=3600
++# Tempo máximo de um lote /sync (ms); o que não chega a correr volta como "deferred"
++SYNC_BATCH_TIMEOUT_MS=8000
++# Validade (s) da primeira página do feed em cache
++FEED_CACHE_TTL_S=30
++# Worker do outbox: intervalo entre rondas (ms) e eventos por ronda
++OUTBOX_WORKER_INTERVAL_MS=5000
++OUTBOX_WORKER_BATCH_SIZE=50
+ 
+ # Recuperação por perguntas de segurança só produz efeito após este atraso (horas)
+ RECOVERY_QUESTIONS_DELAY_HOURS=24
+diff --git a/apps/api/src/auth/middleware.ts b/apps/api/src/auth/middleware.ts
+index 1daf8f5..5e563a5 100644
+--- a/apps/api/src/auth/middleware.ts
++++ b/apps/api/src/auth/middleware.ts
+@@ -25,6 +25,27 @@ export function requireAuth(jwt: JwtService): preHandlerAsyncHookHandler {
+   };
+ }
+ 
++/**
++ * Leitura pública com utilizador opcional: sem cabeçalho `Authorization` o pedido segue como
++ * anónimo; com cabeçalho, o token TEM de ser válido (senão 401). Assim o cliente com o token
++ * expirado renova-o em vez de receber, em silêncio, um feed sem os seus likes.
++ */
++export function optionalAuth(jwt: JwtService): preHandlerAsyncHookHandler {
++  return async (request, reply) => {
++    const auth = request.headers.authorization;
++    if (auth === undefined) return;
++    if (!auth.startsWith("Bearer ")) {
++      return reply.code(401).send({ error: "invalid_token" });
++    }
++    try {
++      const payload = await jwt.verifyAccessToken(auth.slice(7).trim());
++      request.user = { id: payload.sub, role: payload.role };
++    } catch {
++      return reply.code(401).send({ error: "invalid_token" });
++    }
++  };
++}
++
+ export function requireAdmin(db: Database): preHandlerAsyncHookHandler {
+   return async (request, reply) => {
+     if (!request.user) {
+diff --git a/apps/api/src/cache/feed-cache.ts b/apps/api/src/cache/feed-cache.ts
+new file mode 100644
+index 0000000..dfa0076
+--- /dev/null
++++ b/apps/api/src/cache/feed-cache.ts
+@@ -0,0 +1,201 @@
++import { PostPublic } from "@comunidade/shared";
++import type { PostCategory } from "@comunidade/shared";
++import type { Redis } from "ioredis";
++import { z } from "zod";
++import type { Executor } from "../db/client.js";
++import { postsRepo } from "../repositories/posts.js";
++import { presentPosts } from "../services/post-presenter.js";
++
++/**
++ * Cache do feed público (D7). Só guarda a PRIMEIRA página (sem cursor) de `recent` e `top`:
++ * é o que quase todos os visitantes pedem. As páginas seguintes vão sempre à base de dados
++ * (o cursor é validado antes e o rate limit protege a rota).
++ *
++ * Chaves versionadas, como os cards: `cc:v1:feed:v<N>:<filtro>:<categoria>:<card>:<limite>`.
++ * Invalidar = `INCR` da versão (O(1), sem `SCAN` nem `DEL` em massa): as chaves antigas
++ * deixam de ser lidas e expiram sozinhas pelo TTL. A versão lê-se do Redis em cada pedido
++ * (1 `GET`), por isso todas as instâncias vêem a invalidação de imediato.
++ *
++ * O valor guardado é a página «anónima» (`isLiked: false`, `isMine: false`) mais o `authorIds`
++ * em paralelo, que NUNCA sai da API: serve só para marcar `isMine` por espectador sem outra
++ * consulta. Os likes do espectador juntam-se depois (uma consulta por página).
++ *
++ * Os likes não invalidam (D7): o contador do feed público atrasa-se, no máximo, `ttlSeconds`.
++ * Publicar, apagar e escalar (post sai do feed) invalidam.
++ *
++ * Falhas do Redis nunca partem um pedido: lê-se da base de dados. Dados lidos do Redis são
++ * validados com zod; se não passarem, ignoram-se. Os erros registados só levam nome/código
++ * (os do ioredis trazem host e porta na mensagem).
++ */
++
++const NAMESPACE = "cc:v1:feed";
++const VERSION_KEY = `${NAMESPACE}:version`;
++const DEFAULT_TTL_SECONDS = 30;
++
++type RedisLike = Pick<Redis, "get" | "set" | "incr">;
++
++export interface FeedCacheLogger {
++  warn(obj: Record<string, unknown>, msg: string): void;
++}
++
++export interface FeedListOptions {
++  filter: "recent" | "top";
++  category?: PostCategory | undefined;
++  gospelCardId?: string | undefined;
++  /** Cursor já validado pela rota. Com cursor, a página nunca passa pela cache. */
++  cursor?: string | undefined;
++  limit: number;
++}
++
++export interface FeedPage {
++  /** Formato público, SEM decoração do espectador (`isLiked`/`isMine` a `false`). */
++  posts: PostPublic[];
++  /** Autor de cada post, na mesma ordem. Interno: nunca serializar para o cliente. */
++  authorIds: (string | null)[];
++  nextCursor: string | null;
++}
++
++export interface FeedCache {
++  list(opts: FeedListOptions): Promise<FeedPage & { cacheHit: boolean }>;
++  /**
++   * Passa a usar uma nova versão das chaves. Nunca lança: com a escrita já confirmada na base
++   * de dados, uma falha aqui deixa a cache desactualizada no máximo `ttlSeconds` — não pode
++   * transformar uma escrita bem-sucedida num erro. Devolve se a invalidação foi feita.
++   */
++  invalidate(): Promise<boolean>;
++}
++
++export interface FeedCacheDeps {
++  redis: RedisLike | null;
++  db: Executor;
++  logger: FeedCacheLogger;
++  ttlSeconds?: number;
++}
++
++const CachedPage = z
++  .object({
++    posts: z.array(PostPublic),
++    authorIds: z.array(z.uuid().nullable()),
++    nextCursor: z.string().nullable(),
++  })
++  .refine((v) => v.posts.length === v.authorIds.length);
++
++function errorInfo(err: unknown): Record<string, unknown> {
++  return {
++    errorName: err instanceof Error ? err.name : typeof err,
++    errorCode:
++      typeof err === "object" &&
++      err !== null &&
++      "code" in err &&
++      typeof (err as { code: unknown }).code === "string"
++        ? (err as { code: string }).code
++        : undefined,
++  };
++}
++
++export function createFeedCache(deps: FeedCacheDeps): FeedCache {
++  const { redis, db, logger } = deps;
++  const ttl = deps.ttlSeconds ?? DEFAULT_TTL_SECONDS;
++  const inflight = new Map<string, Promise<FeedPage>>();
++
++  async function loadFromDb(opts: FeedListOptions): Promise<FeedPage> {
++    const result = await postsRepo(db).list({
++      filter: opts.filter,
++      limit: opts.limit,
++      ...(opts.category ? { category: opts.category } : {}),
++      ...(opts.gospelCardId ? { gospelCardId: opts.gospelCardId } : {}),
++      ...(opts.cursor ? { cursor: opts.cursor } : {}),
++    });
++    return {
++      posts: await presentPosts(result.items, db),
++      authorIds: result.items.map((p) => p.authorId),
++      nextCursor: result.nextCursor,
++    };
++  }
++
++  /** `null` = sem Redis ou Redis a falhar: a cache fica de lado neste pedido. */
++  async function readVersion(): Promise<number | null> {
++    if (!redis) return null;
++    try {
++      const raw = await redis.get(VERSION_KEY);
++      const parsed = raw === null ? 0 : Number.parseInt(raw, 10);
++      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
++    } catch (err) {
++      logger.warn(errorInfo(err), "feed-cache: version read failed");
++      return null;
++    }
++  }
++
++  async function readPage(key: string): Promise<FeedPage | null> {
++    if (!redis) return null;
++    try {
++      const raw = await redis.get(key);
++      if (raw === null) return null;
++      const parsed = CachedPage.safeParse(JSON.parse(raw));
++      if (!parsed.success) {
++        logger.warn({}, "feed-cache: invalid cached value ignored");
++        return null;
++      }
++      return parsed.data;
++    } catch (err) {
++      logger.warn(errorInfo(err), "feed-cache: read failed");
++      return null;
++    }
++  }
++
++  async function writePage(key: string, page: FeedPage): Promise<void> {
++    if (!redis) return;
++    try {
++      await redis.set(key, JSON.stringify(page), "EX", ttl);
++    } catch (err) {
++      logger.warn(errorInfo(err), "feed-cache: write failed");
++    }
++  }
++
++  return {
++    async list(opts) {
++      // Páginas seguintes: sempre à base de dados.
++      if (opts.cursor !== undefined) {
++        return { ...(await loadFromDb(opts)), cacheHit: false };
++      }
++
++      const version = await readVersion();
++      if (version === null) {
++        return { ...(await loadFromDb(opts)), cacheHit: false };
++      }
++
++      const key =
++        `${NAMESPACE}:v${version}:${opts.filter}:` +
++        `${opts.category ?? "all"}:${opts.gospelCardId ?? "all"}:${opts.limit}`;
++
++      const cached = await readPage(key);
++      if (cached) return { ...cached, cacheHit: true };
++
++      // Anti-stampede: pedidos concorrentes à mesma chave fazem uma só carga.
++      let running = inflight.get(key);
++      if (!running) {
++        const promise: Promise<FeedPage> = (async () => {
++          const page = await loadFromDb(opts);
++          await writePage(key, page);
++          return page;
++        })().finally(() => {
++          if (inflight.get(key) === promise) inflight.delete(key);
++        });
++        inflight.set(key, promise);
++        running = promise;
++      }
++      return { ...(await running), cacheHit: false };
++    },
++
++    async invalidate() {
++      if (!redis) return true;
++      try {
++        await redis.incr(VERSION_KEY);
++        return true;
++      } catch (err) {
++        logger.warn(errorInfo(err), "feed-cache: invalidation failed");
++        return false;
++      }
++    },
++  };
++}
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index 7f7cc0f..765e06b 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -154,6 +154,23 @@ const BaseEnvSchema = z.object({
+   // Pedidos /sync por utilizador (cada um com até 20 operações, já limitadas acima).
+   RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
+   RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
++
++  // Tempo máximo de um lote /sync: as operações que não chegam a correr voltam `deferred`.
++  // Abaixo do timeout típico de proxies/CDN (30 s+) para o cliente receber sempre resposta.
++  SYNC_BATCH_TIMEOUT_MS: z.coerce
++    .number()
++    .int()
++    .min(1000)
++    .max(25_000)
++    .default(8000),
++
++  // Validade da primeira página do feed em cache (segundos). Os likes só aparecem no feed
++  // público ao fim deste prazo; publicar, apagar e escalar invalidam logo.
++  FEED_CACHE_TTL_S: z.coerce.number().int().min(1).max(600).default(30),
++
++  // Worker do outbox (eventos de domínio): intervalo entre rondas e eventos por ronda.
++  OUTBOX_WORKER_INTERVAL_MS: z.coerce.number().int().min(200).default(5000),
++  OUTBOX_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(50),
+ });
+ 
+ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
+diff --git a/apps/api/src/routes/posts.ts b/apps/api/src/routes/posts.ts
+new file mode 100644
+index 0000000..874decf
+--- /dev/null
++++ b/apps/api/src/routes/posts.ts
+@@ -0,0 +1,405 @@
++import {
++  CreatePostRequest,
++  CreatePostResponse,
++  ErrorResponse,
++  IdempotencyKey,
++  LikeResponse,
++  ListPostsQuery,
++  ListPostsResponse,
++  PostPublic,
++  PostIdParams,
++  ReportRequest,
++  ReportResponse,
++} from "@comunidade/shared";
++import type { FastifyInstance, FastifyReply } from "fastify";
++import type { ZodTypeProvider } from "fastify-type-provider-zod";
++import { z } from "zod";
++import type { JwtService } from "../auth/jwt.js";
++import { optionalAuth, requireAuth } from "../auth/middleware.js";
++import type { RateLimitResult, RateLimiters } from "../auth/rate-limit.js";
++import type { FeedCache } from "../cache/feed-cache.js";
++import type { Database } from "../db/client.js";
++import { InvalidCursorError, postsRepo } from "../repositories/posts.js";
++import { usersRepo } from "../repositories/users.js";
++import { decorateForViewer } from "../services/feed-view.js";
++import { presentOne, presentPosts } from "../services/post-presenter.js";
++import {
++  createPostService,
++  deletePostService,
++  likePostService,
++  reportPostService,
++  unlikePostService,
++  unreportPostService,
++  type ServiceError,
++} from "../services/posts.js";
++
++export interface PostsRoutesOptions {
++  db: Database;
++  jwt: JwtService;
++  limiters: RateLimiters;
++  feedCache: FeedCache;
++}
++
++const SinglePostResponse = z.object({ post: PostPublic });
++const DeleteResponse = z.object({ deleted: z.literal(true) });
++const UnreportResponse = z.object({ withdrawn: z.literal(true) });
++const CreateHeaders = z.object({ "idempotency-key": IdempotencyKey });
++
++/**
++ * Envia um erro no formato único. O `reply` das rotas tem tipos por código de resposta; aqui
++ * só interessa o formato `{ error }`, que o `ErrorResponse` de cada rota já declara.
++ */
++function sendError(
++  reply: object,
++  status: number,
++  error: string,
++  retryAfter?: number,
++): FastifyReply {
++  const r = (reply as FastifyReply).code(status);
++  if (retryAfter !== undefined) r.header("Retry-After", String(retryAfter));
++  return r.send({ error });
++}
++
++function tooMany(reply: object, rl: RateLimitResult): FastifyReply {
++  return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
++}
++
++function sendServiceError(reply: object, error: ServiceError): FastifyReply {
++  return sendError(reply, error.status, error.code);
++}
++
++export async function postsRoutes(
++  app: FastifyInstance,
++  { db, jwt, limiters, feedCache }: PostsRoutesOptions,
++): Promise<void> {
++  const f = app.withTypeProvider<ZodTypeProvider>();
++  const posts = postsRepo(db);
++  const users = usersRepo(db);
++  const deps = { db };
++  // `preValidation`: sem sessão válida o pedido é recusado (401) antes de se olhar para o corpo.
++  const authPre = requireAuth(jwt);
++  const maybeAuth = optionalAuth(jwt);
++
++  // ---------- Feed ----------
++
++  f.get(
++    "/posts",
++    {
++      preValidation: maybeAuth,
++      schema: {
++        querystring: ListPostsQuery,
++        response: {
++          200: ListPostsResponse,
++          400: ErrorResponse,
++          401: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const viewerId = request.user?.id;
++      const rl = await limiters.checkReadFeed(request.clientIp, viewerId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const { gospelCardId, category, filter, cursor, limit } = request.query;
++
++      try {
++        // «Curtidos por mim»: lista pessoal, nunca em cache; já vem decorada para o espectador.
++        if (filter === "liked") {
++          if (!viewerId) return sendError(reply, 401, "missing_token");
++          const result = await posts.list({
++            filter: "liked",
++            viewerId,
++            limit,
++            ...(gospelCardId ? { gospelCardId } : {}),
++            ...(category ? { category } : {}),
++            ...(cursor ? { cursor } : {}),
++          });
++          return reply.code(200).send({
++            posts: await presentPosts(result.items, db, viewerId),
++            nextCursor: result.nextCursor,
++          });
++        }
++
++        const page = await feedCache.list({
++          filter,
++          limit,
++          category,
++          gospelCardId,
++          cursor,
++        });
++
++        let items = await decorateForViewer(page, viewerId, db);
++
++        // O autor vê no topo a sua partilha em revisão (ainda não está no feed público). Só na
++        // primeira página: um post em revisão nunca aparece nas páginas públicas, por isso não
++        // há duplicados. Os publicados já vêm no próprio feed (criar invalida a cache).
++        if (viewerId && filter === "recent" && cursor === undefined) {
++          const pending = await posts.findLatestByAuthorInFilter(viewerId, {
++            statuses: ["pending_review"],
++            ...(gospelCardId ? { gospelCardId } : {}),
++            ...(category ? { category } : {}),
++          });
++          if (pending) {
++            items = [await presentOne(pending, db, viewerId), ...items];
++          }
++        }
++
++        return reply
++          .code(200)
++          .send({ posts: items, nextCursor: page.nextCursor });
++      } catch (err) {
++        // A rota já valida o cursor; isto é a rede de segurança.
++        if (err instanceof InvalidCursorError) {
++          return sendError(reply, 400, "validation_error");
++        }
++        throw err;
++      }
++    },
++  );
++
++  // ---------- Um post ----------
++
++  f.get(
++    "/posts/:id",
++    {
++      preValidation: maybeAuth,
++      schema: {
++        params: PostIdParams,
++        response: {
++          200: SinglePostResponse,
++          401: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const viewer = request.user;
++      const rl = await limiters.checkReadFeed(request.clientIp, viewer?.id);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      // `findById` nunca devolve posts apagados pelo autor.
++      const post = await posts.findById(request.params.id);
++      if (!post) return sendError(reply, 404, "not_found");
++
++      if (post.status !== "published") {
++        // Estados não públicos: só o autor e os administradores. Para todos os outros o post
++        // «não existe» (404, nunca 403): não se confirma a existência.
++        let allowed = viewer !== undefined && post.authorId === viewer.id;
++        if (!allowed && viewer?.role === "admin") {
++          // O papel do JWT pode estar desactualizado: revalida-se na base de dados.
++          const user = await users.findById(viewer.id);
++          allowed =
++            user !== null &&
++            user.role === "admin" &&
++            user.deletedAt === null &&
++            user.deletionRequestedAt === null;
++        }
++        if (!allowed) return sendError(reply, 404, "not_found");
++      }
++
++      return reply
++        .code(200)
++        .send({ post: await presentOne(post, db, viewer?.id) });
++    },
++  );
++
++  // ---------- Criar ----------
++
++  f.post(
++    "/posts",
++    {
++      preValidation: authPre,
++      schema: {
++        headers: CreateHeaders,
++        body: CreatePostRequest,
++        response: {
++          200: CreatePostResponse,
++          201: CreatePostResponse,
++          400: ErrorResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          409: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkPostsCreate(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await createPostService(
++        deps,
++        userId,
++        request.body,
++        request.headers["idempotency-key"],
++      );
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      const { replayed, ...body } = result.data;
++      // Um post em revisão não aparece no feed público: nada a invalidar. Repetição (mesma
++      // chave): nada foi criado agora.
++      if (!replayed && body.status === "published") {
++        await feedCache.invalidate();
++      }
++      return reply.code(replayed ? 200 : 201).send(body);
++    },
++  );
++
++  // ---------- Apagar ----------
++
++  f.delete(
++    "/posts/:id",
++    {
++      preValidation: authPre,
++      schema: {
++        params: PostIdParams,
++        response: {
++          200: DeleteResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkPostsDelete(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await deletePostService(deps, userId, request.params.id);
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      if (result.data.changed) await feedCache.invalidate();
++      return reply.code(200).send({ deleted: true });
++    },
++  );
++
++  // ---------- Likes ----------
++
++  f.post(
++    "/posts/:id/like",
++    {
++      preValidation: authPre,
++      schema: {
++        params: PostIdParams,
++        response: {
++          200: LikeResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkLikes(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await likePostService(deps, userId, request.params.id);
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      // Likes não invalidam o feed (D7): o contador público atrasa-se no máximo o TTL.
++      const { likesCount, isLiked } = result.data;
++      return reply.code(200).send({ likesCount, isLiked });
++    },
++  );
++
++  f.delete(
++    "/posts/:id/like",
++    {
++      preValidation: authPre,
++      schema: {
++        params: PostIdParams,
++        response: {
++          200: LikeResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkLikes(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await unlikePostService(deps, userId, request.params.id);
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      const { likesCount, isLiked } = result.data;
++      return reply.code(200).send({ likesCount, isLiked });
++    },
++  );
++
++  // ---------- Denúncias ----------
++
++  f.post(
++    "/posts/:id/report",
++    {
++      preValidation: authPre,
++      schema: {
++        params: PostIdParams,
++        body: ReportRequest,
++        response: {
++          200: ReportResponse,
++          400: ErrorResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkReports(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await reportPostService(
++        deps,
++        userId,
++        request.params.id,
++        request.body.category,
++        request.body.reason,
++      );
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      // Só quando esta denúncia fez o post sair do feed público (passou o limiar).
++      if (result.data.escalated) await feedCache.invalidate();
++      return reply.code(200).send({ outcome: result.data.outcome });
++    },
++  );
++
++  f.delete(
++    "/posts/:id/report",
++    {
++      preValidation: authPre,
++      schema: {
++        params: PostIdParams,
++        response: {
++          200: UnreportResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkReports(userId);
++      if (!rl.allowed) return tooMany(reply, rl);
++
++      const result = await unreportPostService(deps, userId, request.params.id);
++      if (!result.ok) return sendServiceError(reply, result.error);
++
++      return reply.code(200).send({ withdrawn: true });
++    },
++  );
++}
+diff --git a/apps/api/src/routes/sync.ts b/apps/api/src/routes/sync.ts
+new file mode 100644
+index 0000000..2130dfb
+--- /dev/null
++++ b/apps/api/src/routes/sync.ts
+@@ -0,0 +1,363 @@
++import {
++  ErrorResponse,
++  SyncBootstrapResponse,
++  SyncRequest,
++  SyncResponse,
++} from "@comunidade/shared";
++import type {
++  SyncErrorCode,
++  SyncOperation,
++  SyncResult,
++} from "@comunidade/shared";
++import type { FastifyInstance, FastifyReply } from "fastify";
++import type { ZodTypeProvider } from "fastify-type-provider-zod";
++import type { JwtService } from "../auth/jwt.js";
++import { requireAuth } from "../auth/middleware.js";
++import type { RateLimitResult, RateLimiters } from "../auth/rate-limit.js";
++import type { CardsCache } from "../cache/cards-cache.js";
++import type { FeedCache } from "../cache/feed-cache.js";
++import type { Database } from "../db/client.js";
++import type { Env } from "../env.js";
++import { postLikesRepo, postsRepo } from "../repositories/posts.js";
++import { reportsRepo } from "../repositories/reports.js";
++import { usersRepo } from "../repositories/users.js";
++import { decorateForViewer } from "../services/feed-view.js";
++import { presentPosts } from "../services/post-presenter.js";
++import {
++  createPostService,
++  deletePostService,
++  likePostService,
++  reportPostService,
++  unlikePostService,
++  unreportPostService,
++} from "../services/posts.js";
++import type { ServiceError, ServiceResult } from "../services/posts.js";
++
++export interface SyncRoutesOptions {
++  env: Pick<Env, "SYNC_BATCH_TIMEOUT_MS">;
++  db: Database;
++  jwt: JwtService;
++  limiters: RateLimiters;
++  feedCache: FeedCache;
++  cardsCache: CardsCache;
++}
++
++/** Limites da lista de arranque; acima disto o cliente é avisado (`...Truncated`). */
++const BOOTSTRAP_MY_POSTS = 50;
++const BOOTSTRAP_MY_LIKES = 500;
++const BOOTSTRAP_MY_REPORTS = 100;
++const BOOTSTRAP_RECENT = 20;
++
++interface OpOutcome {
++  result: SyncResult;
++  invalidateFeed: boolean;
++}
++
++/** O serviço diz «não mudou nada» (`changed`/`replayed`): o cliente vê `duplicate`. */
++function done(
++  opId: string,
++  duplicate: boolean,
++  result: SyncResult["result"],
++  invalidateFeed = false,
++): OpOutcome {
++  return {
++    result: {
++      op_id: opId,
++      status: duplicate ? "duplicate" : "applied",
++      ...(result ? { result } : {}),
++    },
++    invalidateFeed: invalidateFeed && !duplicate,
++  };
++}
++
++function rejected(opId: string, code: SyncErrorCode): OpOutcome {
++  return {
++    result: { op_id: opId, status: "rejected", error: { code } },
++    invalidateFeed: false,
++  };
++}
++
++/** Fora do prazo ou limite: nada foi tentado, o cliente repete mais tarde. */
++function deferred(
++  opId: string,
++  error?: NonNullable<SyncResult["error"]>,
++): OpOutcome {
++  return {
++    result: {
++      op_id: opId,
++      status: "deferred",
++      ...(error ? { error } : {}),
++    },
++    invalidateFeed: false,
++  };
++}
++
++/**
++ * Códigos internos → contrato do `/sync`. Uma conta em apagamento vê `forbidden`.
++ * `reason_required` é inalcançável aqui (o schema do lote já exige o motivo para «other»).
++ */
++function toSyncCode(error: ServiceError): SyncErrorCode {
++  switch (error.code) {
++    case "not_found":
++    case "forbidden":
++    case "own_post":
++    case "idempotency_key_conflict":
++    case "gospel_card_not_found":
++    case "contains_link":
++    case "contains_contact":
++      return error.code;
++    case "account_inactive":
++      return "forbidden";
++    case "reason_required":
++      return "internal";
++  }
++}
++
++export async function syncRoutes(
++  app: FastifyInstance,
++  { env, db, jwt, limiters, feedCache, cardsCache }: SyncRoutesOptions,
++): Promise<void> {
++  const f = app.withTypeProvider<ZodTypeProvider>();
++  const authPre = requireAuth(jwt);
++  const deps = { db };
++
++  /**
++   * D5: cada operação paga os MESMOS limites do REST (partilham os baldes), além do limite
++   * do próprio lote. Sem isto, `/sync` seria uma porta lateral para contornar os limites.
++   */
++  function checkOpLimit(
++    userId: string,
++    op: SyncOperation,
++  ): Promise<RateLimitResult> {
++    switch (op.type) {
++      case "post.create":
++        return limiters.checkPostsCreate(userId);
++      case "post.delete":
++        return limiters.checkPostsDelete(userId);
++      case "post.like":
++      case "post.unlike":
++        return limiters.checkLikes(userId);
++      case "post.report":
++      case "post.unreport":
++        return limiters.checkReports(userId);
++    }
++  }
++
++  /** Mesmo tratamento de erro do `ServiceResult`: recusa definitiva com o código mapeado. */
++  function fromFailure(opId: string, r: ServiceResult<unknown>): OpOutcome {
++    return rejected(opId, r.ok ? "internal" : toSyncCode(r.error));
++  }
++
++  async function run(userId: string, op: SyncOperation): Promise<OpOutcome> {
++    switch (op.type) {
++      case "post.create": {
++        const r = await createPostService(
++          deps,
++          userId,
++          op.payload,
++          op.idempotency_key,
++        );
++        if (!r.ok) return fromFailure(op.op_id, r);
++        const { replayed, ...body } = r.data;
++        return done(op.op_id, replayed, body, body.status === "published");
++      }
++      case "post.delete": {
++        const r = await deletePostService(deps, userId, op.payload.postId);
++        if (!r.ok) return fromFailure(op.op_id, r);
++        return done(op.op_id, !r.data.changed, { deleted: true }, true);
++      }
++      case "post.like": {
++        const r = await likePostService(deps, userId, op.payload.postId);
++        if (!r.ok) return fromFailure(op.op_id, r);
++        const { likesCount, isLiked, changed } = r.data;
++        return done(op.op_id, !changed, { likesCount, isLiked });
++      }
++      case "post.unlike": {
++        const r = await unlikePostService(deps, userId, op.payload.postId);
++        if (!r.ok) return fromFailure(op.op_id, r);
++        const { likesCount, isLiked, changed } = r.data;
++        return done(op.op_id, !changed, { likesCount, isLiked });
++      }
++      case "post.report": {
++        const r = await reportPostService(
++          deps,
++          userId,
++          op.payload.postId,
++          op.payload.category,
++          op.payload.reason,
++        );
++        if (!r.ok) return fromFailure(op.op_id, r);
++        return done(
++          op.op_id,
++          !r.data.changed,
++          { outcome: r.data.outcome },
++          r.data.escalated,
++        );
++      }
++      case "post.unreport": {
++        const r = await unreportPostService(deps, userId, op.payload.postId);
++        if (!r.ok) return fromFailure(op.op_id, r);
++        return done(op.op_id, !r.data.changed, { withdrawn: true });
++      }
++    }
++  }
++
++  async function processOne(
++    userId: string,
++    op: SyncOperation,
++  ): Promise<OpOutcome> {
++    const rl = await checkOpLimit(userId, op);
++    if (!rl.allowed) {
++      return deferred(op.op_id, {
++        code: "rate_limited",
++        retryAfter: rl.retryAfter ?? 60,
++      });
++    }
++    try {
++      return await run(userId, op);
++    } catch (err) {
++      // Falha inesperada (ex.: base de dados): cada serviço é transaccional, por isso nada
++      // ficou a meio. Repetir é seguro (chave de idempotência / operações idempotentes), logo
++      // `deferred` e não `rejected`. Sem mensagem nem dados do utilizador nos logs.
++      app.log.error(
++        {
++          errorName: err instanceof Error ? err.name : typeof err,
++          errorCode:
++            typeof err === "object" &&
++            err !== null &&
++            "code" in err &&
++            typeof (err as { code: unknown }).code === "string"
++              ? (err as { code: string }).code
++              : undefined,
++          opType: op.type,
++        },
++        "sync: operation failed",
++      );
++      return deferred(op.op_id, { code: "internal" });
++    }
++  }
++
++  const sendError = (
++    reply: object,
++    status: number,
++    error: string,
++    retryAfter?: number,
++  ): FastifyReply => {
++    const r = (reply as FastifyReply).code(status);
++    if (retryAfter !== undefined) r.header("Retry-After", String(retryAfter));
++    return r.send({ error });
++  };
++
++  f.post(
++    "/sync",
++    {
++      preValidation: authPre,
++      schema: {
++        body: SyncRequest,
++        response: {
++          200: SyncResponse,
++          400: ErrorResponse,
++          401: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkSyncBatch(userId);
++      if (!rl.allowed) {
++        return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
++      }
++
++      const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
++      const results: SyncResult[] = [];
++      let invalidateFeed = false;
++
++      // Em série e pela ordem do cliente: uma operação pode depender da anterior.
++      for (const op of request.body.operations) {
++        if (Date.now() >= deadline) {
++          results.push(deferred(op.op_id).result);
++          continue;
++        }
++        const outcome = await processOne(userId, op);
++        results.push(outcome.result);
++        if (outcome.invalidateFeed) invalidateFeed = true;
++      }
++
++      // Uma só invalidação por lote.
++      if (invalidateFeed) await feedCache.invalidate();
++
++      return reply
++        .code(200)
++        .send({ results, serverTime: new Date().toISOString() });
++    },
++  );
++
++  f.get(
++    "/sync/bootstrap",
++    {
++      preValidation: authPre,
++      schema: {
++        response: {
++          200: SyncBootstrapResponse,
++          401: ErrorResponse,
++          403: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const userId = request.user!.id;
++      const rl = await limiters.checkSyncBatch(userId);
++      if (!rl.allowed) {
++        return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
++      }
++
++      const user = await usersRepo(db).findById(userId);
++      if (!user) return sendError(reply, 401, "invalid_token");
++      if (user.deletionRequestedAt) {
++        return sendError(reply, 403, "account_inactive");
++      }
++
++      // Pede-se um a mais do que o limite para saber se houve corte.
++      const [cards, recent, myPostRows, liked, myReportRows] =
++        await Promise.all([
++          cardsCache.list(),
++          feedCache.list({ filter: "recent", limit: BOOTSTRAP_RECENT }),
++          postsRepo(db).listByAuthor(userId, BOOTSTRAP_MY_POSTS + 1),
++          postLikesRepo(db).listLikedPostIds(userId, BOOTSTRAP_MY_LIKES),
++          reportsRepo(db).listByReporter(userId, BOOTSTRAP_MY_REPORTS + 1),
++        ]);
++
++      const [recentPosts, myPosts] = await Promise.all([
++        decorateForViewer(recent, userId, db),
++        presentPosts(myPostRows.slice(0, BOOTSTRAP_MY_POSTS), db, userId),
++      ]);
++
++      return reply.code(200).send({
++        serverTime: new Date().toISOString(),
++        user: {
++          id: user.id,
++          username: user.username,
++          role: user.role,
++          createdAt: user.createdAt.toISOString(),
++        },
++        cards,
++        recentPosts: { posts: recentPosts, nextCursor: recent.nextCursor },
++        myPosts,
++        myPostsTruncated: myPostRows.length > BOOTSTRAP_MY_POSTS,
++        myLikedPostIds: liked.ids,
++        myLikedPostIdsTruncated: liked.truncated,
++        myReports: myReportRows.slice(0, BOOTSTRAP_MY_REPORTS).map((r) => ({
++          id: r.id,
++          postId: r.postId,
++          category: r.category,
++          reason: r.reason,
++          status: r.status,
++          createdAt: r.createdAt.toISOString(),
++        })),
++        myReportsTruncated: myReportRows.length > BOOTSTRAP_MY_REPORTS,
++      });
++    },
++  );
++}
+diff --git a/apps/api/src/services/feed-view.ts b/apps/api/src/services/feed-view.ts
+new file mode 100644
+index 0000000..0bf8898
+--- /dev/null
++++ b/apps/api/src/services/feed-view.ts
+@@ -0,0 +1,28 @@
++import type { PostPublic } from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
++import type { FeedPage } from "../cache/feed-cache.js";
++import { postLikesRepo } from "../repositories/posts.js";
++
++/**
++ * Junta a uma página do feed (partilhada, anónima) o que depende de quem a vê: `isLiked` (uma
++ * consulta por página) e `isMine` (a partir do `authorIds` interno, sem consulta). Devolve
++ * cópias: a página pode vir da cache e ser usada por outros pedidos em simultâneo.
++ */
++export async function decorateForViewer(
++  page: Pick<FeedPage, "posts" | "authorIds">,
++  viewerId: string | undefined,
++  exec: Executor,
++): Promise<PostPublic[]> {
++  if (!viewerId || page.posts.length === 0) return [...page.posts];
++  const liked = new Set(
++    await postLikesRepo(exec).findLikedPostIds(
++      viewerId,
++      page.posts.map((p) => p.id),
++    ),
++  );
++  return page.posts.map((p, i) => ({
++    ...p,
++    isLiked: liked.has(p.id),
++    isMine: page.authorIds[i] === viewerId,
++  }));
++}
+diff --git a/apps/api/src/services/posts.ts b/apps/api/src/services/posts.ts
+index 059f1a4..0965833 100644
+--- a/apps/api/src/services/posts.ts
++++ b/apps/api/src/services/posts.ts
+@@ -333,60 +333,75 @@ type ReportPostError = ErrorOf<
+   "own_post" | "not_found" | "reason_required" | "account_inactive"
+ >;
+ 
++export interface ReportData {
++  outcome: ReportOutcome;
++  changed: boolean;
++  /** Esta denúncia fez o post passar a `pending_review` (sai do feed público). */
++  escalated: boolean;
++}
++
+ export async function reportPostService(
+   deps: ServicesDeps,
+   userId: string,
+   postId: string,
+   category: ReportCategory,
+   reason: string | undefined,
+-): Promise<
+-  ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
+-> {
++): Promise<ServiceResult<ReportData, ReportPostError>> {
+   // Rede de segurança: o schema da rota já exige o motivo para «other».
+   const trimmed = reason?.trim();
+   if (category === "other" && (!trimmed || trimmed.length < 3)) {
+     return fail("reason_required");
+   }
+ 
+-  return deps.db.transaction<
+-    ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
+-  >(async (tx) => {
+-    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++  return deps.db.transaction<ServiceResult<ReportData, ReportPostError>>(
++    async (tx) => {
++      if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
++
++      const result = await reportsRepo(tx).file({
++        postId,
++        reporterId: userId,
++        category,
++        reason: trimmed ?? null,
++      });
+ 
+-    const result = await reportsRepo(tx).file({
+-      postId,
+-      reporterId: userId,
+-      category,
+-      reason: trimmed ?? null,
+-    });
+-
+-    switch (result.outcome) {
+-      case "created": {
+-        await outboxRepo(tx).enqueue({
+-          aggregateType: "post",
+-          aggregateId: postId,
+-          eventType: "post.reported",
+-          payload: { postId, reporterId: userId, category },
+-        });
+-        if (result.escalated && result.escalatedBy) {
+-          const severity: ReportSeverity = result.escalatedBy;
++      switch (result.outcome) {
++        case "created": {
+           await outboxRepo(tx).enqueue({
+             aggregateType: "post",
+             aggregateId: postId,
+-            eventType: "post.escalated",
+-            payload: { postId, severity },
++            eventType: "post.reported",
++            payload: { postId, reporterId: userId, category },
+           });
++          if (result.escalated && result.escalatedBy) {
++            const severity: ReportSeverity = result.escalatedBy;
++            await outboxRepo(tx).enqueue({
++              aggregateType: "post",
++              aggregateId: postId,
++              eventType: "post.escalated",
++              payload: { postId, severity },
++            });
++          }
++          return {
++            ok: true,
++            data: {
++              outcome: "created",
++              changed: true,
++              escalated: result.escalated === true,
++            },
++          };
+         }
+-        return { ok: true, data: { outcome: "created", changed: true } };
++        case "duplicate":
++          return {
++            ok: true,
++            data: { outcome: "duplicate", changed: false, escalated: false },
++          };
++        case "own_post":
++          return fail("own_post");
++        case "post_not_found":
++          return fail("not_found");
+       }
+-      case "duplicate":
+-        return { ok: true, data: { outcome: "duplicate", changed: false } };
+-      case "own_post":
+-        return fail("own_post");
+-      case "post_not_found":
+-        return fail("not_found");
+-    }
+-  });
++    },
++  );
+ }
+ 
+ type UnreportPostError = ErrorOf<"not_found" | "account_inactive">;
+diff --git a/apps/api/src/workers/outbox-worker.ts b/apps/api/src/workers/outbox-worker.ts
+new file mode 100644
+index 0000000..13ed55b
+--- /dev/null
++++ b/apps/api/src/workers/outbox-worker.ts
+@@ -0,0 +1,133 @@
++import type { Database } from "../db/client.js";
++import type { OutboxEvent } from "../db/schema.js";
++import { outboxRepo } from "../repositories/outbox.js";
++
++/**
++ * Worker do outbox: consome os eventos de domínio que os serviços gravam na mesma transacção
++ * que a alteração (post.created, post.liked, post.reported, post.escalated…).
++ *
++ * Ainda não há consumidores (notificações, moderação, métricas): sem este worker os eventos
++ * ficariam para sempre `pending` e a tabela cresceria sem limite (cada like gera um). Por
++ * isso, um evento SEM handler é dado como concluído — a purga de `done` (maintenance) trata
++ * do resto. Quando houver um consumidor, regista-se em `handlers` pelo `eventType`; se lançar,
++ * o evento volta à fila com atraso exponencial e passa a `failed` ao fim de 6 tentativas.
++ *
++ * Seguro com várias instâncias: `claimBatch` usa `FOR UPDATE SKIP LOCKED` e uma janela de
++ * visibilidade (um evento reservado por uma instância que morre volta a ser elegível).
++ */
++
++export type OutboxHandler = (event: OutboxEvent) => Promise<void>;
++
++export interface OutboxLogger {
++  info(obj: Record<string, unknown>, msg: string): void;
++  warn(obj: Record<string, unknown>, msg: string): void;
++}
++
++const VISIBILITY_TIMEOUT_S = 60;
++const BACKOFF_BASE_MS = 1000;
++const BACKOFF_MAX_MS = 5 * 60_000;
++
++export interface OutboxBatchResult {
++  claimed: number;
++  done: number;
++  failed: number;
++}
++
++export function backoffMs(attempts: number): number {
++  return Math.min(
++    BACKOFF_BASE_MS * 2 ** Math.max(attempts - 1, 0),
++    BACKOFF_MAX_MS,
++  );
++}
++
++/** Uma ronda: reserva até `batchSize` eventos e processa-os. Exportada para os testes. */
++export async function processOutboxBatch(
++  db: Database,
++  opts: {
++    batchSize: number;
++    handlers?: Readonly<Record<string, OutboxHandler>>;
++    log?: OutboxLogger;
++  },
++): Promise<OutboxBatchResult> {
++  const repo = outboxRepo(db);
++  const events = await repo.claimBatch(opts.batchSize, VISIBILITY_TIMEOUT_S);
++  const result: OutboxBatchResult = {
++    claimed: events.length,
++    done: 0,
++    failed: 0,
++  };
++
++  for (const event of events) {
++    const handler = opts.handlers?.[event.eventType];
++    try {
++      if (handler) await handler(event);
++      await repo.markDone(event.id);
++      result.done += 1;
++    } catch (err) {
++      result.failed += 1;
++      // Só tipo e nome do erro: a mensagem pode trazer dados do utilizador.
++      opts.log?.warn(
++        {
++          eventType: event.eventType,
++          attempts: event.attempts,
++          errorName: err instanceof Error ? err.name : typeof err,
++        },
++        "outbox: handler failed",
++      );
++      await repo.markFailed(
++        event.id,
++        event.attempts,
++        backoffMs(event.attempts),
++      );
++    }
++  }
++  return result;
++}
++
++export function startOutboxWorker(args: {
++  db: Database;
++  log: OutboxLogger;
++  intervalMs: number;
++  batchSize: number;
++  handlers?: Readonly<Record<string, OutboxHandler>>;
++}): () => Promise<void> {
++  const { db, log, intervalMs, batchSize, handlers } = args;
++  let stopped = false;
++  let timer: NodeJS.Timeout | null = null;
++  let current: Promise<void> = Promise.resolve();
++
++  const schedule = (delay: number) => {
++    if (stopped) return;
++    timer = setTimeout(() => {
++      current = tick();
++    }, delay);
++    timer.unref();
++  };
++
++  const tick = async (): Promise<void> => {
++    let more = false;
++    try {
++      const r = await processOutboxBatch(db, {
++        batchSize,
++        log,
++        ...(handlers ? { handlers } : {}),
++      });
++      // Ronda cheia: provavelmente há mais; continua sem esperar o intervalo.
++      more = r.claimed >= batchSize;
++    } catch (err) {
++      log.warn(
++        { errorName: err instanceof Error ? err.name : typeof err },
++        "outbox: worker round failed",
++      );
++    }
++    schedule(more ? 0 : intervalMs);
++  };
++
++  schedule(intervalMs);
++
++  return async () => {
++    stopped = true;
++    if (timer) clearTimeout(timer);
++    await current;
++  };
++}
+diff --git a/apps/api/test/cache/feed-cache.test.ts b/apps/api/test/cache/feed-cache.test.ts
+new file mode 100644
+index 0000000..fe216b5
+--- /dev/null
++++ b/apps/api/test/cache/feed-cache.test.ts
+@@ -0,0 +1,210 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { createFeedCache } from "../../src/cache/feed-cache.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makePost, makeUser } from "../helpers/factories.js";
++
++// Postgres real + Redis simulado: a base de dados é o que a cache protege, por isso os testes
++// provam o efeito observável (a página não muda até invalidar) sem depender do Redis real.
++// A integração completa com Redis está em routes/posts.test.ts.
++
++class FakeRedis {
++  store = new Map<string, string>();
++  ttls = new Map<string, number>();
++  failWith: Error | null = null;
++
++  async get(key: string): Promise<string | null> {
++    if (this.failWith) throw this.failWith;
++    return this.store.get(key) ?? null;
++  }
++  async set(
++    key: string,
++    value: string,
++    _mode: string,
++    ttl: number,
++  ): Promise<"OK"> {
++    if (this.failWith) throw this.failWith;
++    this.store.set(key, value);
++    this.ttls.set(key, ttl);
++    return "OK";
++  }
++  async incr(key: string): Promise<number> {
++    if (this.failWith) throw this.failWith;
++    const next = Number.parseInt(this.store.get(key) ?? "0", 10) + 1;
++    this.store.set(key, String(next));
++    return next;
++  }
++}
++
++const warnings: Record<string, unknown>[] = [];
++const logger = {
++  warn: (obj: Record<string, unknown>) => void warnings.push(obj),
++};
++
++async function build(redis: FakeRedis | null, ttlSeconds?: number) {
++  return createFeedCache({
++    redis: redis as unknown as Parameters<typeof createFeedCache>[0]["redis"],
++    db: await getTestDb(),
++    logger,
++    ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
++  });
++}
++
++const first = { filter: "recent", limit: 20 } as const;
++
++beforeAll(async () => {
++  await getTestDb();
++});
++afterAll(async () => {
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++  warnings.length = 0;
++});
++
++describe("feed-cache", () => {
++  it("1.ª leitura vai à BD e guarda; a 2.ª vem da cache (mesmo sem a BD ter mudado)", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis, 45);
++    const author = await makeUser();
++    await makePost(author.id, { title: "A" });
++
++    const a = await cache.list(first);
++    expect(a.cacheHit).toBe(false);
++    expect(a.posts.map((p) => p.title)).toEqual(["A"]);
++    expect(a.authorIds).toEqual([author.id]);
++    // TTL configurado
++    expect([...redis.ttls.values()]).toEqual([45]);
++
++    await makePost(author.id, { title: "B" });
++    const b = await cache.list(first);
++    expect(b.cacheHit).toBe(true);
++    expect(b.posts.map((p) => p.title)).toEqual(["A"]);
++  });
++
++  it("invalidar muda a versão: a leitura seguinte vê o estado novo", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    await makePost(author.id, { title: "A" });
++    await cache.list(first);
++    await makePost(author.id, { title: "B" });
++
++    expect(await cache.invalidate()).toBe(true);
++    const after = await cache.list(first);
++    expect(after.cacheHit).toBe(false);
++    expect(after.posts.map((p) => p.title).sort()).toEqual(["A", "B"]);
++  });
++
++  it("filtros, categoria e limite têm chaves separadas", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    await makePost(author.id, { category: "entendimento" });
++    await makePost(author.id, { category: "ensinamento" });
++
++    await cache.list(first);
++    await cache.list({ ...first, category: "ensinamento" });
++    await cache.list({ ...first, filter: "top" });
++    await cache.list({ ...first, limit: 5 });
++    const pageKeys = [...redis.store.keys()].filter(
++      (k) => !k.endsWith("version"),
++    );
++    expect(pageKeys).toHaveLength(4);
++  });
++
++  it("páginas com cursor nunca passam pela cache", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    for (let i = 0; i < 3; i++) await makePost(author.id, { title: `P${i}` });
++
++    const p1 = await cache.list({ ...first, limit: 2 });
++    expect(p1.nextCursor).not.toBeNull();
++    const before = redis.store.size;
++    const p2 = await cache.list({
++      ...first,
++      limit: 2,
++      cursor: p1.nextCursor!,
++    });
++    expect(p2.cacheHit).toBe(false);
++    expect(p2.posts).toHaveLength(1);
++    expect(redis.store.size).toBe(before);
++  });
++
++  it("pedidos concorrentes à mesma chave fazem uma só carga", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    await makePost(author.id);
++    const results = await Promise.all(
++      Array.from({ length: 5 }, () => cache.list(first)),
++    );
++    expect(results.every((r) => r.posts.length === 1)).toBe(true);
++    // Todos partilham a mesma promessa: nenhum foi «hit» (a cache só foi escrita uma vez).
++    expect(results.filter((r) => r.cacheHit)).toHaveLength(0);
++  });
++
++  it("Redis a falhar: serve da BD, não lança e só regista nome/código", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    await makePost(author.id, { title: "A" });
++    redis.failWith = Object.assign(
++      new Error("connect ECONNREFUSED 10.0.0.5:6379"),
++      {
++        code: "ECONNREFUSED",
++      },
++    );
++
++    const page = await cache.list(first);
++    expect(page.cacheHit).toBe(false);
++    expect(page.posts).toHaveLength(1);
++    expect(await cache.invalidate()).toBe(false);
++    expect(warnings.length).toBeGreaterThan(0);
++    expect(JSON.stringify(warnings)).not.toContain("10.0.0.5");
++    expect(warnings[0]).toMatchObject({
++      errorName: "Error",
++      errorCode: "ECONNREFUSED",
++    });
++  });
++
++  it("valor inválido na cache é ignorado e substituído", async () => {
++    const redis = new FakeRedis();
++    const cache = await build(redis);
++    const author = await makeUser();
++    await makePost(author.id, { title: "A" });
++    await cache.list(first);
++    for (const key of [...redis.store.keys()]) {
++      if (!key.endsWith("version")) redis.store.set(key, '{"posts":"lixo"}');
++    }
++
++    const page = await cache.list(first);
++    expect(page.cacheHit).toBe(false);
++    expect(page.posts.map((p) => p.title)).toEqual(["A"]);
++  });
++
++  it("sem Redis funciona sempre contra a BD", async () => {
++    const cache = await build(null);
++    const author = await makeUser();
++    await makePost(author.id, { title: "A" });
++    expect((await cache.list(first)).cacheHit).toBe(false);
++    await makePost(author.id, { title: "B" });
++    expect((await cache.list(first)).posts).toHaveLength(2);
++    expect(await cache.invalidate()).toBe(true);
++  });
++
++  it("não inclui posts em revisão nem apagados", async () => {
++    const cache = await build(null);
++    const author = await makeUser();
++    await makePost(author.id, { title: "visível" });
++    await makePost(author.id, { title: "revisão", status: "pending_review" });
++    const gone = await makePost(author.id, { title: "apagado" });
++    const db = await getTestDb();
++    const { postsRepo } = await import("../../src/repositories/posts.js");
++    await postsRepo(db).softDelete(gone.id, author.id);
++
++    const page = await cache.list(first);
++    expect(page.posts.map((p) => p.title)).toEqual(["visível"]);
++  });
++});
+diff --git a/apps/api/test/routes/posts.test.ts b/apps/api/test/routes/posts.test.ts
+new file mode 100644
+index 0000000..4c19210
+--- /dev/null
++++ b/apps/api/test/routes/posts.test.ts
+@@ -0,0 +1,563 @@
++import { eq } from "drizzle-orm";
++import { Redis } from "ioredis";
++import request from "supertest";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { users } from "../../src/db/schema.js";
++import { loadEnv } from "../../src/env.js";
++import { postsRepo } from "../../src/repositories/posts.js";
++import { buildServer } from "../../src/server.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import {
++  makeLike,
++  makePost,
++  makeUserWithPassword,
++} from "../helpers/factories.js";
++
++const env = loadEnv({
++  NODE_ENV: "test",
++  LOG_LEVEL: "fatal",
++  APP_VERSION: "test",
++});
++
++type App = Awaited<ReturnType<typeof buildServer>>;
++
++let app: App;
++let redis: Redis | null = null;
++let keyCounter = 0;
++
++const idem = () =>
++  `chave-teste-${String(++keyCounter).padStart(8, "0")}-abcdef`;
++
++async function account(role: "user" | "admin" = "user") {
++  const { user, plainPassword } = await makeUserWithPassword({ role });
++  const res = await request(app.server)
++    .post("/auth/login")
++    .send({ username: user.username, password: plainPassword });
++  expect(res.status).toBe(200);
++  return { user, token: res.body.accessToken as string };
++}
++
++const bearer = (t: string) => ({ Authorization: `Bearer ${t}` });
++
++function create(token: string, body: Record<string, unknown>, key = idem()) {
++  return request(app.server)
++    .post("/posts")
++    .set(bearer(token))
++    .set("Idempotency-Key", key)
++    .send({
++      category: "entendimento",
++      title: "Uma partilha",
++      content: "O que entendi da leitura de hoje.",
++      ...body,
++    });
++}
++
++beforeAll(async () => {
++  await getTestDb();
++  if (process.env.REDIS_URL) redis = new Redis(process.env.REDIS_URL);
++  app = await buildServer({ env });
++  await app.ready();
++});
++afterAll(async () => {
++  await app.close();
++  await redis?.quit();
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++  if (redis) {
++    const keys = await redis.keys("cc:v1:feed:*");
++    if (keys.length > 0) await redis.del(...keys);
++  }
++});
++
++describe("GET /posts", () => {
++  it("anónimo: só publicados, sem authorId, isLiked/isMine a false", async () => {
++    const { user } = await account();
++    await makePost(user.id, { title: "visível" });
++    await makePost(user.id, { title: "revisão", status: "pending_review" });
++
++    const res = await request(app.server).get("/posts");
++    expect(res.status).toBe(200);
++    expect(res.headers["cache-control"]).toBe("no-store");
++    expect(res.body.posts).toHaveLength(1);
++    const post = res.body.posts[0];
++    expect(post.title).toBe("visível");
++    expect(post.author).toEqual({ username: user.username });
++    expect(post.isLiked).toBe(false);
++    expect(post.isMine).toBe(false);
++    expect(JSON.stringify(res.body)).not.toContain(user.id);
++    expect(post).not.toHaveProperty("authorId");
++  });
++
++  it("autenticado: isLiked e isMine por espectador (mesma página em cache)", async () => {
++    const a = await account();
++    const b = await account();
++    const post = await makePost(a.user.id);
++    await makeLike(post.id, b.user.id);
++
++    const asA = await request(app.server).get("/posts").set(bearer(a.token));
++    const asB = await request(app.server).get("/posts").set(bearer(b.token));
++    const anon = await request(app.server).get("/posts");
++    expect(asA.body.posts[0]).toMatchObject({ isMine: true, isLiked: false });
++    expect(asB.body.posts[0]).toMatchObject({ isMine: false, isLiked: true });
++    expect(anon.body.posts[0]).toMatchObject({ isMine: false, isLiked: false });
++  });
++
++  it("token inválido ou esquema errado → 401 (não degrada para anónimo)", async () => {
++    const bad = await request(app.server)
++      .get("/posts")
++      .set("Authorization", "Bearer lixo");
++    expect(bad.status).toBe(401);
++    expect(bad.body.error).toBe("invalid_token");
++    const scheme = await request(app.server)
++      .get("/posts")
++      .set("Authorization", "Basic abc");
++    expect(scheme.status).toBe(401);
++  });
++
++  it("o autor vê no topo a sua partilha em revisão, só na 1.ª página", async () => {
++    const a = await account();
++    const other = await account();
++    await makePost(other.user.id, { title: "de outro" });
++    const pending = await makePost(a.user.id, {
++      title: "minha em revisão",
++      status: "pending_review",
++    });
++
++    const mine = await request(app.server).get("/posts").set(bearer(a.token));
++    expect(mine.body.posts.map((p: { id: string }) => p.id)[0]).toBe(
++      pending.id,
++    );
++    expect(mine.body.posts[0].isMine).toBe(true);
++    expect(mine.body.posts).toHaveLength(2);
++
++    const others = await request(app.server)
++      .get("/posts")
++      .set(bearer(other.token));
++    expect(others.body.posts).toHaveLength(1);
++  });
++
++  it("pagina por cursor sem repetir nem saltar; limite respeitado", async () => {
++    const { user } = await account();
++    for (let i = 0; i < 5; i++) await makePost(user.id, { title: `P${i}` });
++
++    const seen: string[] = [];
++    let cursor: string | null = null;
++    for (let page = 0; page < 5; page++) {
++      const res: request.Response = await request(app.server)
++        .get("/posts")
++        .query({ limit: 2, ...(cursor ? { cursor } : {}) });
++      expect(res.status).toBe(200);
++      seen.push(...res.body.posts.map((p: { id: string }) => p.id));
++      cursor = res.body.nextCursor;
++      if (!cursor) break;
++    }
++    expect(seen).toHaveLength(5);
++    expect(new Set(seen).size).toBe(5);
++  });
++
++  it("cursor adulterado ou de outro filtro → 400 validation_error", async () => {
++    const bad = await request(app.server)
++      .get("/posts")
++      .query({ cursor: "abc" });
++    expect(bad.status).toBe(400);
++    expect(bad.body.error).toBe("validation_error");
++    expect(bad.body.fields).toHaveProperty("cursor");
++
++    const { user } = await account();
++    for (let i = 0; i < 3; i++) await makePost(user.id);
++    const p1 = await request(app.server).get("/posts").query({ limit: 2 });
++    const wrong = await request(app.server)
++      .get("/posts")
++      .query({ limit: 2, filter: "top", cursor: p1.body.nextCursor });
++    expect(wrong.status).toBe(400);
++  });
++
++  it("filter=liked: exige sessão e devolve só os curtidos", async () => {
++    const a = await account();
++    const author = await account();
++    const liked = await makePost(author.user.id, { title: "curtido" });
++    await makePost(author.user.id, { title: "outro" });
++    await makeLike(liked.id, a.user.id);
++
++    const anon = await request(app.server)
++      .get("/posts")
++      .query({ filter: "liked" });
++    expect(anon.status).toBe(401);
++
++    const res = await request(app.server)
++      .get("/posts")
++      .query({ filter: "liked" })
++      .set(bearer(a.token));
++    expect(res.status).toBe(200);
++    expect(res.body.posts.map((p: { title: string }) => p.title)).toEqual([
++      "curtido",
++    ]);
++    expect(res.body.posts[0].isLiked).toBe(true);
++  });
++
++  it("autor com conta em apagamento aparece como [removido] (author null)", async () => {
++    const a = await account();
++    await makePost(a.user.id);
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ deletionRequestedAt: new Date() })
++      .where(eq(users.id, a.user.id));
++    const res = await request(app.server).get("/posts");
++    expect(res.body.posts[0].author).toBeNull();
++  });
++});
++
++describe("POST /posts", () => {
++  it("sem sessão → 401 antes de validar o corpo", async () => {
++    const res = await request(app.server).post("/posts").send({ lixo: true });
++    expect(res.status).toBe(401);
++  });
++
++  it("cria (201), e a mesma chave repete a resposta (200) sem criar outro", async () => {
++    const { token, user } = await account();
++    const key = idem();
++    const first = await create(token, {}, key);
++    expect(first.status).toBe(201);
++    expect(first.body.status).toBe("published");
++    expect(first.body.post.isMine).toBe(true);
++    expect(first.body).not.toHaveProperty("replayed");
++
++    const again = await create(token, {}, key);
++    expect(again.status).toBe(200);
++    expect(again.body.post.id).toBe(first.body.post.id);
++
++    const db = await getTestDb();
++    expect(await postsRepo(db).countByAuthor(user.id)).toBe(1);
++  });
++
++  it("mesma chave com outro corpo → 409 idempotency_key_conflict", async () => {
++    const { token } = await account();
++    const key = idem();
++    await create(token, {}, key);
++    const res = await create(token, { title: "Outro título" }, key);
++    expect(res.status).toBe(409);
++    expect(res.body.error).toBe("idempotency_key_conflict");
++  });
++
++  it("sem Idempotency-Key → 400 validation_error", async () => {
++    const { token } = await account();
++    const res = await request(app.server)
++      .post("/posts")
++      .set(bearer(token))
++      .send({ category: "entendimento", title: "T", content: "C" });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toBe("validation_error");
++  });
++
++  it("link e contacto → 400 com o código", async () => {
++    const { token } = await account();
++    const link = await create(token, {
++      content: "vê https://exemplo.com agora",
++    });
++    expect(link.status).toBe(400);
++    expect(link.body.error).toBe("contains_link");
++    const phone = await create(token, { content: "liga +258 84 123 4567" });
++    expect(phone.status).toBe(400);
++    expect(phone.body.error).toBe("contains_contact");
++  });
++
++  it("post novo aparece logo no feed (a criação invalida a cache)", async () => {
++    const { token } = await account();
++    const before = await request(app.server).get("/posts");
++    expect(before.body.posts).toHaveLength(0);
++    await create(token, {});
++    const after = await request(app.server).get("/posts");
++    expect(after.body.posts).toHaveLength(1);
++  });
++
++  it("sinal de spam → pending_review: fora do feed público, visível ao autor", async () => {
++    const { token } = await account();
++    const res = await create(token, {
++      title: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
++      content: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
++    });
++    expect(res.status).toBe(201);
++    expect(res.body.status).toBe("pending_review");
++    const pub = await request(app.server).get("/posts");
++    expect(pub.body.posts).toHaveLength(0);
++    const mine = await request(app.server).get("/posts").set(bearer(token));
++    expect(mine.body.posts).toHaveLength(1);
++  });
++
++  it("conta em apagamento não escreve → 403 account_inactive", async () => {
++    const { token, user } = await account();
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ deletionRequestedAt: new Date() })
++      .where(eq(users.id, user.id));
++    const res = await create(token, {});
++    expect(res.status).toBe(403);
++    expect(res.body.error).toBe("account_inactive");
++  });
++});
++
++describe("GET /posts/:id (visibilidade)", () => {
++  it("publicado: qualquer pessoa; inexistente e id inválido", async () => {
++    const { user } = await account();
++    const post = await makePost(user.id);
++    const res = await request(app.server).get(`/posts/${post.id}`);
++    expect(res.status).toBe(200);
++    expect(res.body.post.id).toBe(post.id);
++
++    const missing = await request(app.server).get(
++      "/posts/0190a0a0-0000-7000-8000-000000000099",
++    );
++    expect(missing.status).toBe(404);
++    const invalid = await request(app.server).get("/posts/nao-e-uuid");
++    expect(invalid.status).toBe(400);
++  });
++
++  it("em revisão/oculto/rejeitado: 404 para anónimos e outros; 200 para autor e admin", async () => {
++    const author = await account();
++    const other = await account();
++    const admin = await account("admin");
++
++    for (const status of ["pending_review", "hidden", "rejected"] as const) {
++      const post = await makePost(author.user.id, { status });
++      const path = `/posts/${post.id}`;
++      expect((await request(app.server).get(path)).status).toBe(404);
++      expect(
++        (await request(app.server).get(path).set(bearer(other.token))).status,
++      ).toBe(404);
++      const own = await request(app.server).get(path).set(bearer(author.token));
++      expect(own.status).toBe(200);
++      expect(own.body.post.status).toBe(status);
++      expect(
++        (await request(app.server).get(path).set(bearer(admin.token))).status,
++      ).toBe(200);
++    }
++  });
++
++  it("admin despromovido (JWT antigo) deixa de ver", async () => {
++    const author = await account();
++    const admin = await account("admin");
++    const post = await makePost(author.user.id, { status: "hidden" });
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ role: "user" })
++      .where(eq(users.id, admin.user.id));
++    const res = await request(app.server)
++      .get(`/posts/${post.id}`)
++      .set(bearer(admin.token));
++    expect(res.status).toBe(404);
++  });
++
++  it("apagado pelo autor: 404 para todos, incluindo o autor", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    const del = await request(app.server)
++      .delete(`/posts/${post.id}`)
++      .set(bearer(author.token));
++    expect(del.status).toBe(200);
++    expect(del.body).toEqual({ deleted: true });
++    expect(
++      (
++        await request(app.server)
++          .get(`/posts/${post.id}`)
++          .set(bearer(author.token))
++      ).status,
++    ).toBe(404);
++  });
++});
++
++describe("DELETE /posts/:id", () => {
++  it("só o autor; os outros recebem 404; repetir é idempotente; sai do feed", async () => {
++    const author = await account();
++    const other = await account();
++    const post = await makePost(author.user.id);
++    await request(app.server).get("/posts"); // aquece a cache
++
++    const foreign = await request(app.server)
++      .delete(`/posts/${post.id}`)
++      .set(bearer(other.token));
++    expect(foreign.status).toBe(404);
++
++    const ok = await request(app.server)
++      .delete(`/posts/${post.id}`)
++      .set(bearer(author.token));
++    expect(ok.status).toBe(200);
++    const again = await request(app.server)
++      .delete(`/posts/${post.id}`)
++      .set(bearer(author.token));
++    expect(again.status).toBe(200);
++
++    const feed = await request(app.server).get("/posts");
++    expect(feed.body.posts).toHaveLength(0);
++  });
++
++  it("sem sessão → 401", async () => {
++    const res = await request(app.server).delete(
++      "/posts/0190a0a0-0000-7000-8000-000000000099",
++    );
++    expect(res.status).toBe(401);
++  });
++});
++
++describe("likes", () => {
++  it("curtir/descurtir é idempotente e actualiza o contador", async () => {
++    const author = await account();
++    const fan = await account();
++    const post = await makePost(author.user.id);
++    const url = `/posts/${post.id}/like`;
++
++    const a = await request(app.server).post(url).set(bearer(fan.token));
++    expect(a.status).toBe(200);
++    expect(a.body).toEqual({ likesCount: 1, isLiked: true });
++    const b = await request(app.server).post(url).set(bearer(fan.token));
++    expect(b.body).toEqual({ likesCount: 1, isLiked: true });
++
++    const c = await request(app.server).delete(url).set(bearer(fan.token));
++    expect(c.body).toEqual({ likesCount: 0, isLiked: false });
++    const d = await request(app.server).delete(url).set(bearer(fan.token));
++    expect(d.body).toEqual({ likesCount: 0, isLiked: false });
++  });
++
++  it("post inexistente ou em revisão → 404; sem sessão → 401", async () => {
++    const author = await account();
++    const fan = await account();
++    const pending = await makePost(author.user.id, {
++      status: "pending_review",
++    });
++    expect(
++      (
++        await request(app.server)
++          .post(`/posts/${pending.id}/like`)
++          .set(bearer(fan.token))
++      ).status,
++    ).toBe(404);
++    expect(
++      (await request(app.server).post(`/posts/${pending.id}/like`)).status,
++    ).toBe(401);
++  });
++
++  it("curtir não invalida a cache pública (D7), mas o espectador vê o seu isLiked", async () => {
++    const author = await account();
++    const fan = await account();
++    const post = await makePost(author.user.id);
++    await request(app.server).get("/posts"); // aquece
++    await request(app.server)
++      .post(`/posts/${post.id}/like`)
++      .set(bearer(fan.token));
++
++    const anon = await request(app.server).get("/posts");
++    expect(anon.body.posts[0].likesCount).toBe(redis ? 0 : 1);
++    const mine = await request(app.server).get("/posts").set(bearer(fan.token));
++    expect(mine.body.posts[0].isLiked).toBe(true);
++  });
++});
++
++describe("denúncias", () => {
++  it("categoria obrigatória; «other» exige motivo; erros no formato único", async () => {
++    const author = await account();
++    const reporter = await account();
++    const post = await makePost(author.user.id);
++    const url = `/posts/${post.id}/report`;
++
++    const noCategory = await request(app.server)
++      .post(url)
++      .set(bearer(reporter.token))
++      .send({});
++    expect(noCategory.status).toBe(400);
++    expect(noCategory.body.error).toBe("validation_error");
++
++    const noReason = await request(app.server)
++      .post(url)
++      .set(bearer(reporter.token))
++      .send({ category: "other" });
++    expect(noReason.status).toBe(400);
++    expect(noReason.body.fields).toHaveProperty("reason");
++  });
++
++  it("não se denuncia o próprio post (400 own_post) nem um inexistente (404)", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    const own = await request(app.server)
++      .post(`/posts/${post.id}/report`)
++      .set(bearer(author.token))
++      .send({ category: "spam" });
++    expect(own.status).toBe(400);
++    expect(own.body).toEqual({ error: "own_post" });
++
++    const missing = await request(app.server)
++      .post("/posts/0190a0a0-0000-7000-8000-000000000099/report")
++      .set(bearer(author.token))
++      .send({ category: "spam" });
++    expect(missing.status).toBe(404);
++    expect(missing.body).toEqual({ error: "not_found" });
++  });
++
++  it("criar (200 created), repetir (200 duplicate), retirar (200) e repetir retirar", async () => {
++    const author = await account();
++    const reporter = await account();
++    const post = await makePost(author.user.id);
++    const url = `/posts/${post.id}/report`;
++    const send = () =>
++      request(app.server)
++        .post(url)
++        .set(bearer(reporter.token))
++        .send({ category: "offensive" });
++
++    expect((await send()).body).toEqual({ outcome: "created" });
++    expect((await send()).body).toEqual({ outcome: "duplicate" });
++
++    const del = () =>
++      request(app.server).delete(url).set(bearer(reporter.token));
++    expect((await del()).body).toEqual({ withdrawn: true });
++    expect((await del()).body).toEqual({ withdrawn: true });
++    // Retirada continua a contar como «já denunciou» (D2).
++    expect((await send()).body).toEqual({ outcome: "duplicate" });
++  });
++
++  it("retirar sem nunca ter denunciado → 404", async () => {
++    const author = await account();
++    const reporter = await account();
++    const post = await makePost(author.user.id);
++    const res = await request(app.server)
++      .delete(`/posts/${post.id}/report`)
++      .set(bearer(reporter.token));
++    expect(res.status).toBe(404);
++  });
++
++  it("a denúncia que escala o post tira-o do feed logo (invalida a cache)", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    expect((await request(app.server).get("/posts")).body.posts).toHaveLength(
++      1,
++    );
++
++    const db = await getTestDb();
++    for (let i = 0; i < 3; i++) {
++      const reporter = await makeUserWithPassword();
++      await db
++        .update(users)
++        .set({ createdAt: new Date(Date.now() - 30 * 24 * 3600 * 1000) })
++        .where(eq(users.id, reporter.user.id));
++      await makePost(reporter.user.id);
++      const login = await request(app.server)
++        .post("/auth/login")
++        .send({
++          username: reporter.user.username,
++          password: reporter.plainPassword,
++        });
++      const res = await request(app.server)
++        .post(`/posts/${post.id}/report`)
++        .set(bearer(login.body.accessToken))
++        .send({ category: "doctrine" });
++      expect(res.body).toEqual({ outcome: "created" });
++    }
++    const feed = await request(app.server).get("/posts");
++    expect(feed.body.posts.map((p: { id: string }) => p.id)).not.toContain(
++      post.id,
++    );
++  });
++});
+diff --git a/apps/api/test/routes/sync.test.ts b/apps/api/test/routes/sync.test.ts
+new file mode 100644
+index 0000000..c5d7e43
+--- /dev/null
++++ b/apps/api/test/routes/sync.test.ts
+@@ -0,0 +1,424 @@
++import { eq } from "drizzle-orm";
++import { Redis } from "ioredis";
++import request from "supertest";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { users } from "../../src/db/schema.js";
++import { loadEnv } from "../../src/env.js";
++import { postsRepo } from "../../src/repositories/posts.js";
++import { buildServer } from "../../src/server.js";
++import { cardsRepo } from "../../src/repositories/cards.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import {
++  makeLike,
++  makePost,
++  makeUserWithPassword,
++} from "../helpers/factories.js";
++
++const baseEnv = {
++  NODE_ENV: "test",
++  LOG_LEVEL: "fatal",
++  APP_VERSION: "test",
++} as const;
++
++type App = Awaited<ReturnType<typeof buildServer>>;
++
++let app: App;
++let redis: Redis | null = null;
++let counter = 0;
++
++const uuid = () =>
++  `0190a0a0-0000-7000-8000-${String(++counter).padStart(12, "0")}`;
++const key = () => `sync-chave-${String(++counter).padStart(8, "0")}-abcdef`;
++const bearer = (t: string) => ({ Authorization: `Bearer ${t}` });
++
++async function account(a: App = app, role: "user" | "admin" = "user") {
++  const { user, plainPassword } = await makeUserWithPassword({ role });
++  const res = await request(a.server)
++    .post("/auth/login")
++    .send({ username: user.username, password: plainPassword });
++  return { user, token: res.body.accessToken as string };
++}
++
++const op = {
++  create: (extra: Record<string, unknown> = {}, k = key()) => ({
++    op_id: uuid(),
++    idempotency_key: k,
++    type: "post.create",
++    payload: {
++      category: "entendimento",
++      title: "Offline",
++      content: "Escrito sem rede.",
++      ...extra,
++    },
++  }),
++  postOp: (
++    type: string,
++    postId: string,
++    extra: Record<string, unknown> = {},
++  ) => ({
++    op_id: uuid(),
++    idempotency_key: key(),
++    type,
++    payload: { postId, ...extra },
++  }),
++};
++
++function sync(a: App, token: string, operations: unknown[]) {
++  return request(a.server)
++    .post("/sync")
++    .set(bearer(token))
++    .send({ operations });
++}
++
++async function flush(): Promise<void> {
++  if (!redis) return;
++  for (const pattern of ["cc:v1:feed:*", "rl:*"]) {
++    const keys = await redis.keys(pattern);
++    if (keys.length > 0) await redis.del(...keys);
++  }
++}
++
++beforeAll(async () => {
++  await getTestDb();
++  if (process.env.REDIS_URL) redis = new Redis(process.env.REDIS_URL);
++  app = await buildServer({ env: loadEnv(baseEnv) });
++  await app.ready();
++});
++afterAll(async () => {
++  await app.close();
++  await redis?.quit();
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++  await flush();
++});
++
++describe("POST /sync", () => {
++  it("sem sessão → 401 antes de validar o corpo", async () => {
++    const res = await request(app.server).post("/sync").send({});
++    expect(res.status).toBe(401);
++  });
++
++  it("lote vazio, demais operações, op_id repetido ou campos a mais → 400", async () => {
++    const { token } = await account();
++    expect((await sync(app, token, [])).status).toBe(400);
++    const many = Array.from({ length: 21 }, () => op.create());
++    expect((await sync(app, token, many)).status).toBe(400);
++
++    const one = op.create();
++    const dup = await sync(app, token, [
++      one,
++      { ...op.create(), op_id: one.op_id },
++    ]);
++    expect(dup.status).toBe(400);
++    expect(dup.body.error).toBe("validation_error");
++
++    const extra = op.create({ authorId: "x" });
++    expect((await sync(app, token, [extra])).status).toBe(400);
++  });
++
++  it("aplica o lote por ordem; repetir o lote devolve `duplicate` sem repetir efeitos", async () => {
++    const author = await account();
++    const me = await account();
++    const target = await makePost(author.user.id);
++
++    const create = op.create();
++    const like = op.postOp("post.like", target.id);
++    const report = op.postOp("post.report", target.id, { category: "spam" });
++    const batch = [create, like, report];
++
++    const first = await sync(app, me.token, batch);
++    expect(first.status).toBe(200);
++    expect(first.body.results.map((r: { op_id: string }) => r.op_id)).toEqual(
++      batch.map((o) => o.op_id),
++    );
++    expect(first.body.results.map((r: { status: string }) => r.status)).toEqual(
++      ["applied", "applied", "applied"],
++    );
++    expect(first.body.results[0].result.status).toBe("published");
++    expect(first.body.results[1].result).toEqual({
++      likesCount: 1,
++      isLiked: true,
++    });
++    expect(first.body.results[2].result).toEqual({ outcome: "created" });
++    expect(first.body.results[0].result).not.toHaveProperty("replayed");
++
++    const second = await sync(app, me.token, batch);
++    expect(
++      second.body.results.map((r: { status: string }) => r.status),
++    ).toEqual(["duplicate", "duplicate", "duplicate"]);
++    // O post criado é o mesmo e só há um.
++    expect(second.body.results[0].result.post.id).toBe(
++      first.body.results[0].result.post.id,
++    );
++    const db = await getTestDb();
++    expect(await postsRepo(db).countByAuthor(me.user.id)).toBe(1);
++  });
++
++  it("apagar e retirar: applied na 1.ª vez, duplicate na 2.ª", async () => {
++    const author = await account();
++    const reporter = await account();
++    const post = await makePost(author.user.id);
++    await sync(app, reporter.token, [
++      op.postOp("post.report", post.id, { category: "spam" }),
++    ]);
++
++    const unreport = op.postOp("post.unreport", post.id);
++    const r1 = await sync(app, reporter.token, [unreport]);
++    expect(r1.body.results[0]).toMatchObject({
++      status: "applied",
++      result: { withdrawn: true },
++    });
++    const r2 = await sync(app, reporter.token, [
++      { ...unreport, op_id: uuid() },
++    ]);
++    expect(r2.body.results[0].status).toBe("duplicate");
++
++    const del = op.postOp("post.delete", post.id);
++    const d1 = await sync(app, author.token, [del]);
++    expect(d1.body.results[0]).toMatchObject({
++      status: "applied",
++      result: { deleted: true },
++    });
++    const d2 = await sync(app, author.token, [{ ...del, op_id: uuid() }]);
++    expect(d2.body.results[0].status).toBe("duplicate");
++  });
++
++  it("erro de uma operação não impede as outras (rejected com o código)", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    const res = await sync(app, author.token, [
++      op.postOp("post.like", "0190a0a0-0000-7000-8000-00000000ffff"),
++      op.postOp("post.report", post.id, { category: "spam" }), // o próprio post
++      op.create({ content: "vê https://exemplo.com" }),
++      op.create({ content: "liga +258 84 123 4567" }),
++      op.create({ gospelCardSlug: "nao-existe" }),
++      op.create(),
++    ]);
++    expect(res.status).toBe(200);
++    const out = res.body.results as {
++      status: string;
++      error?: { code: string };
++    }[];
++    expect(out.map((r) => [r.status, r.error?.code])).toEqual([
++      ["rejected", "not_found"],
++      ["rejected", "own_post"],
++      ["rejected", "contains_link"],
++      ["rejected", "contains_contact"],
++      ["rejected", "gospel_card_not_found"],
++      ["applied", undefined],
++    ]);
++  });
++
++  it("mesma chave com outro corpo → rejected idempotency_key_conflict", async () => {
++    const { token } = await account();
++    const k = key();
++    await sync(app, token, [op.create({}, k)]);
++    const res = await sync(app, token, [op.create({ title: "Outro" }, k)]);
++    expect(res.body.results[0]).toMatchObject({
++      status: "rejected",
++      error: { code: "idempotency_key_conflict" },
++    });
++  });
++
++  it("conta em apagamento: tudo rejected com forbidden", async () => {
++    const { token, user } = await account();
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ deletionRequestedAt: new Date() })
++      .where(eq(users.id, user.id));
++    const res = await sync(app, token, [op.create()]);
++    expect(res.body.results[0]).toMatchObject({
++      status: "rejected",
++      error: { code: "forbidden" },
++    });
++  });
++
++  it("post em revisão no lote: applied, mas não invalida nem aparece no feed público", async () => {
++    const { token } = await account();
++    const res = await sync(app, token, [
++      op.create({
++        title: "A".repeat(60),
++        content: "B".repeat(60),
++      }),
++    ]);
++    expect(res.body.results[0].result.status).toBe("pending_review");
++    expect((await request(app.server).get("/posts")).body.posts).toHaveLength(
++      0,
++    );
++  });
++
++  it("a criação em lote invalida o feed (aparece logo)", async () => {
++    const { token } = await account();
++    await request(app.server).get("/posts");
++    await sync(app, token, [op.create()]);
++    expect((await request(app.server).get("/posts")).body.posts).toHaveLength(
++      1,
++    );
++  });
++});
++
++describe("POST /sync — limites por operação (D5)", () => {
++  let limited: App;
++  beforeAll(async () => {
++    limited = await buildServer({
++      env: loadEnv({ ...baseEnv, RATE_LIMIT_LIKES_MAX: "2" }),
++    });
++    await limited.ready();
++  });
++  afterAll(async () => {
++    await limited.close();
++  });
++
++  it("operações acima do limite do tipo voltam `deferred` com rate_limited e retryAfter", async () => {
++    const author = await account(limited);
++    const me = await account(limited);
++    const posts = [];
++    for (let i = 0; i < 4; i++) posts.push(await makePost(author.user.id));
++
++    const res = await sync(
++      limited,
++      me.token,
++      posts.map((p) => op.postOp("post.like", p.id)),
++    );
++    expect(res.status).toBe(200);
++    const out = res.body.results as {
++      status: string;
++      error?: { code: string; retryAfter?: number };
++    }[];
++    expect(out.map((r) => r.status)).toEqual([
++      "applied",
++      "applied",
++      "deferred",
++      "deferred",
++    ]);
++    expect(out[2]?.error?.code).toBe("rate_limited");
++    expect(out[2]?.error?.retryAfter).toBeGreaterThan(0);
++  });
++
++  it("os likes consumidos no REST contam para o /sync (mesmo balde)", async () => {
++    const author = await account(limited);
++    const me = await account(limited);
++    const a = await makePost(author.user.id);
++    const b = await makePost(author.user.id);
++    const c = await makePost(author.user.id);
++    await request(limited.server)
++      .post(`/posts/${a.id}/like`)
++      .set(bearer(me.token));
++    await request(limited.server)
++      .post(`/posts/${b.id}/like`)
++      .set(bearer(me.token));
++
++    const res = await sync(limited, me.token, [op.postOp("post.like", c.id)]);
++    expect(res.body.results[0].status).toBe("deferred");
++  });
++});
++
++describe("POST /sync — limite do lote", () => {
++  it("pedidos /sync acima do limite → 429 com Retry-After", async () => {
++    const tight = await buildServer({
++      env: loadEnv({ ...baseEnv, RATE_LIMIT_SYNC_MAX: "1" }),
++    });
++    await tight.ready();
++    try {
++      const { token } = await account(tight);
++      expect((await sync(tight, token, [op.create()])).status).toBe(200);
++      const blocked = await sync(tight, token, [op.create()]);
++      expect(blocked.status).toBe(429);
++      expect(blocked.body).toEqual({ error: "rate_limited" });
++      expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
++    } finally {
++      await tight.close();
++    }
++  });
++});
++
++describe("GET /sync/bootstrap", () => {
++  it("sem sessão → 401", async () => {
++    expect((await request(app.server).get("/sync/bootstrap")).status).toBe(401);
++  });
++
++  it("devolve o estado do utilizador sem expor authorId", async () => {
++    const me = await account();
++    const other = await account();
++    const db = await getTestDb();
++    await cardsRepo(db).create({
++      slug: "card-001",
++      title: "Card",
++      gospelReference: "Mateus 2",
++      summary: "Resumo",
++      otReferences: [],
++      ntReferences: [],
++      orderIndex: 1,
++    });
++    const mine = await makePost(me.user.id, { title: "minha" });
++    const pending = await makePost(me.user.id, {
++      title: "em revisão",
++      status: "pending_review",
++    });
++    const liked = await makePost(other.user.id, { title: "dele" });
++    await makeLike(liked.id, me.user.id);
++    await sync(app, me.token, [
++      op.postOp("post.report", liked.id, { category: "spam" }),
++    ]);
++    await sync(app, me.token, [op.postOp("post.unreport", liked.id)]);
++
++    const res = await request(app.server)
++      .get("/sync/bootstrap")
++      .set(bearer(me.token));
++    expect(res.status).toBe(200);
++    const body = res.body;
++    expect(body.user).toMatchObject({
++      id: me.user.id,
++      username: me.user.username,
++    });
++    expect(body.cards.map((c: { slug: string }) => c.slug)).toEqual([
++      "card-001",
++    ]);
++
++    const myIds = body.myPosts.map((p: { id: string }) => p.id);
++    expect(myIds).toContain(mine.id);
++    expect(myIds).toContain(pending.id);
++    expect(body.myPostsTruncated).toBe(false);
++
++    expect(body.myLikedPostIds).toEqual([liked.id]);
++    expect(body.myLikedPostIdsTruncated).toBe(false);
++
++    const recent = body.recentPosts.posts as {
++      id: string;
++      isMine: boolean;
++      isLiked: boolean;
++    }[];
++    expect(recent.find((p) => p.id === mine.id)?.isMine).toBe(true);
++    expect(recent.find((p) => p.id === liked.id)?.isLiked).toBe(true);
++    expect(recent.map((p) => p.id)).not.toContain(pending.id);
++
++    expect(body.myReports).toHaveLength(1);
++    expect(body.myReports[0]).toMatchObject({
++      postId: liked.id,
++      category: "spam",
++      status: "withdrawn",
++    });
++    expect(body.myReportsTruncated).toBe(false);
++
++    // Os outros utilizadores nunca aparecem pelo identificador.
++    expect(JSON.stringify(body.recentPosts)).not.toContain(other.user.id);
++    expect(JSON.stringify(body.myPosts)).not.toContain('"authorId"');
++  });
++
++  it("conta em apagamento → 403 account_inactive", async () => {
++    const { token, user } = await account();
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ deletionRequestedAt: new Date() })
++      .where(eq(users.id, user.id));
++    const res = await request(app.server)
++      .get("/sync/bootstrap")
++      .set(bearer(token));
++    expect(res.status).toBe(403);
++    expect(res.body.error).toBe("account_inactive");
++  });
++});
+diff --git a/apps/api/test/services/posts.test.ts b/apps/api/test/services/posts.test.ts
+index b8bff7b..94afc10 100644
+--- a/apps/api/test/services/posts.test.ts
++++ b/apps/api/test/services/posts.test.ts
+@@ -411,7 +411,7 @@ describe("denúncias", () => {
+     );
+     expect(first).toEqual({
+       ok: true,
+-      data: { outcome: "created", changed: true },
++      data: { outcome: "created", changed: true, escalated: false },
+     });
+     const second = await reportPostService(
+       deps,
+@@ -422,7 +422,7 @@ describe("denúncias", () => {
+     );
+     expect(second).toEqual({
+       ok: true,
+-      data: { outcome: "duplicate", changed: false },
++      data: { outcome: "duplicate", changed: false, escalated: false },
+     });
+     expect(await eventsOf("post.reported")).toHaveLength(1);
+   });
+@@ -445,6 +445,8 @@ describe("denúncias", () => {
+         undefined,
+       );
+       expect(result.ok).toBe(true);
++      // Só a 3.ª denúncia atravessa o limiar.
++      if (result.ok) expect(result.data.escalated).toBe(i === 2);
+     }
+ 
+     const [row] = await db.select().from(posts).where(eq(posts.id, post.id));
+diff --git a/apps/api/test/workers/outbox-worker.test.ts b/apps/api/test/workers/outbox-worker.test.ts
+new file mode 100644
+index 0000000..3894b6e
+--- /dev/null
++++ b/apps/api/test/workers/outbox-worker.test.ts
+@@ -0,0 +1,104 @@
++import { eq } from "drizzle-orm";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { outbox } from "../../src/db/schema.js";
++import { outboxRepo } from "../../src/repositories/outbox.js";
++import {
++  backoffMs,
++  processOutboxBatch,
++} from "../../src/workers/outbox-worker.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++
++const AGG = "0190a0a0-0000-7000-8000-000000000001";
++
++async function enqueue(eventType: string) {
++  const db = await getTestDb();
++  return outboxRepo(db).enqueue({
++    aggregateType: "post",
++    aggregateId: AGG,
++    eventType,
++    payload: { postId: AGG },
++  });
++}
++
++async function statusOf(id: string) {
++  const db = await getTestDb();
++  const [row] = await db.select().from(outbox).where(eq(outbox.id, id));
++  return row!;
++}
++
++beforeAll(async () => {
++  await getTestDb();
++});
++afterAll(async () => {
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++});
++
++describe("outbox worker", () => {
++  it("evento sem handler fica concluído (a tabela não cresce)", async () => {
++    const db = await getTestDb();
++    const e = await enqueue("post.liked");
++    const r = await processOutboxBatch(db, { batchSize: 10 });
++    expect(r).toEqual({ claimed: 1, done: 1, failed: 0 });
++    const row = await statusOf(e.id);
++    expect(row.status).toBe("done");
++    expect(row.processedAt).toBeInstanceOf(Date);
++  });
++
++  it("chama o handler do tipo certo, uma vez", async () => {
++    const db = await getTestDb();
++    const seen: string[] = [];
++    await enqueue("post.created");
++    await enqueue("post.liked");
++    const r = await processOutboxBatch(db, {
++      batchSize: 10,
++      handlers: {
++        "post.created": async (ev) => {
++          seen.push(ev.eventType);
++        },
++      },
++    });
++    expect(seen).toEqual(["post.created"]);
++    expect(r.done).toBe(2);
++  });
++
++  it("handler que lança: volta à fila com atraso e o log não traz a mensagem", async () => {
++    const db = await getTestDb();
++    const logs: Record<string, unknown>[] = [];
++    const e = await enqueue("post.created");
++    const r = await processOutboxBatch(db, {
++      batchSize: 10,
++      log: { info: () => {}, warn: (o) => void logs.push(o) },
++      handlers: {
++        "post.created": async () => {
++          throw new Error("segredo do utilizador");
++        },
++      },
++    });
++    expect(r).toEqual({ claimed: 1, done: 0, failed: 1 });
++    const row = await statusOf(e.id);
++    expect(row.status).toBe("pending");
++    expect(row.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
++    expect(JSON.stringify(logs)).not.toContain("segredo");
++
++    // Ainda não é elegível: a ronda seguinte não o apanha.
++    const again = await processOutboxBatch(db, { batchSize: 10 });
++    expect(again.claimed).toBe(0);
++  });
++
++  it("respeita o tamanho do lote", async () => {
++    const db = await getTestDb();
++    for (let i = 0; i < 3; i++) await enqueue("post.liked");
++    const r = await processOutboxBatch(db, { batchSize: 2 });
++    expect(r.claimed).toBe(2);
++  });
++
++  it("backoff exponencial com tecto", () => {
++    expect(backoffMs(1)).toBe(1000);
++    expect(backoffMs(2)).toBe(2000);
++    expect(backoffMs(4)).toBe(8000);
++    expect(backoffMs(50)).toBe(5 * 60_000);
++  });
++});
+diff --git a/docs/registos/E4c-rotas-cache-sync.md b/docs/registos/E4c-rotas-cache-sync.md
+new file mode 100644
+index 0000000..3446298
+--- /dev/null
++++ b/docs/registos/E4c-rotas-cache-sync.md
+@@ -0,0 +1,86 @@
++# E4-c — Rotas de posts, cache do feed e `/sync`
++
++Data: 2026-11-14 · Segue o E4-b. Continua a **não haver merge** da branch do E4: rotas, cache e
++`/sync` foram reescritos sobre o `dev` (F1–F8 + E4-a + E4-b), corrigindo os achados da revisão.
++
++## 1. Check — o que a revisão encontrou e este bloco resolve
++
++| #   | Problema no E4                                                                                                 | Gravidade |
++| --- | -------------------------------------------------------------------------------------------------------------- | --------- |
++| 1   | Invalidação da cache do feed com `SCAN` + `DEL` em massa (O(N) por escrita, bloqueia o Redis)                  | Alta      |
++| 2   | Todo like/denúncia invalidava a cache: a cache deixava de servir sob carga                                     | Alta      |
++| 3   | Valor lido do Redis aceite sem validação (`JSON.parse as ...`)                                                 | Média     |
++| 4   | Erros do Redis registados com o objecto `err` (host/porta) e a chave                                           | Média     |
++| 5   | Cache de qualquer página (incluindo cursores): chaves a crescer e dados antigos                                | Média     |
++| 6   | `/sync` sem os limites por operação: contornava os limites do REST                                             | Crítica   |
++| 7   | `/sync` dava `applied` a operações repetidas e `rejected` ao apagar/retirar pela 2.ª vez                       | Média     |
++| 8   | `/sync` com uma transacção por operação aberta e o serviço a usar o pool: 2 ligações por operação              | Alta      |
++| 9   | Lote sem prazo: um lote lento segurava o pedido até o proxy cortar                                             | Média     |
++| 10  | Denúncia devolvia 200/400/404 com corpo `{ outcome }` para erros (formato de erro diferente do resto da API)   | Média     |
++| 11  | `GET /posts/:id` mostrava `pending_review` a qualquer pessoa e não deixava o autor ver os seus estados         | Alta      |
++| 12  | Token inválido em leitura pública ignorado em silêncio (cliente ficava sem os seus likes, sem renovar o token) | Média     |
++| 13  | Post do próprio autor injectado em qualquer filtro/página: duplicados ao paginar                               | Média     |
++| 14  | Corpo validado antes da sessão: pedidos sem token recebiam erros de validação                                  | Baixa     |
++| 15  | Bootstrap com `myReports` sem o estado `withdrawn` (quebrava a resposta) e listas cortadas sem aviso           | Alta      |
++| 16  | Eventos do outbox sem consumidor: ficavam `pending` para sempre (um por like)                                  | Alta      |
++| 17  | Bootstrap devolvia o `id` interno de outros utilizadores via `authorId` nos posts                              | Alta      |
++
++## 2. Decisões
++
++| Tema                          | Escolha                                                                                                           |
++| ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
++| Cache do feed (D7)            | Só 1.ª página de `recent`/`top`; chaves versionadas, `INCR`; TTL 30 s (`FEED_CACHE_TTL_S`); likes não invalidam   |
++| Quando invalida               | Criar post publicado, apagar (se mudou), denúncia que escala o post, `/sync` com qualquer destes (1 vez por lote) |
++| Cursor (D8)                   | Páginas com cursor nunca passam pela cache; cursor adulterado → 400 `validation_error`                            |
++| Leitura com sessão opcional   | Sem `Authorization` = anónimo; com `Authorization` o token tem de ser válido (senão 401)                          |
++| `GET /posts/:id` (D4)         | `published` para todos; outros estados só autor e admin (admin revalidado na BD); caso contrário 404              |
++| Post em revisão do autor      | Injectado só no topo da 1.ª página de `recent` (nunca está nas páginas públicas: sem duplicados)                  |
++| `/sync` (D5)                  | Cada operação paga o balde do REST do seu tipo + o balde do lote; acima do limite → `deferred` + `retryAfter`     |
++| `/sync` e erros inesperados   | `deferred` + `internal` (repetir é seguro: serviços transaccionais e idempotentes), não `rejected`                |
++| Prazo do lote                 | `SYNC_BATCH_TIMEOUT_MS` (8 s); operações não tentadas → `deferred`                                                |
++| `account_inactive` no `/sync` | `forbidden`                                                                                                       |
++| Worker do outbox              | Evento sem handler = concluído (nenhum consumidor existe ainda); handler que lança → backoff, `failed` após 6     |
++| Erros das rotas               | Sempre `{ error }` no formato único; denúncia: 400 `own_post`, 404 `not_found`; sucesso 200 `{ outcome }`         |
++
++## 3. Alterações
++
++- `cache/feed-cache.ts` (reescrito): versão em Redis, single-flight, valor validado com zod, falhas
++  do Redis só registam nome/código, `invalidate()` nunca lança. A página em cache leva `authorIds`
++  interno (não sai da API) para calcular `isMine` por espectador.
++- `services/feed-view.ts` (novo): `decorateForViewer` (`isLiked` numa consulta por página; `isMine`
++  sem consulta); devolve cópias.
++- `routes/posts.ts` (reescrito): `GET /posts`, `GET /posts/:id`, `POST /posts` (201; repetição com a
++  mesma chave → 200), `DELETE /posts/:id`, `POST|DELETE /posts/:id/like`, `POST|DELETE /posts/:id/report`.
++  Autenticação em `preValidation`.
++- `routes/sync.ts` (reescrito): `POST /sync`, `GET /sync/bootstrap` (limites e flags `...Truncated`).
++- `auth/middleware.ts`: `optionalAuth`.
++- `services/posts.ts`: `reportPostService` devolve também `escalated`.
++- `workers/outbox-worker.ts` (novo) + registo no `server.ts` (fora dos testes).
++- `server.ts`: uma instância de `cardsCache` e de `feedCache` por processo; regista posts e sync.
++- `packages/shared/src/sync.ts`: `op_id` único por lote; `withdrawn` em `myReports`;
++  `myPostsTruncated`, `myLikedPostIdsTruncated`, `myReportsTruncated`.
++- `env.ts` + `.env.example`: `SYNC_BATCH_TIMEOUT_MS`, `FEED_CACHE_TTL_S`, `OUTBOX_WORKER_INTERVAL_MS`,
++  `OUTBOX_WORKER_BATCH_SIZE`.
++- Testes: `cache/feed-cache`, `routes/posts`, `routes/sync`, `workers/outbox-worker`; `services/posts`
++  ajustado (`escalated`).
++
++## 4. Segurança e privacidade
++
++- Nenhuma resposta (feed, post, bootstrap, `/sync`) contém `authorId`; a cache guarda-o só em Redis
++  (dado interno), nunca serializado para o cliente.
++- Estados não públicos dão 404, nunca 403: não se confirma a existência de posts alheios.
++- Sem sessão válida, o pedido é recusado antes de o corpo ser validado.
++- Logs sem IP, sem mensagens de erro, sem conteúdo: só `errorName`/`errorCode`/tipo de operação.
++- `/sync` não é porta lateral: mesmos limites por operação que o REST (baldes partilhados).
++- Atraso conhecido: o contador de likes do feed público e o nome do autor (conta que pediu
++  apagamento) podem demorar até `FEED_CACHE_TTL_S` (30 s) a reflectir-se na 1.ª página em cache.
++
++## 5. Como verificar
++
++```
++pnpm typecheck
++pnpm test
++```
++
++Os testes de rotas usam Postgres e Redis reais (como `cards.test.ts`); `feed-cache.test.ts` usa
++Redis simulado.
+diff --git a/packages/shared/src/sync.ts b/packages/shared/src/sync.ts
+index e805689..7eea9a0 100644
+--- a/packages/shared/src/sync.ts
++++ b/packages/shared/src/sync.ts 
+@@ -69,9 +69,24 @@ export const SyncOperation = z.discriminatedUnion("type", [
+ export type SyncOperation = z.infer<typeof SyncOperation>;
+ export type SyncOperationType = SyncOperation["type"];
+ 
+-export const SyncRequest = z.object({
+-  operations: z.array(SyncOperation).min(1).max(MAX_SYNC_BATCH_OPS),
+-});
++export const SyncRequest = z
++  .object({
++    operations: z.array(SyncOperation).min(1).max(MAX_SYNC_BATCH_OPS),
++  })
++  .superRefine((req, ctx) => {
++    // Os resultados vêm indexados por `op_id`: um repetido tornaria a resposta ambígua.
++    const seen = new Set<string>();
++    req.operations.forEach((op, i) => {
++      if (seen.has(op.op_id)) {
++        ctx.addIssue({
++          code: "custom",
++          path: ["operations", i, "op_id"],
++          message: "op_id repetido no mesmo lote",
++        });
++      }
++      seen.add(op.op_id);
++    });
++  });
+ export type SyncRequest = z.infer<typeof SyncRequest>;
+ 
+ export const SyncStatus = z.enum([
+@@ -154,16 +169,26 @@ export const SyncBootstrapResponse = z.object({
+     nextCursor: z.string().nullable(),
+   }),
+   myPosts: z.array(PostPublic),
++  /** Havia mais partilhas do que as devolvidas: o cliente não deve assumir que a lista é completa. */
++  myPostsTruncated: z.boolean(),
+   myLikedPostIds: z.array(z.uuid()),
++  myLikedPostIdsTruncated: z.boolean(),
+   myReports: z.array(
+     z.object({
+       id: z.uuid(),
+       postId: z.uuid(),
+       category: ReportCategory,
+       reason: z.string().nullable(),
+-      status: z.enum(["open", "resolved_kept", "resolved_removed"]),
++      status: z.enum([
++        "open",
++        "resolved_kept",
++        "resolved_removed",
++        /** O próprio utilizador retirou a denúncia (continua a contar como «já denunciou»). */
++        "withdrawn",
++      ]),
+       createdAt: z.iso.datetime(),
+     }),
+   ),
++  myReportsTruncated: z.boolean(),
+ });
+ export type SyncBootstrapResponse = z.infer<typeof SyncBootstrapResponse>;

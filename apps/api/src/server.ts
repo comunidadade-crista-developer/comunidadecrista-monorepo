@@ -17,6 +17,7 @@ import { createPasswordService } from "./auth/password.js";
 import { createRateLimiters } from "./auth/rate-limit.js";
 import { createRecoveryService } from "./auth/recovery.js";
 import { createCardsCache } from "./cache/cards-cache.js";
+import { createFeedCache } from "./cache/feed-cache.js";   
 import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
 import { errorHandler, notFoundHandler } from "./http-errors.js";
@@ -32,6 +33,9 @@ import { accountRoutes } from "./routes/account.js";
 import { authRoutes } from "./routes/auth.js";
 import { cardsRoutes } from "./routes/cards.js";
 import { healthRoutes } from "./routes/health.js";
+import { postsRoutes } from "./routes/posts.js";
+import { syncRoutes } from "./routes/sync.js";
+import { startOutboxWorker } from "./workers/outbox-worker.js";   
 
 export type AppInstance = FastifyInstance<
   RawServerDefault,
@@ -181,13 +185,31 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       jwt,
       limiters,
     });
-    await app.register(cardsRoutes, {
-      cache: createCardsCache({
-        redis,
-        cards: cardsRepo(dbBundle.db),
-        logger: app.log,
-      }),
+    const cardsCache = createCardsCache({
+      redis,
+      cards: cardsRepo(dbBundle.db),
+      logger: app.log,
+    });
+    const feedCache = createFeedCache({
+      redis,
+      db: dbBundle.db,
+      logger: app.log,
+      ttlSeconds: env.FEED_CACHE_TTL_S,
+    });
+    await app.register(cardsRoutes, { cache: cardsCache, limiters });
+    await app.register(postsRoutes, {
+      db: dbBundle.db,
+      jwt,
       limiters,
+      feedCache,
+    });
+    await app.register(syncRoutes, {
+      env,
+      db: dbBundle.db,
+      jwt,
+      limiters,
+      feedCache,
+      cardsCache,
     });
 
     // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
@@ -199,11 +221,18 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
         log: app.log,
       });
       app.addHook("onClose", async () => stopMaintenance());
+      const stopOutbox = startOutboxWorker({
+        db: dbBundle.db,
+        log: app.log,
+        intervalMs: env.OUTBOX_WORKER_INTERVAL_MS,
+        batchSize: env.OUTBOX_WORKER_BATCH_SIZE,
+      });
+      app.addHook("onClose", async () => stopOutbox())
     }
   } else {
     app.log.warn(
-      "DATABASE_URL não configurado — rotas de auth, conta e cards desactivadas.",
-    );
+      "DATABASE_URL não configurado — rotas de auth, conta, cards, posts e sync desactivadas.",
+    );   
   }
 
   return app;

@@ -411,7 +411,7 @@ describe("denúncias", () => {
     );
     expect(first).toEqual({
       ok: true,
-      data: { outcome: "created", changed: true },
+      data: { outcome: "created", changed: true, escalated: false },
     });
     const second = await reportPostService(
       deps,
@@ -422,7 +422,7 @@ describe("denúncias", () => {
     );
     expect(second).toEqual({
       ok: true,
-      data: { outcome: "duplicate", changed: false },
+      data: { outcome: "duplicate", changed: false, escalated: false },
     });
     expect(await eventsOf("post.reported")).toHaveLength(1);
   });
@@ -445,6 +445,8 @@ describe("denúncias", () => {
         undefined,
       );
       expect(result.ok).toBe(true);
+      // Só a 3.ª denúncia atravessa o limiar.
+      if (result.ok) expect(result.data.escalated).toBe(i === 2);
     }
 
     const [row] = await db.select().from(posts).where(eq(posts.id, post.id));

@@ -1,0 +1,22 @@
+diff --git a/apps/api/test/routes/sync.test.ts b/apps/api/test/routes/sync.test.ts
+index c5d7e43..c8fc243 100644
+--- a/apps/api/test/routes/sync.test.ts
++++ b/apps/api/test/routes/sync.test.ts
+@@ -264,7 +264,7 @@ describe("POST /sync — limites por operação (D5)", () => {
+   let limited: App;
+   beforeAll(async () => {
+     limited = await buildServer({
+-      env: loadEnv({ ...baseEnv, RATE_LIMIT_LIKES_MAX: "2" }),
++      env: loadEnv({ ...baseEnv, RATE_LIMIT_LIKES_MAX: 2 }),
+     });
+     await limited.ready();
+   });
+@@ -319,7 +319,7 @@ describe("POST /sync — limites por operação (D5)", () => {
+ describe("POST /sync — limite do lote", () => {
+   it("pedidos /sync acima do limite → 429 com Retry-After", async () => {
+     const tight = await buildServer({
+-      env: loadEnv({ ...baseEnv, RATE_LIMIT_SYNC_MAX: "1" }),
++      env: loadEnv({ ...baseEnv, RATE_LIMIT_SYNC_MAX: 1 }),
+     });
+     await tight.ready();
+     try {

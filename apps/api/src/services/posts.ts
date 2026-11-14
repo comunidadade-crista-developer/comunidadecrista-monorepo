@@ -19,11 +19,6 @@ import { usersRepo } from "../repositories/users.js";
 import { presentOne } from "./post-presenter.js";
 
 export interface ServicesDeps {
-  /**
-   * O pool ou uma transacção já aberta. Cada serviço corre na sua própria transacção (dentro
-   * de uma transacção aberta passa a ser um savepoint): tudo o que o serviço escreve — post,
-   * chave de idempotência, evento de outbox, contadores — fica ou desaparece junto.
-   */
   db: Executor;
 }
 
@@ -65,11 +60,6 @@ function fail<C extends ServiceError["code"]>(
   return { ok: false, error: { code, status } as ErrorOf<C> };
 }
 
-/**
- * Escrever exige conta activa: sem apagamento pendente e não apagada. É uma leitura por chave
- * primária, feita a cada escrita (as leituras públicas não pagam este custo), por isso o
- * bloqueio é imediato — não espera pela expiração do token de acesso.
- */
 async function isAccountActive(
   exec: Executor,
   userId: string,
@@ -77,8 +67,6 @@ async function isAccountActive(
   const user = await usersRepo(exec).findById(userId);
   return user !== null && user.deletionRequestedAt === null;
 }
-
-// ---------- Criar ----------
 
 export interface CreatePostInput {
   category: PostCategory;
@@ -115,10 +103,6 @@ function hashCreateRequest(input: CreatePostInput): string {
     .digest("hex");
 }
 
-/**
- * A chave já existe: é uma repetição (mesma operação e mesmo corpo → repete a resposta) ou
- * um erro do cliente (mesma chave, outro pedido → 409). Nunca cria nada.
- */
 async function resolveExistingKey(
   exec: Executor,
   userId: string,
@@ -171,8 +155,6 @@ export async function createPostService(
         gospelCardId = card.id;
       }
 
-      // Reserva ANTES de criar: dois pedidos concorrentes com a mesma chave não criam dois posts.
-      // O segundo espera aqui pelo primeiro e, quando este faz commit, vê a chave como existente.
       const reservation = await idempotencyKeysRepo(tx).reserve({
         userId,
         key: idempotencyKey,
@@ -216,15 +198,8 @@ export async function createPostService(
   );
 }
 
-// ---------- Apagar ----------
-
 type DeletePostError = ErrorOf<"not_found" | "account_inactive">;
 
-/**
- * Apaga (soft delete) um post do próprio autor. Idempotente: apagar outra vez devolve
- * sucesso com `changed: false`. Quem não é o autor recebe o mesmo `not_found` que um post
- * inexistente — não se confirma a existência de posts alheios.
- */
 export async function deletePostService(
   deps: ServicesDeps,
   userId: string,
@@ -253,8 +228,6 @@ export async function deletePostService(
     return { ok: true, data: { deleted: true, changed } };
   });
 }
-
-// ---------- Likes ----------
 
 export interface LikeData {
   likesCount: number;
@@ -327,11 +300,16 @@ export async function unlikePostService(
   });
 }
 
-// ---------- Denúncias ----------
-
 type ReportPostError = ErrorOf<
   "own_post" | "not_found" | "reason_required" | "account_inactive"
 >;
+
+export interface ReportData {
+  outcome: ReportOutcome;
+  changed: boolean;
+  /** Esta denúncia fez o post passar a `pending_review` (sai do feed público). */
+  escalated: boolean;
+}
 
 export async function reportPostService(
   deps: ServicesDeps,
@@ -339,62 +317,66 @@ export async function reportPostService(
   postId: string,
   category: ReportCategory,
   reason: string | undefined,
-): Promise<
-  ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
-> {
+): Promise<ServiceResult<ReportData, ReportPostError>> {
   // Rede de segurança: o schema da rota já exige o motivo para «other».
   const trimmed = reason?.trim();
   if (category === "other" && (!trimmed || trimmed.length < 3)) {
     return fail("reason_required");
   }
 
-  return deps.db.transaction<
-    ServiceResult<{ outcome: ReportOutcome; changed: boolean }, ReportPostError>
-  >(async (tx) => {
-    if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
+  return deps.db.transaction<ServiceResult<ReportData, ReportPostError>>(
+    async (tx) => {
+      if (!(await isAccountActive(tx, userId))) return fail("account_inactive");
 
-    const result = await reportsRepo(tx).file({
-      postId,
-      reporterId: userId,
-      category,
-      reason: trimmed ?? null,
-    });
+      const result = await reportsRepo(tx).file({
+        postId,
+        reporterId: userId,
+        category,
+        reason: trimmed ?? null,
+      });
 
-    switch (result.outcome) {
-      case "created": {
-        await outboxRepo(tx).enqueue({
-          aggregateType: "post",
-          aggregateId: postId,
-          eventType: "post.reported",
-          payload: { postId, reporterId: userId, category },
-        });
-        if (result.escalated && result.escalatedBy) {
-          const severity: ReportSeverity = result.escalatedBy;
+      switch (result.outcome) {
+        case "created": {
           await outboxRepo(tx).enqueue({
             aggregateType: "post",
             aggregateId: postId,
-            eventType: "post.escalated",
-            payload: { postId, severity },
+            eventType: "post.reported",
+            payload: { postId, reporterId: userId, category },
           });
+          if (result.escalated && result.escalatedBy) {
+            const severity: ReportSeverity = result.escalatedBy;
+            await outboxRepo(tx).enqueue({
+              aggregateType: "post",
+              aggregateId: postId,
+              eventType: "post.escalated",
+              payload: { postId, severity },
+            });
+          }
+          return {
+            ok: true,
+            data: {
+              outcome: "created",
+              changed: true,
+              escalated: result.escalated === true,
+            },
+          };
         }
-        return { ok: true, data: { outcome: "created", changed: true } };
+        case "duplicate":
+          return {
+            ok: true,
+            data: { outcome: "duplicate", changed: false, escalated: false },
+          };
+        case "own_post":
+          return fail("own_post");
+        case "post_not_found":
+          return fail("not_found");
       }
-      case "duplicate":
-        return { ok: true, data: { outcome: "duplicate", changed: false } };
-      case "own_post":
-        return fail("own_post");
-      case "post_not_found":
-        return fail("not_found");
-    }
-  });
+    },
+  );
 }
 
 type UnreportPostError = ErrorOf<"not_found" | "account_inactive">;
 
-/**
- * Retira a denúncia do próprio utilizador. Idempotente: se já estava retirada (ou resolvida
- * pelo moderador) devolve sucesso com `changed: false`; só é `not_found` se nunca denunciou.
- */
 export async function unreportPostService(
   deps: ServicesDeps,
   userId: string,

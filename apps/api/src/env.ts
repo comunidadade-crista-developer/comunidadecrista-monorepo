@@ -153,6 +153,23 @@ const BaseEnvSchema = z.object({
   // Pedidos /sync por utilizador (cada um com até 20 operações, já limitadas acima).
   RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
+
+  // Tempo máximo de um lote /sync: as operações que não chegam a correr voltam `deferred`.
+  // Abaixo do timeout típico de proxies/CDN (30 s+) para o cliente receber sempre resposta.
+  SYNC_BATCH_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(25_000)
+    .default(8000),
+
+  // Validade da primeira página do feed em cache (segundos). Os likes só aparecem no feed
+  // público ao fim deste prazo; publicar, apagar e escalar invalidam logo.
+  FEED_CACHE_TTL_S: z.coerce.number().int().min(1).max(600).default(30),
+
+  // Worker do outbox (eventos de domínio): intervalo entre rondas e eventos por ronda.
+  OUTBOX_WORKER_INTERVAL_MS: z.coerce.number().int().min(200).default(5000),
+  OUTBOX_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(50),
 });
 
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
