@@ -25,6 +25,22 @@ export function requireAuth(jwt: JwtService): preHandlerAsyncHookHandler {
   };
 }
 
+export function optionalAuth(jwt: JwtService): preHandlerAsyncHookHandler {
+  return async (request, reply) => {
+    const auth = request.headers.authorization;
+    if (auth === undefined) return;
+    if (!auth.startsWith("Bearer ")) {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
+    try {
+      const payload = await jwt.verifyAccessToken(auth.slice(7).trim());
+      request.user = { id: payload.sub, role: payload.role };
+    } catch {
+      return reply.code(401).send({ error: "invalid_token" });
+    }
+  };
+}
+
 export function requireAdmin(db: Database): preHandlerAsyncHookHandler {
   return async (request, reply) => {
     if (!request.user) {

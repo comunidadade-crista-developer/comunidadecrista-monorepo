@@ -1,8 +1,9 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   idempotencyKeys,
   outbox,
+  posts,
   refreshTokens,
   users,
 } from "../src/db/schema.js";
@@ -11,7 +12,7 @@ import { accountDeletionRepo } from "../src/repositories/account-deletion.js";
 import { idempotencyKeysRepo, outboxRepo } from "../src/repositories/outbox.js";
 import { refreshTokensRepo } from "../src/repositories/users.js";
 import { closeTestDb, getTestDb, truncateAll } from "./helpers/db.js";
-import { makeUser } from "./helpers/factories.js";
+import { makePost, makeUser } from "./helpers/factories.js";
 import { uuidv7 } from "uuidv7";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -129,5 +130,34 @@ describe("runMaintenance", () => {
     expect((await runMaintenance(db, { accountGraceDays: 3 })).accounts).toBe(
       1,
     );
+  });
+});
+
+describe("runMaintenance — posts apagados pelo autor", () => {
+  it("elimina de vez só os apagados há mais do que o prazo (configurável)", async () => {
+    const db = await getTestDb();
+    const author = await makeUser();
+    const old = await makePost(author.id, { title: "Velho" });
+    const recent = await makePost(author.id, { title: "Recente" });
+    const live = await makePost(author.id, { title: "Vivo" });
+    await db.execute(
+      sql`UPDATE posts SET deleted_at = now() - interval '31 days' WHERE id = ${old.id}`,
+    );
+    await db.execute(
+      sql`UPDATE posts SET deleted_at = now() - interval '5 days' WHERE id = ${recent.id}`,
+    );
+
+    const first = await runMaintenance(db, { accountGraceDays: 30 });
+    expect(first.softDeletedPosts).toBe(1);
+    const left = await db.select().from(posts);
+    expect(left.map((p) => p.id).sort()).toEqual([recent.id, live.id].sort());
+
+    // Com um prazo de 3 dias, o «recente» também vai.
+    const second = await runMaintenance(db, {
+      accountGraceDays: 30,
+      postsDeletedRetentionDays: 3,
+    });
+    expect(second.softDeletedPosts).toBe(1);
+    expect((await db.select().from(posts)).map((p) => p.id)).toEqual([live.id]);
   });
 });

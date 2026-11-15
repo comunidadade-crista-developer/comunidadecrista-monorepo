@@ -302,12 +302,14 @@ describe("accountDeletionRepo.purgeDue", () => {
     const filed = await reportsRepo(db).file({
       postId: post.id,
       reporterId: leaver.id,
+      category: "other",
       reason: "x",
     });
     expect(filed.outcome).toBe("created");
     await reportsRepo(db).file({
       postId: post.id,
       reporterId: other.id,
+      category: "other",
       reason: "x",
     });
     expect((await postRow(post.id))?.likesCount).toBe(2);
@@ -331,7 +333,12 @@ describe("accountDeletionRepo.purgeDue", () => {
     const author = await makeUser();
     const post = await makePost(author.id);
     const rr = reportsRepo(db);
-    await rr.file({ postId: post.id, reporterId: leaver.id, reason: "x" });
+    await rr.file({
+      postId: post.id,
+      reporterId: leaver.id,
+      category: "other",
+      reason: "x",
+    });
     await rr.resolveAllForPost(post.id, "resolved_kept", admin.id);
     expect((await postRow(post.id))?.reportsCount).toBe(0);
 

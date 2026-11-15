@@ -1,13 +1,35 @@
-import { and, count, desc, eq, sql } from "drizzle-orm";
-import type { Database } from "../db/client.js";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  sql,
+} from "drizzle-orm";
+import { decodeCursor, encodeCursor } from "@comunidade/shared";
+import type { FeedFilter, PostCategory, PostStatus } from "@comunidade/shared";
+import type { Executor } from "../db/client.js";
 import { postLikes, posts } from "../db/schema.js";
 import type { NewPost, Post } from "../db/schema.js";
 
-export type FeedFilter = "recent" | "top" | "liked";
+export type { FeedFilter };
+
+/** O cursor recebido não é válido para este filtro (a rota valida antes; isto é a rede). */
+export class InvalidCursorError extends Error {
+  constructor() {
+    super("invalid cursor");
+    this.name = "InvalidCursorError";
+  }
+}
 
 export interface ListOptions {
-  category?: "entendimento" | "ensinamento" | "letra_cancao";
+  gospelCardId?: string;
+  category?: PostCategory;
   filter?: FeedFilter;
+  /** Cursor opaco devolvido por uma chamada anterior (`nextCursor`). */
   cursor?: string;
   limit?: number;
   viewerId?: string;
@@ -18,7 +40,15 @@ export interface ListResult {
   nextCursor: string | null;
 }
 
-export function postsRepo(db: Database) {
+/**
+ * Timestamp EXACTO (microssegundos) como texto ISO, para o cursor. Um `Date` do JavaScript
+ * só tem milissegundos: usá-lo no cursor saltaria linhas criadas no mesmo milissegundo.
+ */
+function exactTs(column: typeof posts.createdAt | typeof postLikes.createdAt) {
+  return sql<string>`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+}
+
+export function postsRepo(db: Executor) {
   return {
     async create(data: NewPost): Promise<Post> {
       const now = new Date();
@@ -30,19 +60,106 @@ export function postsRepo(db: Database) {
       return row!;
     },
 
-    async findById(id: string): Promise<Post | null> {
+    /**
+     * O último post do autor (por defeito só publicado ou em revisão) — usado para o autor ver
+     * a sua partilha acabada de criar mesmo que ainda esteja em revisão. Nunca apagados.
+     */
+    async findLatestByAuthorInFilter(
+      authorId: string,
+      opts: {
+        gospelCardId?: string;
+        category?: PostCategory;
+        statuses?: PostStatus[];
+      } = {},
+    ): Promise<Post | null> {
+      const conds = [eq(posts.authorId, authorId), isNull(posts.deletedAt)];
+      if (opts.gospelCardId) {
+        conds.push(eq(posts.gospelCardId, opts.gospelCardId));
+      }
+      if (opts.category) conds.push(eq(posts.category, opts.category));
+      conds.push(
+        inArray(posts.status, opts.statuses ?? ["published", "pending_review"]),
+      );
       const [row] = await db
         .select()
         .from(posts)
-        .where(eq(posts.id, id))
+        .where(and(...conds))
+        .orderBy(desc(posts.createdAt), desc(posts.id))
         .limit(1);
       return row ?? null;
     },
 
+    /**
+     * Por defeito não devolve posts apagados pelo autor (falha fechada). Os serviços que
+     * precisam de os ver (apagar de novo é idempotente) pedem `includeDeleted`.
+     */
+    async findById(
+      id: string,
+      opts: { includeDeleted?: boolean } = {},
+    ): Promise<Post | null> {
+      const conds = [eq(posts.id, id)];
+      if (!opts.includeDeleted) conds.push(isNull(posts.deletedAt));
+      const [row] = await db
+        .select()
+        .from(posts)
+        .where(and(...conds))
+        .limit(1);
+      return row ?? null;
+    },
+
+    /**
+     * Apagar pelo autor: soft delete. A linha (com as denúncias e likes) fica como evidência até
+     * à purga (`purgeDeleted`). `true` só se este pedido foi o que apagou.
+     */
+    async softDelete(id: string, authorId: string): Promise<boolean> {
+      const rows = await db
+        .update(posts)
+        .set({ deletedAt: sql`now()` })
+        .where(
+          and(
+            eq(posts.id, id),
+            eq(posts.authorId, authorId),
+            isNull(posts.deletedAt),
+          ),
+        )
+        .returning({ id: posts.id });
+      return rows.length > 0;
+    },
+
+    /**
+     * Apaga DE VEZ (com likes e denúncias, por cascata) os posts apagados pelo autor há mais
+     * de `olderThan`. Em lotes, para não bloquear a base de dados.
+     */
+    async purgeDeleted(olderThan: Date, batch = 500): Promise<number> {
+      const due = await db
+        .select({ id: posts.id })
+        .from(posts)
+        .where(and(isNotNull(posts.deletedAt), lt(posts.deletedAt, olderThan)))
+        .limit(batch);
+      if (due.length === 0) return 0;
+      const removed = await db
+        .delete(posts)
+        .where(
+          inArray(
+            posts.id,
+            due.map((r) => r.id),
+          ),
+        )
+        .returning({ id: posts.id });
+      return removed.length;
+    },
+
+    /** Apaga de vez (sem passar por soft delete): testes e limpezas internas. */
     async delete(id: string): Promise<void> {
       await db.delete(posts).where(eq(posts.id, id));
     },
 
+    /**
+     * Feed público: só `published` e não apagados. Paginação por chave composta (cursor
+     * opaco), estável mesmo com posts novos ou criados no mesmo instante. No filtro `top` a
+     * chave inclui `likesCount`, que muda entre páginas: o resultado é aproximado (pode, raramente,
+     * repetir ou saltar um post quando os likes mudam a meio).
+     */
     async list(opts: ListOptions = {}): Promise<ListResult> {
       const {
         category,
@@ -51,66 +168,125 @@ export function postsRepo(db: Database) {
         limit = 20,
         viewerId,
       } = opts;
-      const conditions = [eq(posts.status, "published")];
+
+      const parsed = cursor === undefined ? null : decodeCursor(cursor, filter);
+      if (cursor !== undefined && parsed === null)
+        throw new InvalidCursorError();
+
+      const conditions = [
+        eq(posts.status, "published"),
+        isNull(posts.deletedAt),
+      ];
       if (category) conditions.push(eq(posts.category, category));
+      if (opts.gospelCardId) {
+        conditions.push(eq(posts.gospelCardId, opts.gospelCardId));
+      }
 
       if (filter === "recent") {
-        if (cursor) {
-          const cursorDate = new Date(cursor);
-          conditions.push(sql`${posts.createdAt} < ${cursorDate}`);
+        if (parsed?.k === "recent") {
+          conditions.push(
+            sql`(${posts.createdAt}, ${posts.id}) < (${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
+          );
         }
         const rows = await db
-          .select()
+          .select({ post: posts, ts: exactTs(posts.createdAt) })
           .from(posts)
           .where(and(...conditions))
-          .orderBy(desc(posts.createdAt))
+          .orderBy(desc(posts.createdAt), desc(posts.id))
           .limit(limit + 1);
-        const hasMore = rows.length > limit;
-        const items = hasMore ? rows.slice(0, limit) : rows;
+        const page = rows.slice(0, limit);
+        const last = page[page.length - 1];
         return {
-          items,
-          nextCursor: hasMore
-            ? items[items.length - 1]!.createdAt.toISOString()
-            : null,
+          items: page.map((r) => r.post),
+          nextCursor:
+            rows.length > limit && last
+              ? encodeCursor({ k: "recent", t: last.ts, id: last.post.id })
+              : null,
         };
       }
 
       if (filter === "top") {
+        if (parsed?.k === "top") {
+          conditions.push(
+            sql`(${posts.likesCount}, ${posts.createdAt}, ${posts.id}) < (${parsed.l}::int, ${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
+          );
+        }
         const rows = await db
-          .select()
+          .select({ post: posts, ts: exactTs(posts.createdAt) })
           .from(posts)
           .where(and(...conditions))
-          .orderBy(desc(posts.likesCount), desc(posts.createdAt))
-          .limit(limit);
-        return { items: rows, nextCursor: null };
+          .orderBy(
+            desc(posts.likesCount),
+            desc(posts.createdAt),
+            desc(posts.id),
+          )
+          .limit(limit + 1);
+        const page = rows.slice(0, limit);
+        const last = page[page.length - 1];
+        return {
+          items: page.map((r) => r.post),
+          nextCursor:
+            rows.length > limit && last
+              ? encodeCursor({
+                  k: "top",
+                  l: last.post.likesCount,
+                  t: last.ts,
+                  id: last.post.id,
+                })
+              : null,
+        };
       }
 
-      // filter === 'liked'
+      // filter === "liked": os que o viewer curtiu, do like mais recente para o mais antigo.
       if (!viewerId) return { items: [], nextCursor: null };
+      conditions.push(eq(postLikes.userId, viewerId));
+      if (parsed?.k === "liked") {
+        conditions.push(
+          sql`(${postLikes.createdAt}, ${postLikes.postId}) < (${parsed.t}::timestamptz, ${parsed.id}::uuid)`,
+        );
+      }
       const rows = await db
-        .select({ post: posts })
+        .select({ post: posts, ts: exactTs(postLikes.createdAt) })
         .from(posts)
         .innerJoin(postLikes, eq(postLikes.postId, posts.id))
-        .where(and(...conditions, eq(postLikes.userId, viewerId)))
-        .orderBy(desc(posts.createdAt))
-        .limit(limit);
-      return { items: rows.map((r) => r.post), nextCursor: null };
+        .where(and(...conditions))
+        .orderBy(desc(postLikes.createdAt), desc(postLikes.postId))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const last = page[page.length - 1];
+      return {
+        items: page.map((r) => r.post),
+        nextCursor:
+          rows.length > limit && last
+            ? encodeCursor({ k: "liked", t: last.ts, id: last.post.id })
+            : null,
+      };
     },
 
+    /** Os posts do próprio autor (qualquer estado, menos apagados), mais recentes primeiro. */
     async listByAuthor(authorId: string, limit = 50): Promise<Post[]> {
       return db
         .select()
         .from(posts)
-        .where(eq(posts.authorId, authorId))
-        .orderBy(desc(posts.createdAt))
+        .where(and(eq(posts.authorId, authorId), isNull(posts.deletedAt)))
+        .orderBy(desc(posts.createdAt), desc(posts.id))
         .limit(limit);
     },
 
+    /**
+     * Muda o estado de moderação. Ao aprovar (`published`) preenche `publishedAt` se ainda
+     * não tinha (um post que esteve em revisão nunca foi publicado).
+     */
     async setStatus(id: string, status: Post["status"]): Promise<Post | null> {
       const [row] = await db
         .update(posts)
-        .set({ status })
-        .where(eq(posts.id, id))
+        .set({
+          status,
+          ...(status === "published"
+            ? { publishedAt: sql`coalesce(${posts.publishedAt}, now())` }
+            : {}),
+        })
+        .where(and(eq(posts.id, id), isNull(posts.deletedAt)))
         .returning();
       return row ?? null;
     },
@@ -135,17 +311,18 @@ export function postsRepo(db: Database) {
       return row?.reportsCount ?? 0;
     },
 
+    /** Quantos posts (não apagados) o autor tem, em qualquer estado. */
     async countByAuthor(authorId: string): Promise<number> {
       const [row] = await db
         .select({ c: count() })
         .from(posts)
-        .where(eq(posts.authorId, authorId));
+        .where(and(eq(posts.authorId, authorId), isNull(posts.deletedAt)));
       return Number(row?.c ?? 0);
     },
   };
 }
 
-export function postLikesRepo(db: Database) {
+export function postLikesRepo(db: Executor) {
   return {
     async like(postId: string, userId: string): Promise<boolean> {
       const result = await db
@@ -162,6 +339,41 @@ export function postLikesRepo(db: Database) {
         .where(and(eq(postLikes.postId, postId), eq(postLikes.userId, userId)))
         .returning({ postId: postLikes.postId });
       return result.length > 0;
+    },
+
+    /** Dos `postIds` dados, quais o utilizador curtiu (decorar uma página do feed). */
+    async findLikedPostIds(
+      userId: string,
+      postIds: string[],
+    ): Promise<string[]> {
+      if (postIds.length === 0) return [];
+      const rows = await db
+        .select({ postId: postLikes.postId })
+        .from(postLikes)
+        .where(
+          and(eq(postLikes.userId, userId), inArray(postLikes.postId, postIds)),
+        );
+      return rows.map((r) => r.postId);
+    },
+
+    /**
+     * Os likes mais recentes do utilizador, com limite. `truncated` diz se havia mais (o
+     * cliente não fica com uma lista cortada em silêncio).
+     */
+    async listLikedPostIds(
+      userId: string,
+      limit = 500,
+    ): Promise<{ ids: string[]; truncated: boolean }> {
+      const rows = await db
+        .select({ postId: postLikes.postId })
+        .from(postLikes)
+        .where(eq(postLikes.userId, userId))
+        .orderBy(desc(postLikes.createdAt), desc(postLikes.postId))
+        .limit(limit + 1);
+      return {
+        ids: rows.slice(0, limit).map((r) => r.postId),
+        truncated: rows.length > limit,
+      };
     },
   };
 }

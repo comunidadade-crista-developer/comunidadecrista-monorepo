@@ -34,6 +34,15 @@ export interface RateLimiters {
   ): Promise<void>;
   /** Leitura pública dos gospel cards: 1 balde por IP. */
   checkCardsPublic(ip: string): Promise<RateLimitResult>;
+  /** Leitura do feed: balde por utilizador se autenticado, senão por IP. */
+  checkReadFeed(ip: string, userId?: string): Promise<RateLimitResult>;
+  /** Escritas: 1 balde por utilizador e por tipo de operação (REST e /sync partilham-nos). */
+  checkPostsCreate(userId: string): Promise<RateLimitResult>;
+  checkPostsDelete(userId: string): Promise<RateLimitResult>;
+  checkLikes(userId: string): Promise<RateLimitResult>;
+  checkReports(userId: string): Promise<RateLimitResult>;
+  /** Pedidos /sync (lotes) por utilizador. */
+  checkSyncBatch(userId: string): Promise<RateLimitResult>;
 }
 
 /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
@@ -129,6 +138,42 @@ export function createRateLimiters(
     env.RATE_LIMIT_CARDS_WINDOW_S,
   );
 
+  const feedIp = make(
+    "rl:feed:ip",
+    env.RATE_LIMIT_FEED_MAX,
+    env.RATE_LIMIT_FEED_WINDOW_S,
+  );
+  const feedUser = make(
+    "rl:feed:user",
+    env.RATE_LIMIT_FEED_MAX,
+    env.RATE_LIMIT_FEED_WINDOW_S,
+  );
+  const postsCreate = make(
+    "rl:posts:create",
+    env.RATE_LIMIT_POSTS_CREATE_MAX,
+    env.RATE_LIMIT_POSTS_CREATE_WINDOW_S,
+  );
+  const postsDelete = make(
+    "rl:posts:delete",
+    env.RATE_LIMIT_POSTS_DELETE_MAX,
+    env.RATE_LIMIT_POSTS_DELETE_WINDOW_S,
+  );
+  const likes = make(
+    "rl:likes",
+    env.RATE_LIMIT_LIKES_MAX,
+    env.RATE_LIMIT_LIKES_WINDOW_S,
+  );
+  const reportsLimiter = make(
+    "rl:reports",
+    env.RATE_LIMIT_REPORTS_MAX,
+    env.RATE_LIMIT_REPORTS_WINDOW_S,
+  );
+  const syncBatch = make(
+    "rl:sync",
+    env.RATE_LIMIT_SYNC_MAX,
+    env.RATE_LIMIT_SYNC_WINDOW_S,
+  );
+
   const consume = async (
     limiter: RateLimiterAbstract,
     key: string,
@@ -209,5 +254,14 @@ export function createRateLimiters(
       ]);
     },
     checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
+    checkReadFeed: (ip, userId) =>
+      userId
+        ? consumeAll([[feedUser, anon(userId)]])
+        : consumeAll([[feedIp, anon(ip)]]),
+    checkPostsCreate: (userId) => consumeAll([[postsCreate, anon(userId)]]),
+    checkPostsDelete: (userId) => consumeAll([[postsDelete, anon(userId)]]),
+    checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
+    checkReports: (userId) => consumeAll([[reportsLimiter, anon(userId)]]),
+    checkSyncBatch: (userId) => consumeAll([[syncBatch, anon(userId)]]),
   };
 }

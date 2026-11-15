@@ -48,6 +48,14 @@ const BaseEnvSchema = z.object({
     .max(365)
     .default(30),
   MAINTENANCE_INTERVAL_MINUTES: z.coerce.number().int().min(1).default(60),
+  // Dias que uma partilha apagada pelo autor se conserva (com denúncias e likes, como
+  // evidência para a moderação) antes de ser eliminada de vez.
+  POSTS_DELETED_RETENTION_DAYS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .default(30),
 
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
@@ -117,8 +125,51 @@ const BaseEnvSchema = z.object({
     .int()
     .positive()
     .default(3600),
+  // partilham o mesmo IP (CGNAT das operadoras móveis).
   RATE_LIMIT_CARDS_MAX: z.coerce.number().int().positive().default(120),
   RATE_LIMIT_CARDS_WINDOW_S: z.coerce.number().int().positive().default(60),
+  // Leitura do feed de partilhas: 1 balde por utilizador autenticado e outro por IP (anónimos).
+  // Folgado pelo mesmo motivo dos cards (IPs partilhados).
+  RATE_LIMIT_FEED_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_FEED_WINDOW_S: z.coerce.number().int().positive().default(60),
+  // Escritas, por utilizador. O /sync aplica os MESMOS limites, operação a operação, para não
+  // ser um atalho em volta do REST (ADR-013).
+  RATE_LIMIT_POSTS_CREATE_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_POSTS_CREATE_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(3600),
+  RATE_LIMIT_POSTS_DELETE_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_POSTS_DELETE_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(3600),
+  RATE_LIMIT_LIKES_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_LIKES_WINDOW_S: z.coerce.number().int().positive().default(3600),
+  RATE_LIMIT_REPORTS_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_REPORTS_WINDOW_S: z.coerce.number().int().positive().default(3600),
+  // Pedidos /sync por utilizador (cada um com até 20 operações, já limitadas acima).
+  RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
+
+  // Tempo máximo de um lote /sync: as operações que não chegam a correr voltam `deferred`.
+  // Abaixo do timeout típico de proxies/CDN (30 s+) para o cliente receber sempre resposta.
+  SYNC_BATCH_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(25_000)
+    .default(8000),
+
+  // Validade da primeira página do feed em cache (segundos). Os likes só aparecem no feed
+  // público ao fim deste prazo; publicar, apagar e escalar invalidam logo.
+  FEED_CACHE_TTL_S: z.coerce.number().int().min(1).max(600).default(30),
+
+  // Worker do outbox (eventos de domínio): intervalo entre rondas e eventos por ronda.
+  OUTBOX_WORKER_INTERVAL_MS: z.coerce.number().int().min(200).default(5000),
+  OUTBOX_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(50),
 });
 
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
