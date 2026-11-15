@@ -104,112 +104,24 @@ O admin vive na mesma app (`apps/web`), em rotas `/admin/*`, carregadas por `Rea
 
 ## 4. Decisões de arquitectura (ADRs)
 
-### ADR-001 — PWA em vez de app nativa
+Cada decisão tem o seu ficheiro em [`adr/`](adr/README.md) (um ADR por ficheiro: o histórico fica no git e as ligações não partem quando o texto cresce).
 
-**Contexto**: distribuição gratuita, código único, offline-first.
-**Decisão**: PWA com `vite-plugin-pwa`.
-**Consequências**: um único código para web, Android e desktop; instalação sem loja; TWA/APK (bubblewrap) fica para quando houver necessidade real de Play Store; iOS tem limitações conhecidas de push e cache (aceitáveis no MVP).
-
-### ADR-002 — Monorepo com pnpm workspaces
-
-**Contexto**: backend, frontend e tipos partilhados evoluem em conjunto.
-**Decisão**: monorepo com `apps/` e `packages/`.
-**Consequências**: um só PR pode alterar contrato e consumidor; CI tem de ser eficiente (`pnpm --filter`).
-
-### ADR-003 — Neon em vez de Supabase
-
-**Contexto**: Supabase free pausa após 1 semana de inatividade (bloqueador); Neon free faz scale-to-zero com wake rápido.
-**Decisão**: Neon + branch de preview por PR.
-**Consequências**: limite de conexões obriga a usar o pooler do Neon e pool pequeno no driver.
-
-### ADR-004 — Upstash Redis apenas para cache e rate limit
-
-**Contexto**: filas críticas não podem depender de um contador mensal de comandos.
-**Decisão**: Redis só para cache de leitura e rate limit. Filas (outbox) ficam em Postgres.
-**Consequências**: menos carga no Redis; cache com TTL curto; rate limit por IP/username em login e por user em criação de posts.
-
-### ADR-005 — Outbox table em Postgres + worker in-process
-
-**Contexto**: Render free só oferece um web service gratuito; background workers são pagos.
-**Decisão**: tabela `outbox` no Postgres, worker a correr dentro do processo Fastify via `setInterval`, com `SELECT ... FOR UPDATE SKIP LOCKED`.
-**Consequências**: o worker dorme quando o serviço dorme — eventos internos (notificar admin, purgas, caches) processam-se no próximo wake. Aceitável para o domínio.
-
-### ADR-006 — Autenticação: JWT EdDSA + refresh rotativo + argon2id
-
-**Contexto**: offline-first com privacidade.
-**Decisão**: access token EdDSA (15 min); refresh rotativo (30 dias, one-time use, deteção de reuso → revogar família); passwords e respostas de segurança hasheadas com argon2id (params OWASP: m=19456 KiB, t=2, p=1).
-**Rotação de chaves**: cada token leva `kid` no cabeçalho = _thumbprint_ RFC 7638 da chave pública Ed25519
-(derivado, não guardado). A API assina com a chave actual (`JWT_PRIVATE_JWK`/`JWT_PUBLIC_JWK`) e verifica com a
-actual **e**, opcionalmente, com a anterior (`JWT_PUBLIC_JWK_PREVIOUS`, só pública), até os tokens antigos
-expirarem (access 15 min, recuperação 5 min). Regras: algoritmo fixo `EdDSA`; `kid` desconhecido é recusado; a
-assinatura é sempre verificada (um `kid` forjado não dá acesso); tokens sem `kid` (anteriores a esta mudança)
-tentam as chaves configuradas. No arranque valida-se que as chaves são Ed25519, que a privada tem `d`, que as
-públicas não têm `d`, que o par corresponde e que a anterior difere da actual. Refresh tokens são opacos (não
-dependem da chave): numa rotação os utilizadores renovam a sessão sem voltar a autenticar-se.
-**Consequências**: chaves Ed25519 geradas no deploy (env vars); procedimento de rotação (normal e por
-compromisso) no runbook. Em caso de compromisso, omitir `JWT_PUBLIC_JWK_PREVIOUS` invalida de imediato os access tokens antigos.
-
-### ADR-007 — Offline-first com outbox local + idempotency keys
-
-**Contexto**: rede intermitente e servidor que dorme.
-**Decisão**: cliente gera UUID v7 e `idempotency_key` por operação; server deduplica em `idempotency_keys`; retry exponencial no cliente e no servidor.
-**Consequências**: contrato `/sync` é crítico — precisa de testes E2E rigorosos.
-
-### ADR-008 — Conteúdo bíblico apenas por referência
-
-**Contexto**: direitos autorais das traduções.
-**Decisão**: nenhum texto bíblico integral. Apenas referências e resumo próprio.
-**Consequências**: o conteúdo dos cards é curado em `gospel_cards` (seed versionado).
-
-### ADR-009 — Avatar gerado, sem upload
-
-**Contexto**: privacidade, moderação de imagem, custo.
-**Decisão**: avatar determinístico a partir do username (iniciais + cor via hash).
-**Consequências**: nenhum dado biométrico, nenhuma moderação de imagem, nenhum Cloudinary no MVP.
-
-### ADR-010 — Admin na mesma app, role `admin`
-
-**Contexto**: simplicidade operacional.
-**Decisão**: `/admin/*` lazy-loaded, protegido por role `admin` no JWT e por middleware no backend.
-**Consequências**: um só deploy; middleware no backend **deve** revalidar role em cada pedido (nunca confiar só no frontend).
-
-### ADR-011 — Recuperação de conta: código imediato, perguntas com atraso
-
-**Contexto**: sem email, a recuperação depende de segredos que o utilizador guarda. O código de
-recuperação tem 80 bits de entropia; as perguntas (cor, número 0–999, igreja) têm pouca, e
-bastava acertá-las para tomar a conta.
-**Decisão**:
-
-- Código de recuperação → efeito imediato. A sessão de recuperação (JWT 5 min) é de **uso único**
-  (`jti` em `used_recovery_sessions`) e o reset corre numa só transacção: nova palavra-passe,
-  novo código, revogação de todas as sessões e cancelamento de pedidos pendentes.
-- Perguntas → a nova palavra-passe fica **pendente** (`pending_password_resets`) durante
-  `RECOVERY_QUESTIONS_DELAY_HOURS` (24 h). Não se emite código novo. Se o dono entrar entretanto
-  com a palavra-passe actual, o pedido é cancelado e o login devolve `pendingRecoveryCancelled`.
-  Passado o prazo, o 1.º login com a nova palavra-passe aplica-a, revoga as sessões e devolve um
-  código novo (uma única vez).
-- Limites por conta (todos os IPs) e por IP (todas as contas), além de IP+utilizador; sem Redis
-  ou com o Redis em baixo, o limite aplica-se em memória (nunca falha em aberto).
-  **Consequências**: quem perde o código e não entra durante 24 h perde a conta para quem tiver
-  acertado as perguntas — risco aceite sem email. Os atrasos exigem a UI mostrar `recovery_pending`
-  e `pendingRecoveryCancelled`.
-
-### ADR-012 — Apagamento de conta: período de graça de 30 dias
-
-**Contexto**: apagar logo é irreversível e uma conta tomada (ver ADR-011) seria destruída pelo atacante.
-**Decisão** (modelo "Facebook"):
-
-- `POST /users/me/deletion` (confirma a palavra-passe) coloca a conta em estado **pendente** durante
-  `ACCOUNT_DELETION_GRACE_DAYS` (30). A conta continua a existir; o `username` fica reservado e as sessões são revogadas.
-- Um **login** com sucesso durante o período reactiva a conta (`accountRestored`) e repõe as partilhas.
-- Partilhas, à escolha do utilizador no pedido: `anonymize` (ficam visíveis como autor oculto, `author_hidden`)
-  ou `delete` (ficam ocultas durante o período — `suspended_status` — e são apagadas na purga).
-- Passados os 30 dias, o job de manutenção (`setInterval` in-process, `unref`, `MAINTENANCE_INTERVAL_MINUTES`; ADR-005)
-  purga a conta: decrementa os contadores de likes/denúncias de terceiros antes da cascata, aplica `SET NULL`/cascatas
-  do modelo de dados e liberta o `username`. `SKIP LOCKED` torna a purga segura com várias instâncias.
-- O último administrador não pode apagar a conta.
-  **Consequências**: quem tiver a palavra-passe comprometida pode pedir o apagamento, mas o dono recupera a conta ao
-  entrar (ou pelo ADR-011) dentro do prazo. A UI tem de mostrar `accountRestored` e o estado pendente.
+| ADR                       | Decisão                                                     |
+| ------------------------- | ----------------------------------------------------------- |
+| [ADR-001](adr/ADR-001.md) | PWA em vez de app nativa                                    |
+| [ADR-002](adr/ADR-002.md) | Monorepo com pnpm workspaces                                |
+| [ADR-003](adr/ADR-003.md) | Neon em vez de Supabase                                     |
+| [ADR-004](adr/ADR-004.md) | Upstash Redis apenas para cache e rate limit                |
+| [ADR-005](adr/ADR-005.md) | Outbox table em Postgres + worker in-process                |
+| [ADR-006](adr/ADR-006.md) | Autenticação: JWT EdDSA + refresh rotativo + argon2id       |
+| [ADR-007](adr/ADR-007.md) | Offline-first com outbox local + idempotency keys           |
+| [ADR-008](adr/ADR-008.md) | Conteúdo bíblico apenas por referência                      |
+| [ADR-009](adr/ADR-009.md) | Avatar gerado, sem upload                                   |
+| [ADR-010](adr/ADR-010.md) | Admin na mesma app, role `admin`                            |
+| [ADR-011](adr/ADR-011.md) | Recuperação de conta: código imediato, perguntas com atraso |
+| [ADR-012](adr/ADR-012.md) | Apagamento de conta: período de graça de 30 dias            |
+| [ADR-013](adr/ADR-013.md) | Filtro anti-spam no conteúdo                                |
+| [ADR-014](adr/ADR-014.md) | Severidade de denúncias    
 
 ## 5. Modelo de dados
 
@@ -238,7 +150,9 @@ erDiagram
     timestamptz created_at
     timestamptz updated_at
     timestamptz last_login_at
-    timestamptz deleted_at "pedido de apagamento (conta pendente; purga após a graça)"
+    timestamptz deletion_requested_at "pedido de apagamento (conta pendente, 30 dias de graça)"
+    enum deletion_posts_mode "anonymize|delete"
+    timestamptz deleted_at "conta já purgada/anonimizada"
   }
 
   REFRESH_TOKENS {
@@ -272,6 +186,10 @@ erDiagram
     enum status "published|pending_review|hidden|rejected"
     int likes_count
     int reports_count
+    bool author_hidden "partilha mantida anónima (conta apagada)"
+    enum suspended_status "estado antes de ocultar por apagamento pendente"
+    text_array review_flags "porque foi para revisão (caps, keywords, reports_high…)"
+    timestamptz deleted_at "apagado pelo autor (soft delete; purga após POSTS_DELETED_RETENTION_DAYS)"
     timestamptz created_at
     timestamptz published_at
   }
@@ -286,10 +204,13 @@ erDiagram
     uuid id PK
     uuid post_id FK
     uuid reporter_id FK
-    text reason
-    enum status "open|resolved_kept|resolved_removed"
+    enum category "spam|off_topic|offensive|doctrine|other"
+    enum severity "basic|medium|high (coluna gerada a partir da categoria)"
+    text reason "nullable; obrigatório se category = other (CHECK)"
+    enum status "open|resolved_kept|resolved_removed|withdrawn"
     timestamptz created_at
     timestamptz resolved_at
+    timestamptz withdrawn_at
     uuid resolved_by FK
   }
 
@@ -319,6 +240,7 @@ erDiagram
     text key PK
     uuid user_id FK
     text operation
+    text request_hash "hash do pedido: mesma chave com outro corpo = conflito"
     jsonb response
     timestamptz created_at
     timestamptz expires_at
@@ -329,12 +251,16 @@ erDiagram
 
 - UUID v7 em todas as PKs (ordenação temporal sem colisões).
 - `citext` para `username` (unicidade case-insensitive).
-- Índices: `posts(status, created_at desc)`, `posts(gospel_card_id, status)`, `post_likes(user_id)`, `reports(post_id, status)`, `outbox(status, next_attempt_at)`.
+- Índices: `posts(status, created_at)`, `posts(gospel_card_id, status)`, `posts(author_id, created_at)`, `posts(category, status)`, `post_likes(user_id)`, `reports(post_id, status)`, `reports(post_id, category, status)`, `reports(reporter_id, status)`, `outbox(status, next_attempt_at)`. `reports` tem unicidade `(post_id, reporter_id)`: uma denúncia por utilizador e post, em qualquer estado.
 - `outbox` e `idempotency_keys` têm TTL — purga periódica pelo worker (ex.: > 7 dias).
 - Purga de conta: `posts.author_id` → NULL (partilha anónima, "[removido]"); `moderation_log.post_id` e `moderator_id` → NULL (a auditoria nunca se perde); `post_likes`, `reports`, `refresh_tokens` e `idempotency_keys` apagam-se em cascata. `idempotency_keys` tem PK `(user_id, key)`: a chave vem do cliente e só é única por utilizador.
 - Outbox: `claimBatch` empurra `next_attempt_at` para o futuro (5 min) ao reservar; um evento preso em `processing` só volta a ser reclamável depois desse prazo.
-- Apagamento de conta (ADR-012): `users.deleted_at` marca a conta pendente; a purga corre no job de manutenção. Partilhas: `author_hidden` (modo anonimizar) ou `suspended_status` (modo apagar, ocultas até à purga).
-- `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
+- Apagamento de conta (ADR-012): `users.deletion_requested_at` marca a conta pendente (e `deletion_posts_mode` a escolha do utilizador); `users.deleted_at` marca a conta já purgada. A purga corre no job de manutenção. Partilhas: `author_hidden` (modo anonimizar) ou `suspended_status` (modo apagar, ocultas até à purga). Uma conta pendente não escreve (os serviços consultam a base de dados em cada escrita).
+- Posts apagados pelo autor (soft delete, `posts.deleted_at`): saem de todas as leituras; a linha, com likes e denúncias, fica como evidência até à purga (`POSTS_DELETED_RETENTION_DAYS`, 30 por omissão).
+- Denúncias (ADR-014): `reports.severity` é uma coluna **gerada** a partir da categoria. Retirar uma denúncia passa-a a `withdrawn` (a linha fica; deixa de contar). `reports_other_requires_reason` garante o motivo em `other`.
+- `posts.review_flags` guarda os códigos que levaram a `pending_review` (sinais do filtro, ADR-013, ou `reports_<gravidade>`, ADR-014).
+- Idempotência (`post.create`): a chave é reservada **antes** de criar o post (`INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now()`), com `request_hash`; repetir a chave devolve a resposta guardada, e o mesmo valor com outro corpo é `idempotency_key_conflict`.
+ - `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
 
 ## 6. Contratos de API (resumo)
 
@@ -358,31 +284,37 @@ lista embebida de palavras-passe comuns recusada, não pode conter o username, s
 
 ### Conteúdo
 
-| Método | Rota                  | Descrição                                                                 |
-| ------ | --------------------- | ------------------------------------------------------------------------- |
-| GET    | `/gospel-cards`       | Lista de cards.                                                           |
-| GET    | `/gospel-cards/:slug` | Detalhe de card.                                                          |
-| GET    | `/posts`              | Feed com `?category=&filter=recent                                        | top | liked&cursor=`. |
-| GET    | `/posts/:id`          | Detalhe.                                                                  |
-| POST   | `/posts`              | Cria partilha. Requer `Idempotency-Key`.                                  |
-| DELETE | `/posts/:id`          | Autor apaga.                                                              |
-| POST   | `/posts/:id/like`     | Idempotente.                                                              |
-| DELETE | `/posts/:id/like`     | Idempotente.                                                              |
-| POST   | `/posts/:id/report`   | Uma denúncia por user por post.                                           |
-| DELETE | `/posts/:id/report`   | Cancela denúncia aberta.                                                  |
-| GET    | `/users/me/posts`     | Gestão de partilhas.                                                      |
-| GET    | `/users/me/reports`   | Denúncias do utilizador.                                                  |
-| PATCH  | `/users/me`           | Alterar username.                                                         |
-| POST   | `/users/me/deletion`  | Pede o apagamento (30 dias de graça; `postsMode`: `anonymize`\|`delete`). |
-| POST   | `/users/me/password`  | Alterar palavra-passe (atual + nova).                                     |
+| Método | Rota                  | Descrição                                                                                   |
+| ------ | --------------------- | ------------------------------------------------------------------------------------------- |
+| GET    | `/gospel-cards`       | Lista de cards (pública, com `ETag`).                                                       |
+| GET    | `/gospel-cards/:slug` | Detalhe de card.                                                                            |
+| GET    | `/posts`              | Feed: `?category=&gospelCardId=&filter=recent\|top\|liked&cursor=&limit=`. Sessão opcional. |
+| GET    | `/posts/:id`          | Detalhe. Publicado: público; outros estados: só autor e admin (404 para os restantes).      |
+| POST   | `/posts`              | Cria partilha. Requer `Idempotency-Key`. Filtro anti-spam (ADR-013).                        |
+| DELETE | `/posts/:id`          | Autor apaga (soft delete, idempotente).                                                     |
+| POST   | `/posts/:id/like`     | Idempotente.                                                                                |
+| DELETE | `/posts/:id/like`     | Idempotente.                                                                                |
+| POST   | `/posts/:id/report`   | Uma denúncia por utilizador e post, com categoria (ADR-014).                                |
+| DELETE | `/posts/:id/report`   | Retira a denúncia (fica `withdrawn`; idempotente).                                          |
+
+### Conta
+
+| Método | Rota                 | Descrição                                                                     | Estado   |
+| ------ | -------------------- | ----------------------------------------------------------------------------- | -------- |
+| POST   | `/users/me/deletion` | Pede o apagamento (30 dias de graça; `postsMode`: `anonymize`\|`delete`).     | Feito    |
+| GET    | `/users/me/posts`    | Gestão de partilhas.                                                          | Planeado |
+| GET    | `/users/me/reports`  | Denúncias do utilizador.                                                      | Planeado |
+| PATCH  | `/users/me`          | Alterar username.                                                             | Planeado |
+| POST   | `/users/me/password` | Alterar palavra-passe (atual + nova; cancela recuperação pendente e sessões). | Planeado |
 
 ### Sync
 
-| Método | Rota    | Descrição                                                                    |
-| ------ | ------- | ---------------------------------------------------------------------------- |
-| POST   | `/sync` | Lote de operações idempotentes da outbox local. Devolve estado por operação. |
+| Método | Rota              | Descrição                                                                                                                             |
+| ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/sync`           | Lote (até 20) de operações da outbox local. Devolve um resultado por operação (`applied`/`duplicate`/`rejected`/`deferred`).          |
+| GET    | `/sync/bootstrap` | Estado inicial do cliente: cards, 1.ª página do feed, as minhas partilhas, os meus likes e as minhas denúncias (com avisos de corte). |
 
-### Admin
+### Admin (planeado)
 
 | Método | Rota                                 | Descrição           |
 | ------ | ------------------------------------ | ------------------- |
@@ -471,21 +403,23 @@ sequenceDiagram
 
 **Regras**
 
-- `POST /sync` aceita até 20 operações por chamada.
+- `POST /sync` aceita até 20 operações por chamada; os `op_id` têm de ser únicos no lote.
 - Cada operação tem `{op_id, idempotency_key, type, payload}`.
 - Retry exponencial no cliente: 5s, 15s, 45s, 2m, 5m, 15m (máx. 6 tentativas); depois estado `failed` visível.
 - Servidor **nunca** confia em `created_at` do cliente — usa sempre `now()`.
 - Conflito de username ou de exclusão: `rejected` com motivo específico.
+- Resultado por operação: `applied` (aplicada agora), `duplicate` (já estava aplicada: repetição da chave, like já dado, post já apagado…), `rejected` (recusa definitiva, com código: `not_found`, `forbidden`, `own_post`, `idempotency_key_conflict`, `gospel_card_not_found`, `contains_link`, `contains_contact`) e `deferred` (não foi tentada — limite, prazo do lote ou falha inesperada — e o cliente repete mais tarde; `retryAfter` quando é limite).
+- Cada operação paga os **mesmos limites por operação que o REST** (os baldes são partilhados) além do limite do lote; o `/sync` não é uma porta lateral. Prazo do lote: `SYNC_BATCH_TIMEOUT_MS` (8 s): o que não chega a correr volta `deferred`.
+- As operações correm em série, pela ordem do cliente, cada uma na sua transacção.
+ 
 
 ## 9. Estratégia de caching
 
-| Chave                                    | TTL                  | Invalidação                                        |
-| ---------------------------------------- | -------------------- | -------------------------------------------------- |
-| `feed:{category}:{filter}:{cursor}`      | 60s                  | Ao publicar/apagar post na categoria               |
-| `post:{id}`                              | 120s                 | Ao editar, apagar, mudar status, like              |
-| `post:{id}:likes_count`                  | 120s                 | Ao like/unlike (increment atómico)                 |
-| `cc:v1:cards:v<N>:list` / `:item:<slug>` | 1h (L2) / 5 min (L1) | Só em seed: `INCR` da versão `cc:v1:cards:version` |
-| `user:{id}:profile`                      | 60s                  | Ao alterar username                                |
+| Chave                                                  | TTL                       | Invalidação                                                                                                                       |
+| ------------------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `cc:v1:feed:v<N>:<filtro>:<categoria>:<card>:<limite>` | 30 s (`FEED_CACHE_TTL_S`) | Só a 1.ª página de `recent`/`top`. `INCR` de `cc:v1:feed:version` ao publicar, apagar ou escalar um post; **likes não invalidam** |
+| `cc:v1:cards:v<N>:list` / `:item:<slug>`               | 1h (L2) / 5 min (L1)      | Só em seed: `INCR` da versão `cc:v1:cards:version`                                                                                |
+ 
 
 **Regras**
 
@@ -493,6 +427,7 @@ sequenceDiagram
 - Contadores (`likes_count`, `reports_count`) mantidos em Postgres como fonte de verdade; Redis só acelera leitura.
 - Rate limit: `rate-limiter-flexible` (Redis, com fallback em memória que nunca falha em aberto).
 - Gospel cards (E3): duas camadas. L1 em memória do processo (lista e cards montados; um hit não toca no Redis nem na BD) e L2 no Redis com chaves versionadas. A versão lê-se do Redis no máximo 1×/min por instância; invalidar = `INCR` da versão. Redis em baixo → continua com a última versão conhecida e depois vai à BD. O que vem do Redis é validado com zod. Cache negativa (60 s, máx. 1000 entradas) e _single-flight_ protegem a BD. Ver `docs/registos/E3-gospel-cards-cache.md`.
+- Feed (E4-c): só a 1.ª página (sem cursor) de `recent` e `top`; as páginas seguintes e `liked` vão sempre à base de dados. Redis em baixo → serve da BD. O valor em cache é a página anónima, validada com zod, com o `authorIds` interno (nunca serializado) para calcular `isMine`; `isLiked` junta-se por espectador numa consulta. _Single-flight_ protege a BD. O contador de likes do feed público e o nome do autor de uma conta que pediu apagamento podem atrasar-se até ao TTL.
 - Cache HTTP: só as respostas públicas dos cards (200/304) podem ser guardadas (`public, max-age=300, stale-while-revalidate=86400` + `ETag`); todo o resto é `no-store`.
 
 ## 10. Estratégia de cold start
@@ -509,11 +444,12 @@ sequenceDiagram
 - **CORS**: apenas o domínio do frontend.
 - **Passwords e respostas**: argon2id (m=19456 KiB, t=2, p=1).
 - **JWT**: EdDSA (Ed25519) com `kid`; chaves em env vars; rotação com chave anterior só pública (ADR-006), procedimento no runbook.
-- **Rate limiting**: login (IP+username), registo (IP), criação de posts (user), denúncias (user).
+- **Rate limiting**: login (IP+username), registo (IP), leitura do feed (IP e utilizador), criação e apagamento de posts (user), likes (user), denúncias (user) e lotes `/sync` (user). Cada operação do `/sync` paga o balde do seu tipo.
 - **Validação**: Zod em todos os endpoints.
 - **SQL**: drizzle-orm com prepared statements; sem concatenação.
 - **Logs**: sem passwords, sem tokens, sem PII; username é o único identificador presente.
 - **Privacidade**: sem IP persistido, sem analytics de terceiros, sem cookies de rastreio. Política de privacidade e termos de utilização publicados.
+- **Privacidade das partilhas**: nenhuma resposta expõe o `authorId`; o autor aparece como `{ username }` ou `null` («[removido]») e o cliente sabe que o post é seu por `isMine`. Estados não públicos dão 404 (não 403) a quem não é autor nem admin.
 - **Apagamento de conta**: estado pendente 30 dias (login reactiva); purga pelo job de manutenção; partilhas anonimizadas ou apagadas conforme a escolha do utilizador (ADR-012).
 - **Headers de admin**: middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido.
 
