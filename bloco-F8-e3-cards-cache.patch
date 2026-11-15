@@ -1,0 +1,1770 @@
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index 471d412..25782e9 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -59,6 +59,9 @@ RATE_LIMIT_RECOVER_ACCOUNT_QUESTIONS_MAX=5
+ RATE_LIMIT_RECOVER_ACCOUNT_QUESTIONS_WINDOW_S=86400
+ RATE_LIMIT_RECOVER_ACCOUNT_CODE_MAX=10
+ RATE_LIMIT_RECOVER_ACCOUNT_CODE_WINDOW_S=3600
++# Leitura pública dos gospel cards, por IP
++RATE_LIMIT_CARDS_MAX=120
++RATE_LIMIT_CARDS_WINDOW_S=60
+ 
+ # Recuperação por perguntas de segurança só produz efeito após este atraso (horas)
+ RECOVERY_QUESTIONS_DELAY_HOURS=24
+diff --git a/apps/api/src/auth/rate-limit.ts b/apps/api/src/auth/rate-limit.ts
+index 8372de6..70336d5 100644
+--- a/apps/api/src/auth/rate-limit.ts
++++ b/apps/api/src/auth/rate-limit.ts
+@@ -32,6 +32,8 @@ export interface RateLimiters {
+     username: string,
+     mode: RecoverMode,
+   ): Promise<void>;
++  /** Leitura pública dos gospel cards: 1 balde por IP. */
++  checkCardsPublic(ip: string): Promise<RateLimitResult>;
+ }
+ 
+ /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
+@@ -121,6 +123,12 @@ export function createRateLimiters(
+     ),
+   };
+ 
++  const cardsPublic = make(
++    "rl:cards",
++    env.RATE_LIMIT_CARDS_MAX,
++    env.RATE_LIMIT_CARDS_WINDOW_S,
++  );
++
+   const consume = async (
+     limiter: RateLimiterAbstract,
+     key: string,
+@@ -202,5 +210,6 @@ export function createRateLimiters(
+         () => recoverAccount[mode].reward(anon(user), 1),
+       ]);
+     },
++    checkCardsPublic: (ip) => consumeAll([[cardsPublic, anon(ip)]]),
+   };
+ }
+diff --git a/apps/api/src/cache/cards-cache.ts b/apps/api/src/cache/cards-cache.ts
+new file mode 100644
+index 0000000..e329316
+--- /dev/null
++++ b/apps/api/src/cache/cards-cache.ts
+@@ -0,0 +1,304 @@
++import {
++  CardSlug,
++  GospelCardListResponse,
++  GospelCardPublic,
++} from "@comunidade/shared";
++import type { Redis } from "ioredis";
++import type { GospelCard } from "../db/schema.js";
++import type { cardsRepo } from "../repositories/cards.js";
++
++/**
++ * Cache dos gospel cards em duas camadas:
++ *
++ * - L1 (memória do processo): lista e cards já montados. Um hit não toca em Redis nem na BD.
++ * - L2 (Redis): partilhada entre instâncias, com chaves versionadas
++ *   (`cc:v1:cards:v<N>:list|item:<slug>`). A versão (`cc:v1:cards:version`) é lida do Redis
++ *   no máximo 1 vez por `versionMemoryTtlMs` por instância.
++ *
++ * Invalidar = `INCR` da versão (o seed corre noutro processo): as chaves antigas deixam de ser
++ * lidas e expiram sozinhas. As outras instâncias vêem a nova versão ao fim de, no máximo,
++ * `versionMemoryTtlMs` (60 s).
++ *
++ * Falhas do Redis nunca partem um pedido: usa-se a última versão conhecida (L1) ou vai-se à BD.
++ * Dados lidos do Redis são validados com zod; se não passarem, ignoram-se e recarrega-se da BD.
++ * Os erros registados só levam nome/código (os do ioredis trazem host e porta na mensagem).
++ */
++
++const NAMESPACE = "cc:v1:cards";
++const VERSION_KEY = `${NAMESPACE}:version`;
++const L2_TTL_SECONDS = 3600;
++const L1_TTL_MS = 5 * 60_000;
++// Sem Redis não há versão para detectar mudanças: a L1 vive pouco.
++const L1_TTL_NO_REDIS_MS = 60_000;
++const VERSION_MEMORY_TTL_MS = 60_000;
++const VERSION_RETRY_AFTER_ERROR_MS = 10_000;
++const NEGATIVE_TTL_MS = 60_000;
++const NEGATIVE_MAX_ENTRIES = 1000;
++
++type CardsRepo = ReturnType<typeof cardsRepo>;
++type CardsSource = Pick<CardsRepo, "list" | "findBySlug">;
++type RedisLike = Pick<Redis, "get" | "set" | "incr">;
++
++export interface CardsCacheLogger {
++  warn(obj: Record<string, unknown>, msg: string): void;
++  info(obj: Record<string, unknown>, msg: string): void;
++}
++
++export interface CardsCache {
++  list(): Promise<GospelCardPublic[]>;
++  /** `null` para slug inexistente ou inválido. */
++  bySlug(slug: string): Promise<GospelCardPublic | null>;
++  /**
++   * Passa a usar uma nova versão das chaves e limpa a L1 deste processo. Devolve a versão
++   * nova (0 se não há Redis). LANÇA se o Redis falhar: quem invalida (o seed) tem de saber.
++   */
++  invalidate(): Promise<number>;
++}
++
++export interface CardsCacheDeps {
++  redis: RedisLike | null;
++  cards: CardsSource;
++  logger: CardsCacheLogger;
++  /** Só para testes. */
++  now?: () => number;
++  versionMemoryTtlMs?: number;
++}
++
++interface Entry<T> {
++  version: number | null;
++  expiresAt: number;
++  data: T;
++}
++
++function toPublic(card: GospelCard): GospelCardPublic {
++  return {
++    slug: card.slug,
++    title: card.title,
++    gospelReference: card.gospelReference,
++    summary: card.summary,
++    otReferences: card.otReferences,
++    ntReferences: card.ntReferences,
++    orderIndex: card.orderIndex,
++  };
++}
++
++function errorInfo(err: unknown): Record<string, unknown> {
++  return {
++    errorName: err instanceof Error ? err.name : typeof err,
++    errorCode:
++      typeof err === "object" &&
++      err !== null &&
++      "code" in err &&
++      typeof (err as { code: unknown }).code === "string"
++        ? (err as { code: string }).code
++        : undefined,
++  };
++}
++
++export function createCardsCache(deps: CardsCacheDeps): CardsCache {
++  const { redis, cards, logger } = deps;
++  const now = deps.now ?? Date.now;
++  const versionTtl = deps.versionMemoryTtlMs ?? VERSION_MEMORY_TTL_MS;
++
++  let knownVersion: { value: number; at: number } | null = null;
++  let versionRetryAt = 0;
++  let versionInflight: Promise<number | null> | null = null;
++
++  let listL1: Entry<GospelCardPublic[]> | null = null;
++  const itemL1 = new Map<string, Entry<GospelCardPublic>>();
++  const missL1 = new Map<string, { version: number | null; expiresAt: number }>();
++  const inflight = new Map<string, Promise<unknown>>();
++
++  function clearL1(): void {
++    listL1 = null;
++    itemL1.clear();
++    missL1.clear();
++    inflight.clear();
++  }
++
++  async function readVersion(): Promise<number | null> {
++    if (!redis) return null;
++    const t = now();
++    if (knownVersion && t - knownVersion.at < versionTtl) {
++      return knownVersion.value;
++    }
++    // Redis em baixo: continua-se com a última versão conhecida (stale-if-error) e só se
++    // volta a tentar passado um intervalo.
++    if (t < versionRetryAt) return knownVersion?.value ?? null;
++    if (versionInflight) return versionInflight;
++
++    versionInflight = (async () => {
++      try {
++        const raw = await redis.get(VERSION_KEY);
++        const parsed = raw === null ? 0 : Number.parseInt(raw, 10);
++        const value = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
++        knownVersion = { value, at: now() };
++        return value;
++      } catch (err) {
++        versionRetryAt = now() + VERSION_RETRY_AFTER_ERROR_MS;
++        logger.warn(errorInfo(err), "cards-cache: version read failed");
++        return knownVersion?.value ?? null;
++      } finally {
++        versionInflight = null;
++      }
++    })();
++    return versionInflight;
++  }
++
++  function l1Ttl(version: number | null): number {
++    return version === null ? L1_TTL_NO_REDIS_MS : L1_TTL_MS;
++  }
++
++  function fresh<T>(entry: Entry<T> | null | undefined, version: number | null) {
++    return entry && entry.version === version && now() < entry.expiresAt
++      ? entry
++      : null;
++  }
++
++  // Junta pedidos concorrentes que falham a cache numa só carga (anti-stampede).
++  function once<T>(key: string, load: () => Promise<T>): Promise<T> {
++    const running = inflight.get(key) as Promise<T> | undefined;
++    if (running) return running;
++    const promise = load().finally(() => {
++      if (inflight.get(key) === promise) inflight.delete(key);
++    });
++    inflight.set(key, promise);
++    return promise;
++  }
++
++  async function l2Get<T>(
++    key: string,
++    parse: (value: unknown) => T | null,
++  ): Promise<T | null> {
++    if (!redis) return null;
++    try {
++      const raw = await redis.get(key);
++      if (raw === null) return null;
++      const value = parse(JSON.parse(raw));
++      if (value === null) {
++        logger.warn({}, "cards-cache: invalid cached value ignored");
++      }
++      return value;
++    } catch (err) {
++      logger.warn(errorInfo(err), "cards-cache: read failed");
++      return null;
++    }
++  }
++
++  async function l2Set(key: string, value: unknown): Promise<void> {
++    if (!redis) return;
++    try {
++      await redis.set(key, JSON.stringify(value), "EX", L2_TTL_SECONDS);
++    } catch (err) {
++      logger.warn(errorInfo(err), "cards-cache: write failed");
++    }
++  }
++
++  const parseList = (value: unknown): GospelCardPublic[] | null => {
++    const result = GospelCardListResponse.safeParse({ cards: value });
++    return result.success ? result.data.cards : null;
++  };
++  const parseItem = (value: unknown): GospelCardPublic | null => {
++    const result = GospelCardPublic.safeParse(value);
++    return result.success ? result.data : null;
++  };
++
++  function rememberMiss(slug: string, version: number | null): void {
++    if (missL1.size >= NEGATIVE_MAX_ENTRIES) {
++      const oldest = missL1.keys().next();
++      if (!oldest.done) missL1.delete(oldest.value);
++    }
++    missL1.set(slug, { version, expiresAt: now() + NEGATIVE_TTL_MS });
++  }
++
++  return {
++    async list() {
++      const version = await readVersion();
++      const hit = fresh(listL1, version);
++      if (hit) return hit.data;
++
++      return once(`${version}:list`, async () => {
++        const key = `${NAMESPACE}:v${version}:list`;
++        const cached =
++          version === null ? null : await l2Get(key, parseList);
++        const data = cached ?? (await cards.list()).map(toPublic);
++
++        // Lista vazia = seed por correr: não se guarda, para não a fixar durante 1 h.
++        if (data.length > 0) {
++          listL1 = {
++            version,
++            expiresAt: now() + l1Ttl(version),
++            data,
++          };
++          if (cached === null && version !== null) await l2Set(key, data);
++        }
++        return data;
++      });
++    },
++
++    async bySlug(slug) {
++      if (!CardSlug.safeParse(slug).success) return null;
++      const version = await readVersion();
++
++      const hit = fresh(itemL1.get(slug), version);
++      if (hit) return hit.data;
++
++      const miss = missL1.get(slug);
++      if (miss && miss.version === version && now() < miss.expiresAt) {
++        return null;
++      }
++
++      // Uma lista completa e válida é autoritativa: o que não está nela não existe.
++      const list = fresh(listL1, version);
++      if (list) {
++        const found = list.data.find((c) => c.slug === slug) ?? null;
++        if (found) {
++          itemL1.set(slug, {
++            version,
++            expiresAt: now() + l1Ttl(version),
++            data: found,
++          });
++        } else {
++          rememberMiss(slug, version);
++        }
++        return found;
++      }
++
++      return once(`${version}:item:${slug}`, async () => {
++        const key = `${NAMESPACE}:v${version}:item:${slug}`;
++        const cached =
++          version === null ? null : await l2Get(key, parseItem);
++        let data = cached;
++        if (data === null) {
++          const row = await cards.findBySlug(slug);
++          data = row ? toPublic(row) : null;
++        }
++
++        if (data === null) {
++          rememberMiss(slug, version);
++          return null;
++        }
++        itemL1.set(slug, {
++          version,
++          expiresAt: now() + l1Ttl(version),
++          data,
++        });
++        if (cached === null && version !== null) await l2Set(key, data);
++        return data;
++      });
++    },
++
++    async invalidate() {
++      if (!redis) {
++        clearL1();
++        return 0;
++      }
++      const next = await redis.incr(VERSION_KEY);
++      knownVersion = { value: next, at: now() };
++      versionRetryAt = 0;
++      clearL1();
++      logger.info({ version: next }, "cards-cache: invalidated");
++      return next;
++    },
++  };
++}
+diff --git a/apps/api/src/db/seed.ts b/apps/api/src/db/seed.ts
+index 844a625..7cc4534 100644
+--- a/apps/api/src/db/seed.ts
++++ b/apps/api/src/db/seed.ts
+@@ -1,45 +1,82 @@
+ import { readFileSync } from "node:fs";
+ import { fileURLToPath } from "node:url";
+-import { cardsRepo } from "../repositories/cards.js";
++import { GospelCardsSeedFile } from "@comunidade/shared";
++import { createCardsCache } from "../cache/cards-cache.js";
+ import { loadEnv } from "../env.js";
++import {
++  attachRedisErrorLogging,
++  createRedis,
++  waitUntilReady,
++} from "../redis.js";
++import { cardsRepo } from "../repositories/cards.js";
+ import { createDb } from "./client.js";
+ 
++// Os logs do seed vão para a consola; nunca se imprime o erro completo (traz host/porta).
++const log = {
++  warn: (obj: Record<string, unknown>, msg: string) => console.warn(msg, obj),
++  info: (obj: Record<string, unknown>, msg: string) => console.log(msg, obj),
++};
++
+ const env = loadEnv();
+ if (!env.DATABASE_URL) {
+   console.error("DATABASE_URL não está definido.");
+   process.exit(1);
+ }
+ 
++// 1) Validar o ficheiro ANTES de tocar na base de dados.
+ const cardsFile = fileURLToPath(
+   new URL("./seed-data/cards.json", import.meta.url),
+ );
+-const cardsData = JSON.parse(readFileSync(cardsFile, "utf-8")) as Array<{
+-  slug: string;
+-  title: string;
+-  gospelReference: string;
+-  summary: string;
+-  otReferences: string[];
+-  ntReferences: string[];
+-  orderIndex: number;
+-}>;
++let raw: unknown;
++try {
++  raw = JSON.parse(readFileSync(cardsFile, "utf-8"));
++} catch {
++  console.error("seed-data/cards.json não é JSON válido.");
++  process.exit(1);
++}
++const parsed = GospelCardsSeedFile.safeParse(raw);
++if (!parsed.success) {
++  console.error("seed-data/cards.json inválido:");
++  for (const issue of parsed.error.issues) {
++    console.error(`  - ${issue.path.join(".") || "(raiz)"}: ${issue.message}`);
++  }
++  process.exit(1);
++}
++const cardsData = parsed.data;
+ 
+ const { db, pool } = createDb(env.DATABASE_URL);
+ const repo = cardsRepo(db);
++const redis = createRedis(env.REDIS_URL);
++let exitCode = 0;
+ 
+-let created = 0;
+-let updated = 0;
++try {
++  // 2) Todos os cards numa só transacção: ou ficam todos, ou nenhum.
++  const { created, updated } = await repo.upsertMany(cardsData);
++  console.log(`Seed concluído: ${created} criados, ${updated} actualizados.`);
+ 
+-for (const card of cardsData) {
+-  try {
+-    const before = await repo.findBySlug(card.slug);
+-    await repo.upsertBySlug(card);
+-    if (before) updated += 1;
+-    else created += 1;
+-  } catch (err) {
+-    console.error(`Erro a inserir card "${card.slug}":`, err);
+-    process.exit(1);
++  // 3) Invalidar a cache. Se falhar, os dados já estão gravados mas as APIs podem servir
++  //    a versão anterior até 1 h: o seed sai com erro para ser repetido.
++  if (!redis) {
++    console.warn("REDIS_URL ausente — nada para invalidar.");
++  } else {
++    attachRedisErrorLogging(redis, log);
++    if (!(await waitUntilReady(redis))) {
++      throw new Error("redis_unavailable");
++    }
++    const version = await createCardsCache({ redis, cards: repo, logger: log })
++      .invalidate();
++    console.log(`Cache invalidada (versão ${version}).`);
+   }
++} catch (err) {
++  exitCode = 1;
++  console.error(
++    "Seed falhou ou a cache não foi invalidada:",
++    err instanceof Error ? err.name : typeof err,
++    "— repete `pnpm db:seed` (é idempotente).",
++  );
++} finally {
++  if (redis) await redis.quit().catch(() => {});
++  await pool.end().catch(() => {});
+ }
+ 
+-await pool.end();
+-console.log(`Seed concluído: ${created} criados, ${updated} actualizados.`);
++process.exit(exitCode);
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index 6380d90..d4de0a4 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -117,6 +117,10 @@ const BaseEnvSchema = z.object({
+     .int()
+     .positive()
+     .default(3600),
++  // Leitura pública dos gospel cards, por IP. Folgado de propósito: muitos utilizadores
++  // partilham o mesmo IP (CGNAT das operadoras móveis).
++  RATE_LIMIT_CARDS_MAX: z.coerce.number().int().positive().default(120),
++  RATE_LIMIT_CARDS_WINDOW_S: z.coerce.number().int().positive().default(60),
+ });
+ 
+ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
+diff --git a/apps/api/src/repositories/cards.ts b/apps/api/src/repositories/cards.ts
+index 99f7c0e..c71a406 100644
+--- a/apps/api/src/repositories/cards.ts
++++ b/apps/api/src/repositories/cards.ts
+@@ -37,19 +37,54 @@ export function cardsRepo(db: Database) {
+         .values(data)
+         .onConflictDoUpdate({
+           target: gospelCards.slug,
+-          set: {
+-            title: data.title,
+-            gospelReference: data.gospelReference,
+-            summary: data.summary,
+-            otReferences: data.otReferences,
+-            ntReferences: data.ntReferences,
+-            orderIndex: data.orderIndex,
+-          },
++          set: conflictSet(data),
+         })
+         .returning();
+       return row!;
+     },
++
++    /**
++     * Seed: todos os cards numa só transacção (ou ficam todos, ou nenhum). Idempotente.
++     * Devolve quantos foram criados e quantos já existiam (e foram actualizados).
++     */
++    async upsertMany(
++      items: NewGospelCard[],
++    ): Promise<{ created: number; updated: number }> {
++      if (items.length === 0) return { created: 0, updated: 0 };
++      return db.transaction(async (tx) => {
++        const existing = await tx
++          .select({ slug: gospelCards.slug })
++          .from(gospelCards)
++          .where(
++            inArray(
++              gospelCards.slug,
++              items.map((i) => i.slug),
++            ),
++          );
++        const known = new Set(existing.map((r) => r.slug));
++        for (const data of items) {
++          await tx
++            .insert(gospelCards)
++            .values(data)
++            .onConflictDoUpdate({
++              target: gospelCards.slug,
++              set: conflictSet(data),
++            });
++        }
++        const updated = items.filter((i) => known.has(i.slug)).length;
++        return { created: items.length - updated, updated };
++      });
++    },
+   };
+ }
+ 
+-//
++function conflictSet(data: NewGospelCard) {
++  return {
++    title: data.title,
++    gospelReference: data.gospelReference,
++    summary: data.summary,
++    otReferences: data.otReferences,
++    ntReferences: data.ntReferences,
++    orderIndex: data.orderIndex,
++  };
++}
+diff --git a/apps/api/src/routes/cards.ts b/apps/api/src/routes/cards.ts
+new file mode 100644
+index 0000000..935cf72
+--- /dev/null
++++ b/apps/api/src/routes/cards.ts
+@@ -0,0 +1,132 @@
++import { createHash } from "node:crypto";
++import {
++  CardSlugParams,
++  ErrorResponse,
++  GospelCardListResponse,
++  GospelCardResponse,
++} from "@comunidade/shared";
++import type { FastifyInstance, FastifyReply } from "fastify";
++import type { ZodTypeProvider } from "fastify-type-provider-zod";
++import type { RateLimiters } from "../auth/rate-limit.js";
++import type { CardsCache } from "../cache/cards-cache.js";
++
++/**
++ * Conteúdo público e igual para todos: pode ser guardado pelo browser e pelo service worker.
++ * O hook global de `server.ts` respeita este valor só nas respostas 200/304; erros ficam
++ * sempre `no-store`.
++ */
++export const CARDS_CACHE_CONTROL =
++  "public, max-age=300, stale-while-revalidate=86400";
++
++export interface CardsRoutesOptions {
++  cache: CardsCache;
++  limiters: RateLimiters;
++}
++
++// O ETag calcula-se uma vez por objecto: a L1 devolve sempre a mesma referência até expirar
++// ou ser invalidada, por isso um hit não serializa nem calcula o hash outra vez.
++const etags = new WeakMap<object, string>();
++
++export function etagOf(value: object): string {
++  const known = etags.get(value);
++  if (known) return known;
++  const hash = createHash("sha256")
++    .update(JSON.stringify(value))
++    .digest("base64url")
++    .slice(0, 27);
++  const etag = `W/"${hash}"`;
++  etags.set(value, etag);
++  return etag;
++}
++
++/** Comparação fraca (RFC 9110 §13.1.2) do `If-None-Match` com o ETag actual. */
++export function matchesIfNoneMatch(
++  header: string | undefined,
++  etag: string,
++): boolean {
++  if (!header) return false;
++  if (header.trim() === "*") return true;
++  const strip = (tag: string) => tag.trim().replace(/^W\//, "");
++  const current = strip(etag);
++  return header.split(",").some((tag) => strip(tag) === current);
++}
++
++function notModified(reply: FastifyReply, etag: string): FastifyReply {
++  return reply
++    .code(304)
++    .header("ETag", etag)
++    .header("Cache-Control", CARDS_CACHE_CONTROL)
++    .send();
++}
++
++export async function cardsRoutes(
++  app: FastifyInstance,
++  { cache, limiters }: CardsRoutesOptions,
++): Promise<void> {
++  const f = app.withTypeProvider<ZodTypeProvider>();
++
++  f.get(
++    "/gospel-cards",
++    {
++      schema: {
++        response: { 200: GospelCardListResponse, 429: ErrorResponse },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkCardsPublic(request.clientIp);
++      if (!rl.allowed) {
++        return reply
++          .code(429)
++          .header("Retry-After", String(rl.retryAfter ?? 60))
++          .send({ error: "rate_limited" });
++      }
++
++      const cards = await cache.list();
++      // Lista vazia = seed por correr: sem cabeçalhos de cache (o hook global põe no-store),
++      // para nenhum browser a fixar durante horas.
++      if (cards.length === 0) return reply.code(200).send({ cards });
++
++      const etag = etagOf(cards);
++      if (matchesIfNoneMatch(request.headers["if-none-match"], etag)) {
++        return notModified(reply as unknown as FastifyReply, etag);
++      }
++
++      reply.header("ETag", etag).header("Cache-Control", CARDS_CACHE_CONTROL);
++      return reply.code(200).send({ cards });
++    },
++  );
++
++  f.get(
++    "/gospel-cards/:slug",
++    {
++      schema: {
++        params: CardSlugParams,
++        response: {
++          200: GospelCardResponse,
++          404: ErrorResponse,
++          429: ErrorResponse,
++        },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkCardsPublic(request.clientIp);
++      if (!rl.allowed) {
++        return reply
++          .code(429)
++          .header("Retry-After", String(rl.retryAfter ?? 60))
++          .send({ error: "rate_limited" });
++      }
++
++      const card = await cache.bySlug(request.params.slug);
++      if (!card) return reply.code(404).send({ error: "not_found" });
++
++      const etag = etagOf(card);
++      if (matchesIfNoneMatch(request.headers["if-none-match"], etag)) {
++        return notModified(reply as unknown as FastifyReply, etag);
++      }
++
++      reply.header("ETag", etag).header("Cache-Control", CARDS_CACHE_CONTROL);
++      return reply.code(200).send({ card });
++    },
++  );
++}
+diff --git a/apps/api/src/server.ts b/apps/api/src/server.ts
+index fcad10f..ded98ea 100644
+--- a/apps/api/src/server.ts
++++ b/apps/api/src/server.ts
+@@ -16,6 +16,7 @@ import { createJwtService } from "./auth/jwt.js";
+ import { createPasswordService } from "./auth/password.js";
+ import { createRateLimiters } from "./auth/rate-limit.js";
+ import { createRecoveryService } from "./auth/recovery.js";
++import { createCardsCache } from "./cache/cards-cache.js";
+ import { createDb } from "./db/client.js";
+ import type { Env } from "./env.js";
+ import { errorHandler, notFoundHandler } from "./http-errors.js";
+@@ -26,8 +27,10 @@ import {
+   createRedis,
+   waitUntilReady,
+ } from "./redis.js";
++import { cardsRepo } from "./repositories/cards.js";
+ import { accountRoutes } from "./routes/account.js";
+ import { authRoutes } from "./routes/auth.js";
++import { cardsRoutes } from "./routes/cards.js";
+ import { healthRoutes } from "./routes/health.js";
+ 
+ export type AppInstance = FastifyInstance<
+@@ -104,9 +107,16 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
+   app.decorateRequest("clientIp", "");
+   app.addHook("onRequest", createEdgeGuard(env).onRequest);
+ 
+-  // Respostas da API nunca devem ser guardadas em cache (Cloudflare, browsers, proxies).
++  // Respostas da API não são guardadas em cache (Cloudflare, browsers, proxies), com uma
++  // única excepção: uma rota de conteúdo público pode declarar `Cache-Control: public...`, e
++  // só vale nas respostas 200/304. Erros (400/404/429/5xx) e tudo o resto ficam `no-store`.
+   app.addHook("onSend", async (_request, reply, payload) => {
+-    reply.header("Cache-Control", "no-store");
++    const declared = reply.getHeader("Cache-Control");
++    const publicOk =
++      (reply.statusCode === 200 || reply.statusCode === 304) &&
++      typeof declared === "string" &&
++      declared.startsWith("public");
++    if (!publicOk) reply.header("Cache-Control", "no-store");
+     return payload;
+   });
+ 
+@@ -176,6 +186,14 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
+       jwt,
+       limiters,
+     });
++    await app.register(cardsRoutes, {
++      cache: createCardsCache({
++        redis,
++        cards: cardsRepo(dbBundle.db),
++        logger: app.log,
++      }),
++      limiters,
++    });
+ 
+     // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
+     // corre-se `runMaintenance` à mão.
+@@ -188,7 +206,7 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
+       app.addHook("onClose", async () => stopMaintenance());
+     }
+   } else {
+-    app.log.warn("DATABASE_URL não configurado — rotas de auth desactivadas.");
++    app.log.warn("DATABASE_URL não configurado — rotas de auth, conta e cards desactivadas.");
+   }
+ 
+   return app;
+diff --git a/apps/api/test/auth/rate-limit.test.ts b/apps/api/test/auth/rate-limit.test.ts
+index d2accb6..0ff22dc 100644
+--- a/apps/api/test/auth/rate-limit.test.ts
++++ b/apps/api/test/auth/rate-limit.test.ts
+@@ -102,6 +102,18 @@ describe("rate limit — registo", () => {
+   });
+ });
+ 
++describe("rate limit — gospel cards (leitura pública)", () => {
++  it("bloqueia por IP ao exceder, com retryAfter; outro IP não é afectado", async () => {
++    const rl = make({ RATE_LIMIT_CARDS_MAX: 2 });
++    expect((await rl.checkCardsPublic("1.1.1.1")).allowed).toBe(true);
++    expect((await rl.checkCardsPublic("1.1.1.1")).allowed).toBe(true);
++    const blocked = await rl.checkCardsPublic("1.1.1.1");
++    expect(blocked.allowed).toBe(false);
++    expect(blocked.retryAfter).toBeGreaterThan(0);
++    expect((await rl.checkCardsPublic("2.2.2.2")).allowed).toBe(true);
++  });
++});
++
+ describe("rate limit — Redis indisponível", () => {
+   it("continua a limitar em memória (não falha em aberto)", async () => {
+     // Porta 1: ligação recusada. Sem fila offline, cada comando falha de imediato.
+diff --git a/apps/api/test/cache/cards-cache.test.ts b/apps/api/test/cache/cards-cache.test.ts
+new file mode 100644
+index 0000000..3356107
+--- /dev/null
++++ b/apps/api/test/cache/cards-cache.test.ts
+@@ -0,0 +1,336 @@
++import { describe, expect, it } from "vitest";
++import {
++  createCardsCache,
++  type CardsCacheDeps,
++} from "../../src/cache/cards-cache.js";
++import type { GospelCard } from "../../src/db/schema.js";
++
++// Sem infraestrutura: Redis, repositório e relógio são simulados, por isso estes testes são
++// rápidos e determinísticos. A integração real (Postgres + Redis) está em routes/cards.test.ts.
++
++class FakeRedis {
++  store = new Map<string, string>();
++  ttls = new Map<string, number>();
++  calls = { get: 0, set: 0, incr: 0 };
++  failWith: Error | null = null;
++
++  async get(key: string): Promise<string | null> {
++    this.calls.get += 1;
++    if (this.failWith) throw this.failWith;
++    return this.store.get(key) ?? null;
++  }
++  async set(
++    key: string,
++    value: string,
++    _mode: string,
++    ttl: number,
++  ): Promise<"OK"> {
++    this.calls.set += 1;
++    if (this.failWith) throw this.failWith;
++    this.store.set(key, value);
++    this.ttls.set(key, ttl);
++    return "OK";
++  }
++  async incr(key: string): Promise<number> {
++    this.calls.incr += 1;
++    if (this.failWith) throw this.failWith;
++    const next = Number.parseInt(this.store.get(key) ?? "0", 10) + 1;
++    this.store.set(key, String(next));
++    return next;
++  }
++}
++
++const asRedis = (r: FakeRedis | null) => r as unknown as CardsCacheDeps["redis"];
++
++function row(slug: string, orderIndex: number, title = `Card ${slug}`): GospelCard {
++  return {
++    id: `00000000-0000-4000-8000-${String(orderIndex).padStart(12, "0")}`,
++    slug,
++    title,
++    gospelReference: "Mateus 2",
++    summary: "Resumo",
++    otReferences: ["Isaías 7:14"],
++    ntReferences: ["Mateus 2:1-12"],
++    orderIndex,
++    createdAt: new Date("2026-01-01T00:00:00Z"),
++  };
++}
++
++function makeSource(rows: GospelCard[]) {
++  const state = { rows, list: 0, find: 0 };
++  return {
++    state,
++    source: {
++      async list() {
++        state.list += 1;
++        return [...state.rows];
++      },
++      async findBySlug(slug: string) {
++        state.find += 1;
++        return state.rows.find((r) => r.slug === slug) ?? null;
++      },
++    },
++  };
++}
++
++function makeLogger() {
++  const logs: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
++  return {
++    logs,
++    logger: {
++      warn: (obj: Record<string, unknown>, msg: string) =>
++        logs.push({ level: "warn", obj, msg }),
++      info: (obj: Record<string, unknown>, msg: string) =>
++        logs.push({ level: "info", obj, msg }),
++    },
++  };
++}
++
++function setup(
++  rows: GospelCard[] = [row("a", 1), row("b", 2)],
++  opts: { redis?: FakeRedis | null } = {},
++) {
++  const redis = opts.redis === undefined ? new FakeRedis() : opts.redis;
++  const clock = { t: 1_000_000 };
++  const src = makeSource(rows);
++  const { logs, logger } = makeLogger();
++  const build = (source = src.source) =>
++    createCardsCache({
++      redis: asRedis(redis),
++      cards: source,
++      logger,
++      now: () => clock.t,
++    });
++  return { redis, clock, src, logs, build, cache: build() };
++}
++
++describe("cards-cache — list", () => {
++  it("miss → BD + L2 (TTL 1 h); o segundo pedido vem da L1 sem BD nem Redis", async () => {
++    const { redis, src, cache } = setup();
++    const first = await cache.list();
++    expect(first.map((c) => c.slug)).toEqual(["a", "b"]);
++    expect(src.state.list).toBe(1);
++    expect(redis!.store.has("cc:v1:cards:v0:list")).toBe(true);
++    expect(redis!.ttls.get("cc:v1:cards:v0:list")).toBe(3600);
++
++    redis!.calls = { get: 0, set: 0, incr: 0 };
++    const second = await cache.list();
++    expect(second).toBe(first);
++    expect(src.state.list).toBe(1);
++    expect(redis!.calls.get).toBe(0);
++  });
++
++  it("não expõe campos internos (id, createdAt)", async () => {
++    const { cache } = setup();
++    const [card] = await cache.list();
++    expect(Object.keys(card!).sort()).toEqual(
++      [
++        "gospelReference",
++        "ntReferences",
++        "orderIndex",
++        "otReferences",
++        "slug",
++        "summary",
++        "title",
++      ].sort(),
++    );
++  });
++
++  it("outra instância (L1 vazia) lê da L2 sem ir à BD", async () => {
++    const { build, src } = setup();
++    await build().list();
++    const other = makeSource([row("x", 9)]);
++    const second = await build(other.source).list();
++    expect(second.map((c) => c.slug)).toEqual(["a", "b"]);
++    expect(other.state.list).toBe(0);
++    expect(src.state.list).toBe(1);
++  });
++
++  it("lista vazia não é guardada (seed por correr)", async () => {
++    const { redis, src, cache } = setup([]);
++    expect(await cache.list()).toEqual([]);
++    expect(await cache.list()).toEqual([]);
++    expect(src.state.list).toBe(2);
++    expect([...redis!.store.keys()].some((k) => k.endsWith(":list"))).toBe(false);
++  });
++
++  it("pedidos concorrentes numa falha de cache fazem uma só carga (anti-stampede)", async () => {
++    const { src, cache } = setup();
++    const results = await Promise.all(
++      Array.from({ length: 20 }, () => cache.list()),
++    );
++    expect(src.state.list).toBe(1);
++    expect(new Set(results).size).toBe(1);
++  });
++
++  it("preserva caracteres PT através da L2", async () => {
++    const { build } = setup([row("pt", 1, "O Verbo se fez carne — graça")]);
++    await build().list();
++    const other = makeSource([]);
++    const fromL2 = await build(other.source).list();
++    expect(fromL2[0]!.title).toBe("O Verbo se fez carne — graça");
++    expect(other.state.list).toBe(0);
++  });
++});
++
++describe("cards-cache — invalidação", () => {
++  it("invalidate dá uma versão nova, limpa a L1 e a lista volta a ser lida da BD", async () => {
++    const { redis, src, cache } = setup();
++    await cache.list();
++    src.state.rows = [row("a", 1), row("b", 2), row("c", 3)];
++
++    expect(await cache.invalidate()).toBe(1);
++    const after = await cache.list();
++    expect(after.map((c) => c.slug)).toEqual(["a", "b", "c"]);
++    expect(src.state.list).toBe(2);
++    expect(redis!.store.has("cc:v1:cards:v1:list")).toBe(true);
++  });
++
++  it("outra instância só vê a invalidação ao fim do TTL da versão (60 s)", async () => {
++    const { build, clock, src } = setup();
++    const a = build();
++    const bSource = makeSource([row("a", 1), row("b", 2)]);
++    const b = build(bSource.source);
++
++    await a.list();
++    await b.list();
++    expect(bSource.state.list).toBe(0); // veio da L2
++
++    bSource.state.rows = [row("novo", 1)];
++    await a.invalidate();
++
++    expect((await b.list()).map((c) => c.slug)).toEqual(["a", "b"]);
++    clock.t += 60_001;
++    expect((await b.list()).map((c) => c.slug)).toEqual(["novo"]);
++    expect(bSource.state.list).toBe(1);
++    expect(src.state.list).toBe(1);
++  });
++
++  it("invalidate lança se o Redis falhar (o seed tem de saber)", async () => {
++    const { redis, cache } = setup();
++    redis!.failWith = Object.assign(new Error("connect ECONNREFUSED 10.9.8.7:6379"), {
++      code: "ECONNREFUSED",
++    });
++    await expect(cache.invalidate()).rejects.toThrow();
++  });
++});
++
++describe("cards-cache — Redis com problemas", () => {
++  it("L2 corrompida ou com forma inválida é ignorada e reescrita", async () => {
++    for (const bad of ["{isto não é json", '[{"slug":"x"}]', "null"]) {
++      const { redis, src, cache, logs } = setup();
++      redis!.store.set("cc:v1:cards:v0:list", bad);
++      const list = await cache.list();
++      expect(list.map((c) => c.slug)).toEqual(["a", "b"]);
++      expect(src.state.list).toBe(1);
++      expect(() => JSON.parse(redis!.store.get("cc:v1:cards:v0:list")!)).not.toThrow();
++      expect(logs.some((l) => l.level === "warn")).toBe(true);
++    }
++  });
++
++  it("Redis a falhar: o pedido funciona e o log não leva host nem porta", async () => {
++    const redis = new FakeRedis();
++    redis.failWith = Object.assign(new Error("connect ECONNREFUSED 10.9.8.7:6379"), {
++      code: "ECONNREFUSED",
++    });
++    const { src, cache, logs } = setup(undefined, { redis });
++    const list = await cache.list();
++    expect(list.map((c) => c.slug)).toEqual(["a", "b"]);
++    expect(src.state.list).toBe(1);
++    const text = JSON.stringify(logs);
++    expect(text).not.toContain("10.9.8.7");
++    expect(text).not.toContain("6379");
++    expect(text).toContain("ECONNREFUSED");
++  });
++
++  it("stale-if-error: com o Redis em baixo mantém a última versão, serve da L1 e não insiste", async () => {
++    const { redis, clock, src, cache } = setup();
++    await cache.list();
++    redis!.failWith = new Error("down");
++    clock.t += 61_000; // a versão em memória expirou
++    redis!.calls = { get: 0, set: 0, incr: 0 };
++
++    expect((await cache.list()).map((c) => c.slug)).toEqual(["a", "b"]);
++    expect((await cache.list()).map((c) => c.slug)).toEqual(["a", "b"]);
++    expect(src.state.list).toBe(1);
++    expect(redis!.calls.get).toBe(1); // só uma tentativa dentro dos 10 s de espera
++  });
++
++  it("sem Redis (null): serve da BD, L1 curta (60 s) e invalidate devolve 0", async () => {
++    const { clock, src, cache } = setup(undefined, { redis: null });
++    await cache.list();
++    await cache.list();
++    expect(src.state.list).toBe(1);
++    clock.t += 60_001;
++    await cache.list();
++    expect(src.state.list).toBe(2);
++
++    expect(await cache.invalidate()).toBe(0);
++    await cache.list();
++    expect(src.state.list).toBe(3);
++  });
++});
++
++describe("cards-cache — bySlug", () => {
++  it("miss → BD + L2; o segundo pedido vem da L1", async () => {
++    const { redis, src, cache } = setup();
++    expect((await cache.bySlug("a"))?.slug).toBe("a");
++    expect(src.state.find).toBe(1);
++    expect(redis!.store.has("cc:v1:cards:v0:item:a")).toBe(true);
++    expect((await cache.bySlug("a"))?.slug).toBe("a");
++    expect(src.state.find).toBe(1);
++  });
++
++  it("inexistente: null, cache negativa de 60 s, não vai ao Redis como valor", async () => {
++    const { redis, clock, src, cache } = setup();
++    expect(await cache.bySlug("nao-existe")).toBeNull();
++    expect(await cache.bySlug("nao-existe")).toBeNull();
++    expect(src.state.find).toBe(1);
++    expect([...redis!.store.keys()].some((k) => k.includes("nao-existe"))).toBe(false);
++
++    clock.t += 60_001;
++    await cache.bySlug("nao-existe");
++    expect(src.state.find).toBe(2);
++  });
++
++  it("a cache negativa cai com a invalidação (card criado pelo seed)", async () => {
++    const { src, cache } = setup();
++    expect(await cache.bySlug("novo")).toBeNull();
++    src.state.rows = [...src.state.rows, row("novo", 3)];
++    await cache.invalidate();
++    expect((await cache.bySlug("novo"))?.slug).toBe("novo");
++  });
++
++  it("com a lista em L1, a lista é autoritativa: não vai à BD nem para inexistentes", async () => {
++    const { src, cache } = setup();
++    await cache.list();
++    expect((await cache.bySlug("a"))?.slug).toBe("a");
++    expect(await cache.bySlug("nao-existe")).toBeNull();
++    expect(src.state.find).toBe(0);
++  });
++
++  it("slug inválido: null, sem BD e sem tocar no Redis", async () => {
++    const { redis, src, cache } = setup();
++    for (const bad of ["", "A", "com espaço", "a/b", "x".repeat(101), "a:b"]) {
++      expect(await cache.bySlug(bad)).toBeNull();
++    }
++    expect(src.state.find).toBe(0);
++    expect(redis!.calls.get).toBe(0);
++  });
++
++  it("as entradas negativas têm limite (1000): as mais antigas saem", async () => {
++    const { src, cache } = setup();
++    for (let i = 0; i < 1001; i++) await cache.bySlug(`miss-${i}`);
++    src.state.find = 0;
++    await cache.bySlug("miss-1000");
++    expect(src.state.find).toBe(0); // recente: continua em cache
++    await cache.bySlug("miss-0");
++    expect(src.state.find).toBe(1); // a mais antiga foi expulsa
++  });
++
++  it("pedidos concorrentes do mesmo slug fazem uma só carga", async () => {
++    const { src, cache } = setup();
++    await Promise.all(Array.from({ length: 20 }, () => cache.bySlug("a")));
++    expect(src.state.find).toBe(1);
++  });
++});
+diff --git a/apps/api/test/repositories/cards.test.ts b/apps/api/test/repositories/cards.test.ts
+index 67c1899..0518a49 100644
+--- a/apps/api/test/repositories/cards.test.ts
++++ b/apps/api/test/repositories/cards.test.ts
+@@ -57,3 +57,43 @@ describe("cardsRepo", () => {
+     expect(all[0]!.orderIndex).toBe(2);
+   });
+ });
++
++describe("cardsRepo.upsertMany", () => {
++  it("cria e actualiza numa só chamada e devolve as contagens", async () => {
++    const db = await getTestDb();
++    const repo = cardsRepo(db);
++    await repo.create(sample("existente", 1));
++
++    const result = await repo.upsertMany([
++      { ...sample("existente", 1), title: "Novo título" },
++      sample("novo", 2),
++    ]);
++    expect(result).toEqual({ created: 1, updated: 1 });
++
++    const all = await repo.list();
++    expect(all.map((c) => c.slug)).toEqual(["existente", "novo"]);
++    expect(all[0]!.title).toBe("Novo título");
++  });
++
++  it("é idempotente", async () => {
++    const db = await getTestDb();
++    const repo = cardsRepo(db);
++    const items = [sample("a", 1), sample("b", 2)];
++    expect(await repo.upsertMany(items)).toEqual({ created: 2, updated: 0 });
++    expect(await repo.upsertMany(items)).toEqual({ created: 0, updated: 2 });
++    expect(await repo.list()).toHaveLength(2);
++  });
++
++  it("transacção: se um item falha, nenhum fica gravado", async () => {
++    const db = await getTestDb();
++    const repo = cardsRepo(db);
++    const broken = { ...sample("quebrado", 2), title: null as unknown as string };
++    await expect(repo.upsertMany([sample("bom", 1), broken])).rejects.toThrow();
++    expect(await repo.list()).toHaveLength(0);
++  });
++
++  it("lista vazia não faz nada", async () => {
++    const db = await getTestDb();
++    expect(await cardsRepo(db).upsertMany([])).toEqual({ created: 0, updated: 0 });
++  });
++});
+diff --git a/apps/api/test/routes/cards.test.ts b/apps/api/test/routes/cards.test.ts
+new file mode 100644
+index 0000000..3ab61d8
+--- /dev/null
++++ b/apps/api/test/routes/cards.test.ts
+@@ -0,0 +1,203 @@
++import { Redis } from "ioredis";
++import request from "supertest";
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { loadEnv } from "../../src/env.js";
++import { cardsRepo } from "../../src/repositories/cards.js";
++import { buildServer } from "../../src/server.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++
++type App = Awaited<ReturnType<typeof buildServer>>;
++
++const baseEnv = { NODE_ENV: "test", LOG_LEVEL: "fatal", APP_VERSION: "test" } as const;
++
++let redis: Redis;
++
++async function flushKeys(): Promise<void> {
++  for (const pattern of ["cc:v1:cards:*", "rl:cards*"]) {
++    const keys = await redis.keys(pattern);
++    if (keys.length > 0) await redis.del(...keys);
++  }
++}
++
++async function seed(count: number): Promise<void> {
++  const repo = cardsRepo(await getTestDb());
++  for (let i = 1; i <= count; i++) {
++    await repo.create({
++      slug: `card-${String(i).padStart(3, "0")}`,
++      title: `Card ${i}`,
++      gospelReference: "Mateus 2",
++      summary: "Resumo",
++      otReferences: ["Isaías 7:14"],
++      ntReferences: ["Mateus 2:1-12"],
++      orderIndex: i,
++    });
++  }
++}
++
++beforeAll(async () => {
++  await getTestDb();
++  redis = new Redis(process.env.REDIS_URL!);
++});
++
++afterAll(async () => {
++  await redis.quit();
++  await closeTestDb();
++});
++
++beforeEach(async () => {
++  await truncateAll();
++  await flushKeys();
++});
++
++describe("GET /gospel-cards", () => {
++  let app: App;
++  // App nova por teste: a cache L1 vive no processo e não pode passar de um teste para o outro.
++  beforeEach(async () => {
++    app = await buildServer({ env: loadEnv(baseEnv) });
++    await app.ready();
++  });
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it("lista vazia → 200 sem cabeçalhos de cache (seed por correr)", async () => {
++    const res = await request(app.server).get("/gospel-cards");
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ cards: [] });
++    expect(res.headers["cache-control"]).toBe("no-store");
++    expect(res.headers["etag"]).toBeUndefined();
++  });
++
++  it("devolve os cards ordenados por orderIndex, com cache pública e ETag", async () => {
++    await seed(3);
++    const res = await request(app.server).get("/gospel-cards");
++    expect(res.status).toBe(200);
++    expect(
++      res.body.cards.map((c: { orderIndex: number }) => c.orderIndex),
++    ).toEqual([1, 2, 3]);
++    expect(res.headers["cache-control"]).toBe(
++      "public, max-age=300, stale-while-revalidate=86400",
++    );
++    expect(res.headers["etag"]).toMatch(/^W\/"[A-Za-z0-9_-]+"$/);
++  });
++
++  it("só expõe os campos públicos (sem id nem createdAt)", async () => {
++    await seed(1);
++    const res = await request(app.server).get("/gospel-cards");
++    expect(Object.keys(res.body.cards[0]).sort()).toEqual(
++      [
++        "gospelReference",
++        "ntReferences",
++        "orderIndex",
++        "otReferences",
++        "slug",
++        "summary",
++        "title",
++      ].sort(),
++    );
++  });
++
++  it("guarda a lista na cache Redis versionada", async () => {
++    await seed(2);
++    await request(app.server).get("/gospel-cards");
++    expect(await redis.exists("cc:v1:cards:v0:list")).toBe(1);
++  });
++
++  it("If-None-Match igual → 304 sem corpo; diferente → 200", async () => {
++    await seed(2);
++    const first = await request(app.server).get("/gospel-cards");
++    const etag = first.headers["etag"] as string;
++
++    const same = await request(app.server)
++      .get("/gospel-cards")
++      .set("If-None-Match", etag);
++    expect(same.status).toBe(304);
++    expect(same.text).toBe("");
++    expect(same.headers["etag"]).toBe(etag);
++    expect(same.headers["cache-control"]).toContain("public");
++
++    const strong = await request(app.server)
++      .get("/gospel-cards")
++      .set("If-None-Match", `"x", ${etag.replace(/^W\//, "")}`);
++    expect(strong.status).toBe(304);
++
++    const other = await request(app.server)
++      .get("/gospel-cards")
++      .set("If-None-Match", 'W/"outro"');
++    expect(other.status).toBe(200);
++    expect(other.body.cards).toHaveLength(2);
++  });
++});
++
++describe("GET /gospel-cards/:slug", () => {
++  let app: App;
++  beforeEach(async () => {
++    app = await buildServer({ env: loadEnv(baseEnv) });
++    await app.ready();
++  });
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it("devolve o card, com cache pública e ETag", async () => {
++    await seed(2);
++    const res = await request(app.server).get("/gospel-cards/card-002");
++    expect(res.status).toBe(200);
++    expect(res.body.card.slug).toBe("card-002");
++    expect(res.body.card.otReferences).toEqual(["Isaías 7:14"]);
++    expect(res.headers["cache-control"]).toContain("public");
++    expect(res.headers["etag"]).toBeDefined();
++
++    const again = await request(app.server)
++      .get("/gospel-cards/card-002")
++      .set("If-None-Match", res.headers["etag"] as string);
++    expect(again.status).toBe(304);
++  });
++
++  it("404 para slug inexistente, sempre no-store", async () => {
++    const res = await request(app.server).get("/gospel-cards/nao-existe");
++    expect(res.status).toBe(404);
++    expect(res.body).toEqual({ error: "not_found" });
++    expect(res.headers["cache-control"]).toBe("no-store");
++  });
++
++  // (Um segmento com mais de 100 caracteres nem chega à rota: o Fastify responde 404.)
++  it.each(["slug%20com%20espacos", "MAIUSCULAS", "a_b"])(
++    "400 validation_error para slug inválido (%s), no-store",
++    async (slug) => {
++      const res = await request(app.server).get(`/gospel-cards/${slug}`);
++      expect(res.status).toBe(400);
++      expect(res.body.error).toBe("validation_error");
++      expect(res.headers["cache-control"]).toBe("no-store");
++    },
++  );
++});
++
++describe("GET /gospel-cards — rate limit", () => {
++  let app: App;
++  beforeEach(async () => {
++    app = await buildServer({
++      env: loadEnv({ ...baseEnv, RATE_LIMIT_CARDS_MAX: 3 }),
++    });
++    await app.ready();
++  });
++  afterEach(async () => {
++    await app.close();
++  });
++
++  it("acima do limite → 429 com Retry-After, formato de erro único e no-store", async () => {
++    await seed(1);
++    for (let i = 0; i < 3; i++) {
++      const ok = await request(app.server).get("/gospel-cards");
++      expect(ok.status).toBe(200);
++    }
++    const blocked = await request(app.server).get("/gospel-cards");
++    expect(blocked.status).toBe(429);
++    expect(blocked.body).toEqual({ error: "rate_limited" });
++    expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
++    expect(blocked.headers["cache-control"]).toBe("no-store");
++
++    const item = await request(app.server).get("/gospel-cards/card-001");
++    expect(item.status).toBe(429); // o balde é partilhado entre lista e detalhe
++  });
++});
+diff --git a/apps/api/test/setup.ts b/apps/api/test/setup.ts
+index fe6044c..cb0486c 100644
+--- a/apps/api/test/setup.ts
++++ b/apps/api/test/setup.ts
+@@ -14,6 +14,7 @@ process.env.RATE_LIMIT_LOGIN_ACCOUNT_MAX = "1000";
+ process.env.RATE_LIMIT_RECOVER_IP_MAX = "1000";
+ process.env.RATE_LIMIT_RECOVER_ACCOUNT_QUESTIONS_MAX = "1000";
+ process.env.RATE_LIMIT_RECOVER_ACCOUNT_CODE_MAX = "1000";
++process.env.RATE_LIMIT_CARDS_MAX = "1000";
+ 
+ // Chaves JWT efémeras por run (nunca reutilizar)
+ if (!process.env.JWT_PRIVATE_JWK || !process.env.JWT_PUBLIC_JWK) {
+diff --git a/apps/api/test/shared/cards-schema.test.ts b/apps/api/test/shared/cards-schema.test.ts
+new file mode 100644
+index 0000000..716dca3
+--- /dev/null
++++ b/apps/api/test/shared/cards-schema.test.ts
+@@ -0,0 +1,75 @@
++import { readFileSync } from "node:fs";
++import { fileURLToPath } from "node:url";
++import {
++  CardSlugParams,
++  GospelCardsSeedFile,
++  MAX_GOSPEL_CARDS,
++} from "@comunidade/shared";
++import { describe, expect, it } from "vitest";
++
++function card(i: number, overrides: Record<string, unknown> = {}) {
++  return {
++    slug: `card-${i}`,
++    title: `Card ${i}`,
++    gospelReference: "Mateus 2",
++    summary: "Resumo",
++    otReferences: ["Isaías 7:14"],
++    ntReferences: ["Mateus 2:1-12"],
++    orderIndex: i,
++    ...overrides,
++  };
++}
++
++describe("GospelCardsSeedFile", () => {
++  it("o seed-data/cards.json do repositório é válido", () => {
++    const file = fileURLToPath(
++      new URL("../../src/db/seed-data/cards.json", import.meta.url),
++    );
++    const parsed = GospelCardsSeedFile.safeParse(
++      JSON.parse(readFileSync(file, "utf-8")),
++    );
++    expect(parsed.success).toBe(true);
++  });
++
++  it("aceita um conjunto válido, até ao máximo", () => {
++    const cards = Array.from({ length: MAX_GOSPEL_CARDS }, (_, i) => card(i + 1));
++    expect(GospelCardsSeedFile.safeParse(cards).success).toBe(true);
++  });
++
++  it("recusa mais do que o máximo (excesso visível no seed, não corte na leitura)", () => {
++    const cards = Array.from({ length: MAX_GOSPEL_CARDS + 1 }, (_, i) => card(i + 1));
++    expect(GospelCardsSeedFile.safeParse(cards).success).toBe(false);
++  });
++
++  it("recusa vazio, slugs repetidos e orderIndex repetido", () => {
++    expect(GospelCardsSeedFile.safeParse([]).success).toBe(false);
++
++    const dupSlug = GospelCardsSeedFile.safeParse([card(1), card(2, { slug: "card-1" })]);
++    expect(dupSlug.success).toBe(false);
++    if (!dupSlug.success) {
++      expect(dupSlug.error.issues[0]?.message).toContain("slug repetido");
++    }
++
++    const dupOrder = GospelCardsSeedFile.safeParse([card(1), card(2, { orderIndex: 1 })]);
++    expect(dupOrder.success).toBe(false);
++  });
++
++  it.each([
++    ["slug com maiúsculas", { slug: "Natal" }],
++    ["slug com espaço", { slug: "o natal" }],
++    ["título vazio", { title: "" }],
++    ["orderIndex negativo", { orderIndex: -1 }],
++    ["orderIndex decimal", { orderIndex: 1.5 }],
++    ["referência vazia", { otReferences: [""] }],
++    ["resumo gigante", { summary: "x".repeat(1001) }],
++  ])("recusa %s", (_name, overrides) => {
++    expect(GospelCardsSeedFile.safeParse([card(1, overrides)]).success).toBe(false);
++  });
++});
++
++describe("CardSlugParams", () => {
++  it("valida o formato do slug", () => {
++    expect(CardSlugParams.safeParse({ slug: "o-nascimento-de-jesus" }).success).toBe(true);
++    expect(CardSlugParams.safeParse({ slug: "Com Espaço" }).success).toBe(false);
++  });
++});
+diff --git a/docs/Arquitectura/arquitectura.md b/docs/Arquitectura/arquitectura.md
+index 3efa170..6784916 100644
+--- a/docs/Arquitectura/arquitectura.md
++++ b/docs/Arquitectura/arquitectura.md
+@@ -484,14 +484,16 @@ sequenceDiagram
+ | `feed:{category}:{filter}:{cursor}` | 60s  | Ao publicar/apagar post na categoria  |
+ | `post:{id}`                         | 120s | Ao editar, apagar, mudar status, like |
+ | `post:{id}:likes_count`             | 120s | Ao like/unlike (increment atómico)    |
+-| `cards:list`                        | 1h   | Só em seed de conteúdo                |
++| `cc:v1:cards:v<N>:list` / `:item:<slug>` | 1h (L2) / 5 min (L1) | Só em seed: `INCR` da versão `cc:v1:cards:version` |
+ | `user:{id}:profile`                 | 60s  | Ao alterar username                   |
+ 
+ **Regras**
+ 
+ - Cache-aside: o backend lê do Redis, em falha vai a Postgres.
+ - Contadores (`likes_count`, `reports_count`) mantidos em Postgres como fonte de verdade; Redis só acelera leitura.
+-- Rate limit: `@upstash/ratelimit` (sliding window).
++- Rate limit: `rate-limiter-flexible` (Redis, com fallback em memória que nunca falha em aberto).
++- Gospel cards (E3): duas camadas. L1 em memória do processo (lista e cards montados; um hit não toca no Redis nem na BD) e L2 no Redis com chaves versionadas. A versão lê-se do Redis no máximo 1×/min por instância; invalidar = `INCR` da versão. Redis em baixo → continua com a última versão conhecida e depois vai à BD. O que vem do Redis é validado com zod. Cache negativa (60 s, máx. 1000 entradas) e _single-flight_ protegem a BD. Ver `docs/registos/E3-gospel-cards-cache.md`.
++- Cache HTTP: só as respostas públicas dos cards (200/304) podem ser guardadas (`public, max-age=300, stale-while-revalidate=86400` + `ETag`); todo o resto é `no-store`.
+ 
+ ## 10. Estratégia de cold start
+ 
+diff --git a/docs/api/api.md b/docs/api/api.md
+index e019d31..fc699ec 100644
+--- a/docs/api/api.md
++++ b/docs/api/api.md
+@@ -1,6 +1,7 @@
+ # API — Comunidade Cristã
+ 
+-Base: `/api/v1`
++Base: raiz do host da API (por exemplo `https://api.<dominio>/gospel-cards`). Ainda não há prefixo
++`/api/v1`; se vier a existir, será um registo próprio.
+ Formato: JSON
+ Autenticação: Bearer JWT (a partir de E2)
+ 
+@@ -30,3 +31,45 @@ _**200**_
+   "checks": { "db": "ok", "redis": "ok" }
+ }
+ ```
++
++## Gospel cards (conteúdo público)
++
++Sem autenticação. Limite por IP: `RATE_LIMIT_CARDS_MAX` pedidos por `RATE_LIMIT_CARDS_WINDOW_S`
++(por omissão 120 por 60 s), partilhado entre a lista e o detalhe. Acima disso: `429`.
++
++**Cache HTTP.** As respostas `200` levam
++`Cache-Control: public, max-age=300, stale-while-revalidate=86400` e `ETag` (fraco). Com
++`If-None-Match` igual a API responde `304` sem corpo. Lista vazia (seed por correr) e **todos** os
++erros levam `Cache-Control: no-store`. Depois de um seed, os clientes podem ver o conteúdo antigo
++até 5 minutos (browser) e as instâncias da API até 1 minuto (versão da cache).
++
++### GET /gospel-cards
++
++Lista completa, ordenada por `orderIndex` (no máximo 200 cards; sem paginação).
++
++**200**
++
++```json
++{
++  "cards": [
++    {
++      "slug": "o-nascimento-de-jesus",
++      "title": "O Nascimento de Jesus",
++      "gospelReference": "Mateus 2",
++      "summary": "…",
++      "otReferences": ["Isaías 7:14"],
++      "ntReferences": ["Mateus 2:1-12"],
++      "orderIndex": 1
++    }
++  ]
++}
++```
++
++**304** (`If-None-Match` igual ao `ETag`), **429** `{ "error": "rate_limited" }` com `Retry-After`.
++
++### GET /gospel-cards/:slug
++
++`slug`: `[a-z0-9-]`, 1–100 caracteres.
++
++**200** `{ "card": { …campos acima } }` · **304** · **400** `{ "error": "validation_error", "fields": { "slug": "slug inválido" } }`
++· **404** `{ "error": "not_found" }` · **429** `{ "error": "rate_limited" }`.
+diff --git a/docs/plano-de-construcao.md b/docs/plano-de-construcao.md
+index 77f1c66..5f27f87 100644
+--- a/docs/plano-de-construcao.md
++++ b/docs/plano-de-construcao.md
+@@ -166,9 +166,9 @@ Escala de esforço relativo: **XS** (< ½ dia) · **S** (½–1 dia) · **M** (1
+ 
+ | #    | Tarefa                                                                     | Esforço |
+ | ---- | -------------------------------------------------------------------------- | ------- |
+-| T3.1 | `GET /gospel-cards` (lista ordenada, paginação)                            | S       |
++| T3.1 | `GET /gospel-cards` (lista ordenada; sem paginação, máx. 200 validado no seed) | S       |
+ | T3.2 | `GET /gospel-cards/:slug`                                                  | S       |
+-| T3.3 | Camada de cache: `cache.get(key, ttl, loader)` com fallback se Redis falha | S       |
++| T3.3 | Camada de cache L1 (memória) + L2 (Redis versionado) com fallback se o Redis falha | S       |
+ | T3.4 | Cache de `cards:list` (TTL 1h) e `card:{slug}` (TTL 1h)                    | XS      |
+ | T3.5 | Invalidação em seed                                                        | XS      |
+ 
+diff --git a/docs/registos/E3-gospel-cards-cache.md b/docs/registos/E3-gospel-cards-cache.md
+new file mode 100644
+index 0000000..b54c105
+--- /dev/null
++++ b/docs/registos/E3-gospel-cards-cache.md
+@@ -0,0 +1,82 @@
++# E3 — Gospel cards e cache
++
++Data: 2026-11-01 · Branch de origem: `feat` do E3 (criada sobre a versão antiga do E2), rebaseada
++sobre `dev` (F1–F7 aplicados).
++
++## 1. Contexto
++
++Leitura pública dos gospel cards (`GET /gospel-cards`, `GET /gospel-cards/:slug`) com cache. A
++branch do E3 foi criada antes da refactorização do E2, por isso o `server.ts`, o formato de erros e
++as opções do pool estavam desactualizados. Só se aproveitou o que era do E3.
++
++## 2. Check — o que se encontrou
++
++| #   | Problema                                                                                                    | Gravidade |
++| --- | ----------------------------------------------------------------------------------------------------------- | --------- |
++| 1   | O hook global do `dev` força `Cache-Control: no-store` por cima da rota: o `public` do E3 nunca chegava ao cliente | Alta      |
++| 2   | `server.ts` do E3 estava na versão antiga: copiá-lo desfazia o formato de erro único, o pool e a manutenção  | Alta      |
++| 3   | A cache registava `{ err }`: os erros do ioredis trazem host e porta                                         | Média     |
++| 4   | Valores lidos do Redis usados sem validação (`JSON.parse(...) as ...`)                                       | Média     |
++| 5   | Ramo `__null__` morto: slugs inexistentes iam sempre à BD (enumeração)                                       | Média     |
++| 6   | Corte silencioso a 200 cards na leitura                                                                      | Média     |
++| 7   | Seed: `process.exit(1)` ao 1.º erro, escritas parciais e cache não invalidada                                | Média     |
++| 8   | Rate limit fixo em 30/min por IP: bloqueia utilizadores legítimos atrás de CGNAT                             | Média     |
++| 9   | Lista vazia (seed por correr) podia ficar fixada no browser                                                  | Média     |
++| 10  | `api.md` dizia `/api/v1` mas as rotas não têm prefixo                                                        | Baixa     |
++
++## 3. Decisões
++
++| Tema                  | Escolha                                                                                      | Alternativas                   |
++| --------------------- | -------------------------------------------------------------------------------------------- | ------------------------------ |
++| Cache fora do servidor | **A** — só browser e service worker (`public, max-age=300, stale-while-revalidate=86400`, `ETag`/304) | B: também Cloudflare; C: nenhuma |
++| Camadas de cache      | **L1 (memória) + L2 (Redis versionado)**: um hit não toca em Redis nem BD                    | Só Redis (plano original)      |
++| Paginação / limite    | Sem paginação; máximo 200 validado **no seed** (erro visível), sem cortar na leitura         | Paginar; manter o `slice`      |
++| Rate limit dos cards  | 120/min por IP, configurável (`RATE_LIMIT_CARDS_MAX`, `RATE_LIMIT_CARDS_WINDOW_S`)           | 30/min fixo                    |
++
++Decisões tomadas pelo responsável do projecto em 2026-11-01.
++
++## 4. Alterações
++
++- `packages/shared/src/cards.ts` (novo): schemas dos cards com limites, `CardSlug`, `GospelCardsSeedFile` (slugs e `orderIndex` únicos, 1–200 cards).
++- `apps/api/src/cache/cards-cache.ts` (novo):
++  - L1 em memória (5 min; 60 s sem Redis) e L2 Redis (1 h) com chaves `cc:v1:cards:v<N>:list|item:<slug>`.
++  - A versão lê-se do Redis no máximo 1×/min por instância; `invalidate()` faz `INCR`, limpa a L1 e **lança** se o Redis falhar.
++  - _stale-if-error_: com o Redis em baixo mantém a última versão conhecida (nova tentativa a cada 10 s) e depois vai à BD.
++  - _single-flight_ por chave (anti-stampede); cache negativa de 60 s (máx. 1000 entradas); lista em L1 é autoritativa para `bySlug`.
++  - Dados do Redis validados com zod; logs só com `errorName`/`errorCode`.
++- `apps/api/src/routes/cards.ts` (novo): rotas, `ETag` fraco (calculado uma vez por objecto), `If-None-Match` → 304, 429 com `Retry-After`. Lista vazia não leva cabeçalhos de cache.
++- `apps/api/src/server.ts`: o hook de `Cache-Control` só respeita `public...` em respostas 200/304; regista `cardsRoutes` com a cache.
++- `apps/api/src/auth/rate-limit.ts`, `env.ts`, `.env.example`, `test/setup.ts`: balde `rl:cards` configurável.
++- `apps/api/src/repositories/cards.ts`: `upsertMany` transaccional (tudo ou nada) com contagens.
++- `apps/api/src/db/seed.ts`: valida o JSON com zod antes de escrever, grava numa transacção e invalida a cache; se a invalidação falhar sai com erro para repetir (é idempotente).
++- Documentação: `docs/api/api.md`, `docs/Arquitectura/arquitectura.md` (§9), `docs/plano-de-construcao.md` (E3), este registo.
++
++## 5. Segurança e privacidade
++
++- Os cards são públicos: sem dados de utilizador na cache, nem nas chaves, nem nos logs.
++- O slug é validado (schema da rota e, de novo, dentro da cache) antes de entrar numa chave do Redis: não há injecção de chaves.
++- Erros 4xx/5xx nunca são cacheáveis pelo cliente (`no-store`), incluindo 429.
++- Rate limit com chave HMAC do IP (como os restantes baldes); falha do limitador fecha.
++- Os logs da cache não levam host, porta nem mensagens de erro do Redis.
++
++## 6. Testes
++
++- `test/cache/cards-cache.test.ts` (sem infra): L1/L2, versão, invalidação entre instâncias, Redis em baixo, L2 corrompida, _stale-if-error_, sem Redis, cache negativa e o seu limite, anti-stampede, slugs inválidos, logs sem host.
++- `test/routes/cards.test.ts` (Postgres + Redis): contrato, ordem, campos públicos, chaves no Redis, ETag/304, `no-store` nos erros, rate limit.
++- `test/shared/cards-schema.test.ts`: schema do seed e o `cards.json` real do repositório.
++- `test/repositories/cards.test.ts` (`upsertMany`), `test/auth/rate-limit.test.ts` (balde dos cards).
++- **Por cobrir:** o `seed.ts` como processo (exige Postgres + Redis reais); verificação manual no runbook abaixo.
++
++## 7. Operação
++
++- Variáveis: `RATE_LIMIT_CARDS_MAX` (120) e `RATE_LIMIT_CARDS_WINDOW_S` (60).
++- Publicar conteúdo: editar `apps/api/src/db/seed-data/cards.json` e correr `pnpm --filter @comunidade/api db:seed` com `DATABASE_URL` e `REDIS_URL` de produção. Se terminar com "cache não foi invalidada", repetir.
++- Depois do seed: instâncias da API até 1 min; browsers até 5 min (mais SWR).
++- Cloudflare: manter "Bypass cache" para a API (decisão A). Se um dia se quiser cache na borda, abrir excepção para `/gospel-cards*`.
++- O seed não apaga cards removidos do JSON (podem estar ligados a posts).
++
++## 8. Pendente
++
++- Conteúdo: o `cards.json` tem 1 card; os restantes serão fornecidos.
++- Registar retroactivamente F1–F7 neste formato (a pedido).
++- `/health/deep`: ainda abre uma ligação nova ao Postgres por pedido (backlog).
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+new file mode 100644
+index 0000000..78e9975
+--- /dev/null
++++ b/docs/registos/README.md
+@@ -0,0 +1,24 @@
++# Registos de fase
++
++Um registo por feature refactorada ou revista (check → fix → refactory → update). Serve para
++quem chegar depois perceber **o que mudou, porquê, que decisões se tomaram e o que ficou por
++fazer**, sem ler o histórico de commits.
++
++Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`.
++
++## Modelo
++
++1. **Contexto** — o que a feature faz e de onde veio (branch, versão antiga).
++2. **Check** — o que se encontrou ao rever (bugs, riscos, desvios do plano).
++3. **Decisões** — alternativas, escolha e porquê (quem decidiu).
++4. **Alterações** — ficheiros e comportamento novo.
++5. **Segurança e privacidade** — o que foi considerado.
++6. **Testes** — o que cobrem e o que ficou por cobrir.
++7. **Operação** — variáveis de ambiente, comandos, passos de deploy.
++8. **Pendente** — o que ficou por fazer.
++
++## Índice
++
++| Fase | Assunto                                               | Estado |
++| ---- | ----------------------------------------------------- | ------ |
++| E3   | [Gospel cards e cache](E3-gospel-cards-cache.md)      | Feito  |
+diff --git a/packages/shared/src/cards.ts b/packages/shared/src/cards.ts
+new file mode 100644
+index 0000000..9c19f30
+--- /dev/null
++++ b/packages/shared/src/cards.ts
+@@ -0,0 +1,68 @@
++import { z } from "zod";
++
++/**
++ * Máximo de gospel cards. A lista é devolvida inteira (sem paginação): são dezenas de cards
++ * pequenos e a PWA guarda-os para uso offline. O limite é validado no seed, para um excesso
++ * ser um erro visível ao publicar o conteúdo e não um corte silencioso na leitura.
++ */
++export const MAX_GOSPEL_CARDS = 200;
++
++const Reference = z.string().min(1).max(100);
++
++export const CardSlug = z
++  .string()
++  .min(1, "slug vazio")
++  .max(100, "slug demasiado longo")
++  .regex(/^[a-z0-9-]+$/, "slug inválido");
++
++export const GospelCardPublic = z.object({
++  slug: CardSlug,
++  title: z.string().min(1).max(200),
++  gospelReference: z.string().min(1).max(100),
++  summary: z.string().min(1).max(1000),
++  otReferences: z.array(Reference).max(50),
++  ntReferences: z.array(Reference).max(50),
++  orderIndex: z.number().int().min(0),
++});
++export type GospelCardPublic = z.infer<typeof GospelCardPublic>;
++
++export const GospelCardListResponse = z.object({
++  cards: z.array(GospelCardPublic),
++});
++export type GospelCardListResponse = z.infer<typeof GospelCardListResponse>;
++
++export const GospelCardResponse = z.object({
++  card: GospelCardPublic,
++});
++export type GospelCardResponse = z.infer<typeof GospelCardResponse>;
++
++export const CardSlugParams = z.object({ slug: CardSlug });
++export type CardSlugParams = z.infer<typeof CardSlugParams>;
++
++/** Ficheiro `seed-data/cards.json`: validado antes de qualquer escrita na base de dados. */
++export const GospelCardsSeedFile = z
++  .array(GospelCardPublic)
++  .min(1, "o ficheiro de seed está vazio")
++  .max(MAX_GOSPEL_CARDS, `no máximo ${MAX_GOSPEL_CARDS} cards`)
++  .superRefine((cards, ctx) => {
++    const slugs = new Set<string>();
++    const orders = new Set<number>();
++    cards.forEach((card, index) => {
++      if (slugs.has(card.slug)) {
++        ctx.addIssue({
++          code: "custom",
++          path: [index, "slug"],
++          message: `slug repetido: ${card.slug}`,
++        });
++      }
++      slugs.add(card.slug);
++      if (orders.has(card.orderIndex)) {
++        ctx.addIssue({
++          code: "custom",
++          path: [index, "orderIndex"],
++          message: `orderIndex repetido: ${card.orderIndex}`,
++        });
++      }
++      orders.add(card.orderIndex);
++    });
++  });
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index b9454ba..241c190 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,5 +1,6 @@
+ import { z } from "zod";
+ export * from "./auth.js";
++export * from "./cards.js";
+ export * from "./password-policy.js";
+ export * from "./reserved-usernames.js";
+ 
