@@ -18,6 +18,7 @@ import type { CardsCache } from "../cache/cards-cache.js";
 import type { FeedCache } from "../cache/feed-cache.js";
 import type { Database } from "../db/client.js";
 import type { Env } from "../env.js";
+import { idempotencyKeysRepo } from "../repositories/outbox.js";
 import { postLikesRepo, postsRepo } from "../repositories/posts.js";
 import { reportsRepo } from "../repositories/reports.js";
 import { usersRepo } from "../repositories/users.js";
@@ -194,9 +195,26 @@ export async function syncRoutes(
     }
   }
 
+  async function hasKeyConflict(
+    userId: string,
+    op: SyncOperation,
+    keysInBatch: Map<string, SyncOperation["type"]>,
+  ): Promise<boolean> {
+    const earlierType = keysInBatch.get(op.idempotency_key);
+    if (earlierType !== undefined && earlierType !== op.type) return true;
+    keysInBatch.set(op.idempotency_key, earlierType ?? op.type);
+    if (op.type === "post.create") return false; // o serviço trata deste caso
+    const stored = await idempotencyKeysRepo(db).get(
+      userId,
+      op.idempotency_key,
+    );
+    return stored !== null && stored.operation !== op.type;
+  }
+
   async function processOne(
     userId: string,
     op: SyncOperation,
+    keysInBatch: Map<string, SyncOperation["type"]>,  // ← NOVO parâmetro
   ): Promise<OpOutcome> {
     const rl = await checkOpLimit(userId, op);
     if (!rl.allowed) {
@@ -206,8 +224,11 @@ export async function syncRoutes(
       });
     }
     try {
+      if (await hasKeyConflict(userId, op, keysInBatch)) {  // ← NOVO guard
+        return rejected(op.op_id, "idempotency_key_conflict");
+      }
       return await run(userId, op);
-    } catch (err) {
+    } catch (err) {   
       app.log.error(
         {
           errorName: err instanceof Error ? err.name : typeof err,
@@ -258,17 +279,17 @@ export async function syncRoutes(
         return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
       }
 
-      const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
+            const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
       const results: SyncResult[] = [];
       let invalidateFeed = false;
+      const keysInBatch = new Map<string, SyncOperation["type"]>(); 
 
-      // Em série e pela ordem do cliente: uma operação pode depender da anterior.
       for (const op of request.body.operations) {
         if (Date.now() >= deadline) {
           results.push(deferred(op.op_id).result);
           continue;
         }
-        const outcome = await processOne(userId, op);
+        const outcome = await processOne(userId, op, keysInBatch); 
         results.push(outcome.result);
         if (outcome.invalidateFeed) invalidateFeed = true;
       }
