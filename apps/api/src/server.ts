@@ -47,8 +47,8 @@ export type AppInstance = FastifyInstance<
 
 export interface BuildServerOptions {
   env: Env;
-  /** Destino alternativo dos logs (testes). */
   logStream?: NodeJS.WritableStream;
+  disableWorker?: boolean;
 }
 
 const LOG_REDACT_PATHS = [
@@ -68,8 +68,13 @@ function pathOnly(url: string | undefined): string | undefined {
   return i === -1 ? url : url.slice(0, i);
 }
 
-export async function buildServer({ env, logStream }: BuildServerOptions) {
-  const trustProxy =
+export async function buildServer({
+  env,
+  logStream,
+  disableWorker,
+}: BuildServerOptions) {
+  const workersDisabled = disableWorker ?? env.NODE_ENV === "test";
+  const trustProxy =   
     env.EDGE_MODE === "none" && env.TRUST_PROXY
       ? (_addr: string, hop: number) => hop < env.TRUST_PROXY_HOPS
       : false;
@@ -212,22 +217,23 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
       cardsCache,
     });
 
-    // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
-    // corre-se `runMaintenance` à mão.
-    if (env.NODE_ENV !== "test") {
-      const stopMaintenance = startMaintenance({
-        db: dbBundle.db,
-        env,
-        log: app.log,
+    if (!workersDisabled) {
+      const db = dbBundle.db;
+      let stopMaintenance: (() => Promise<void> | void) | null = null;
+      let stopOutbox: (() => Promise<void>) | null = null;
+      app.addHook("onReady", async () => {
+        stopMaintenance = startMaintenance({ db, env, log: app.log });
+        stopOutbox = startOutboxWorker({
+          db,
+          log: app.log,
+          intervalMs: env.OUTBOX_WORKER_INTERVAL_MS,
+          batchSize: env.OUTBOX_WORKER_BATCH_SIZE,
+        });
       });
-      app.addHook("onClose", async () => stopMaintenance());
-      const stopOutbox = startOutboxWorker({
-        db: dbBundle.db,
-        log: app.log,
-        intervalMs: env.OUTBOX_WORKER_INTERVAL_MS,
-        batchSize: env.OUTBOX_WORKER_BATCH_SIZE,
+      app.addHook("onClose", async () => {
+        await stopOutbox?.();
+        await stopMaintenance?.();
       });
-      app.addHook("onClose", async () => stopOutbox())
     }
   } else {
     app.log.warn(

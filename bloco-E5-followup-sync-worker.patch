@@ -1,0 +1,392 @@
+diff --git a/apps/api/src/routes/sync.ts b/apps/api/src/routes/sync.ts
+index 2130dfb..e310467 100644
+--- a/apps/api/src/routes/sync.ts
++++ b/apps/api/src/routes/sync.ts
+@@ -18,6 +18,7 @@ import type { CardsCache } from "../cache/cards-cache.js";
+ import type { FeedCache } from "../cache/feed-cache.js";
+ import type { Database } from "../db/client.js";
+ import type { Env } from "../env.js";
++import { idempotencyKeysRepo } from "../repositories/outbox.js";
+ import { postLikesRepo, postsRepo } from "../repositories/posts.js";
+ import { reportsRepo } from "../repositories/reports.js";
+ import { usersRepo } from "../repositories/users.js";
+@@ -202,9 +203,34 @@ export async function syncRoutes(
+     }
+   }
+ 
++  /**
++   * A mesma `idempotency_key` não pode servir operações de tipos diferentes. Só `post.create`
++   * grava a chave (as outras são idempotentes por natureza), por isso o serviço de criação só
++   * apanha o conflito quando a criação vem DEPOIS de outra criação. Aqui fecha-se o resto:
++   *  - no mesmo lote: a chave já foi usada por uma operação de outro tipo;
++   *  - já gravada: uma operação que não é criação usa uma chave de criação existente.
++   * Em ambos os casos o cliente tem um erro (chave reutilizada), logo `rejected`, nunca repetir.
++   */
++  async function hasKeyConflict(
++    userId: string,
++    op: SyncOperation,
++    keysInBatch: Map<string, SyncOperation["type"]>,
++  ): Promise<boolean> {
++    const earlierType = keysInBatch.get(op.idempotency_key);
++    if (earlierType !== undefined && earlierType !== op.type) return true;
++    keysInBatch.set(op.idempotency_key, earlierType ?? op.type);
++    if (op.type === "post.create") return false; // o serviço trata deste caso
++    const stored = await idempotencyKeysRepo(db).get(
++      userId,
++      op.idempotency_key,
++    );
++    return stored !== null && stored.operation !== op.type;
++  }
++
+   async function processOne(
+     userId: string,
+     op: SyncOperation,
++    keysInBatch: Map<string, SyncOperation["type"]>,
+   ): Promise<OpOutcome> {
+     const rl = await checkOpLimit(userId, op);
+     if (!rl.allowed) {
+@@ -214,6 +240,9 @@ export async function syncRoutes(
+       });
+     }
+     try {
++      if (await hasKeyConflict(userId, op, keysInBatch)) {
++        return rejected(op.op_id, "idempotency_key_conflict");
++      }
+       return await run(userId, op);
+     } catch (err) {
+       // Falha inesperada (ex.: base de dados): cada serviço é transaccional, por isso nada
+@@ -272,6 +301,7 @@ export async function syncRoutes(
+       const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
+       const results: SyncResult[] = [];
+       let invalidateFeed = false;
++      const keysInBatch = new Map<string, SyncOperation["type"]>();
+ 
+       // Em série e pela ordem do cliente: uma operação pode depender da anterior.
+       for (const op of request.body.operations) {
+@@ -279,7 +309,7 @@ export async function syncRoutes(
+           results.push(deferred(op.op_id).result);
+           continue;
+         }
+-        const outcome = await processOne(userId, op);
++        const outcome = await processOne(userId, op, keysInBatch);
+         results.push(outcome.result);
+         if (outcome.invalidateFeed) invalidateFeed = true;
+       }
+diff --git a/apps/api/src/server.ts b/apps/api/src/server.ts
+index a1640fe..5815a36 100644
+--- a/apps/api/src/server.ts
++++ b/apps/api/src/server.ts
+@@ -49,6 +49,11 @@ export interface BuildServerOptions {
+   env: Env;
+   /** Destino alternativo dos logs (testes). */
+   logStream?: NodeJS.WritableStream;
++  /**
++   * Não arranca o worker do outbox (nem a manutenção periódica). Por omissão só se desliga
++   * nos testes (`NODE_ENV=test`); um teste pode ligá-lo com `false`.
++   */
++  disableWorker?: boolean;
+ }
+ 
+ // Privacidade: os logs nunca levam IP, cabeçalhos nem query string. O Fastify, por omissão,
+@@ -70,7 +75,12 @@ function pathOnly(url: string | undefined): string | undefined {
+   return i === -1 ? url : url.slice(0, i);
+ }
+ 
+-export async function buildServer({ env, logStream }: BuildServerOptions) {
++export async function buildServer({
++  env,
++  logStream,
++  disableWorker,
++}: BuildServerOptions) {
++  const workersDisabled = disableWorker ?? env.NODE_ENV === "test";
+   const trustProxy =
+     env.EDGE_MODE === "none" && env.TRUST_PROXY
+       ? (_addr: string, hop: number) => hop < env.TRUST_PROXY_HOPS
+@@ -219,23 +229,26 @@ export async function buildServer({ env, logStream }: BuildServerOptions) {
+       cardsCache,
+     });
+ 
+-    // Limpeza periódica (purga de dados com prazo e de contas em apagamento). Nos testes
+-    // corre-se `runMaintenance` à mão.
+-    if (env.NODE_ENV !== "test") {
+-      const stopMaintenance = startMaintenance({
+-        db: dbBundle.db,
+-        env,
+-        log: app.log,
++    // Tarefas em segundo plano. Arrancam em `onReady` (só depois de o servidor estar pronto, e
++    // nunca num `buildServer` que não chega a ser iniciado) e param em `onClose`, esperando
++    // pela ronda em curso. Nos testes corre-se `runMaintenance` / `processOutboxBatch` à mão.
++    if (!workersDisabled) {
++      const db = dbBundle.db;
++      let stopMaintenance: (() => Promise<void> | void) | null = null;
++      let stopOutbox: (() => Promise<void>) | null = null;
++      app.addHook("onReady", async () => {
++        stopMaintenance = startMaintenance({ db, env, log: app.log });
++        stopOutbox = startOutboxWorker({
++          db,
++          log: app.log,
++          intervalMs: env.OUTBOX_WORKER_INTERVAL_MS,
++          batchSize: env.OUTBOX_WORKER_BATCH_SIZE,
++        });
+       });
+-      app.addHook("onClose", async () => stopMaintenance());
+-
+-      const stopOutbox = startOutboxWorker({
+-        db: dbBundle.db,
+-        log: app.log,
+-        intervalMs: env.OUTBOX_WORKER_INTERVAL_MS,
+-        batchSize: env.OUTBOX_WORKER_BATCH_SIZE,
++      app.addHook("onClose", async () => {
++        await stopOutbox?.();
++        await stopMaintenance?.();
+       });
+-      app.addHook("onClose", async () => stopOutbox());
+     }
+   } else {
+     app.log.warn(
+diff --git a/apps/api/test/routes/sync.test.ts b/apps/api/test/routes/sync.test.ts
+index c8fc243..28dd982 100644
+--- a/apps/api/test/routes/sync.test.ts
++++ b/apps/api/test/routes/sync.test.ts
+@@ -222,6 +222,56 @@ describe("POST /sync", () => {
+     });
+   });
+ 
++  it("a mesma chave em operações de tipos diferentes: só a primeira passa", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    const other = await account();
++    const k = key();
++    const like = { ...op.postOp("post.like", post.id), idempotency_key: k };
++    const create = op.create({}, k);
++    const res = await sync(app, other.token, [like, create]);
++    const out = res.body.results as {
++      status: string;
++      error?: { code: string };
++    }[];
++    expect(out.map((r) => [r.status, r.error?.code])).toEqual([
++      ["applied", undefined],
++      ["rejected", "idempotency_key_conflict"],
++    ]);
++    // A criação recusada não deixou nada.
++    const db = await getTestDb();
++    expect(await postsRepo(db).listByAuthor(other.user.id, 10)).toHaveLength(0);
++  });
++
++  it("chave de uma criação já gravada, reutilizada por outro tipo (outro lote) → rejected", async () => {
++    const { token, user } = await account();
++    const post = await makePost(user.id);
++    const k = key();
++    await sync(app, token, [op.create({}, k)]);
++    const del = { ...op.postOp("post.delete", post.id), idempotency_key: k };
++    const res = await sync(app, token, [del]);
++    expect(res.body.results[0]).toMatchObject({
++      status: "rejected",
++      error: { code: "idempotency_key_conflict" },
++    });
++    // O post alheio ao conflito continua lá.
++    const db = await getTestDb();
++    expect((await postsRepo(db).findById(post.id))?.deletedAt).toBeNull();
++  });
++
++  it("chaves iguais mas do mesmo tipo e operações naturalmente idempotentes não conflituam", async () => {
++    const author = await account();
++    const post = await makePost(author.user.id);
++    const other = await account();
++    const k = key();
++    const like = { ...op.postOp("post.like", post.id), idempotency_key: k };
++    const again = { ...op.postOp("post.like", post.id), idempotency_key: k };
++    const res = await sync(app, other.token, [like, again]);
++    expect(
++      (res.body.results as { status: string }[]).map((r) => r.status),
++    ).toEqual(["applied", "duplicate"]);
++  });
++
+   it("conta em apagamento: tudo rejected com forbidden", async () => {
+     const { token, user } = await account();
+     const db = await getTestDb();
+diff --git a/apps/api/test/workers/outbox-worker.test.ts b/apps/api/test/workers/outbox-worker.test.ts
+index 3894b6e..b09b3a7 100644
+--- a/apps/api/test/workers/outbox-worker.test.ts
++++ b/apps/api/test/workers/outbox-worker.test.ts
+@@ -5,6 +5,7 @@ import { outboxRepo } from "../../src/repositories/outbox.js";
+ import {
+   backoffMs,
+   processOutboxBatch,
++  startOutboxWorker,
+ } from "../../src/workers/outbox-worker.js";
+ import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
+ 
+@@ -36,6 +37,20 @@ beforeEach(async () => {
+   await truncateAll();
+ });
+ 
++const silent = { info: () => {}, warn: () => {} };
++
++async function waitFor(
++  check: () => Promise<boolean>,
++  timeoutMs = 3000,
++): Promise<void> {
++  const start = Date.now();
++  while (!(await check())) {
++    if (Date.now() - start > timeoutMs)
++      throw new Error("waitFor: tempo esgotado");
++    await new Promise((r) => setTimeout(r, 20));
++  }
++}
++
+ describe("outbox worker", () => {
+   it("evento sem handler fica concluído (a tabela não cresce)", async () => {
+     const db = await getTestDb();
+@@ -102,3 +117,69 @@ describe("outbox worker", () => {
+     expect(backoffMs(50)).toBe(5 * 60_000);
+   });
+ });
++
++describe("outbox worker: concorrência e paragem", () => {
++  it("duas rondas em simultâneo nunca tratam o mesmo evento duas vezes", async () => {
++    const db = await getTestDb();
++    const ids: string[] = [];
++    for (let i = 0; i < 20; i++) ids.push((await enqueue("post.created")).id);
++
++    const handled: string[] = [];
++    const handlers = {
++      "post.created": async (ev: { id: string }) => {
++        handled.push(ev.id);
++        await new Promise((r) => setTimeout(r, 5));
++      },
++    };
++    const [a, b] = await Promise.all([
++      processOutboxBatch(db, { batchSize: 20, handlers }),
++      processOutboxBatch(db, { batchSize: 20, handlers }),
++    ]);
++
++    expect(a.claimed + b.claimed).toBe(20);
++    expect(handled).toHaveLength(20);
++    expect(new Set(handled).size).toBe(20);
++    expect([...handled].sort()).toEqual([...ids].sort());
++  });
++
++  it("startOutboxWorker processa eventos e stop() espera pela ronda em curso", async () => {
++    const db = await getTestDb();
++    const e = await enqueue("post.created");
++    let finished = false;
++    let started = false;
++
++    const stop = startOutboxWorker({
++      db,
++      log: silent,
++      intervalMs: 10,
++      batchSize: 10,
++      handlers: {
++        "post.created": async () => {
++          started = true;
++          await new Promise((r) => setTimeout(r, 150));
++          finished = true;
++        },
++      },
++    });
++
++    await waitFor(async () => started);
++    await stop(); // a meio do handler: tem de esperar
++    expect(finished).toBe(true);
++    expect((await statusOf(e.id)).status).toBe("done");
++  });
++
++  it("depois de stop() o worker já não consome eventos", async () => {
++    const db = await getTestDb();
++    const stop = startOutboxWorker({
++      db,
++      log: silent,
++      intervalMs: 10,
++      batchSize: 10,
++    });
++    await stop();
++
++    const e = await enqueue("post.liked");
++    await new Promise((r) => setTimeout(r, 150));
++    expect((await statusOf(e.id)).status).toBe("pending");
++  });
++});
+diff --git a/apps/api/test/workers/server-worker.test.ts b/apps/api/test/workers/server-worker.test.ts
+new file mode 100644
+index 0000000..65ec73d
+--- /dev/null
++++ b/apps/api/test/workers/server-worker.test.ts
+@@ -0,0 +1,76 @@
++import { eq } from "drizzle-orm";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { outbox } from "../../src/db/schema.js";
++import { loadEnv } from "../../src/env.js";
++import { outboxRepo } from "../../src/repositories/outbox.js";
++import { buildServer } from "../../src/server.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++
++const AGG = "0190a0a0-0000-7000-8000-000000000002";
++
++const baseEnv = {
++  NODE_ENV: "test",
++  LOG_LEVEL: "fatal",
++  APP_VERSION: "test",
++  OUTBOX_WORKER_INTERVAL_MS: 200,
++} as const;
++
++async function enqueue() {
++  const db = await getTestDb();
++  return outboxRepo(db).enqueue({
++    aggregateType: "post",
++    aggregateId: AGG,
++    eventType: "post.liked",
++    payload: { postId: AGG },
++  });
++}
++
++async function statusOf(id: string) {
++  const db = await getTestDb();
++  const [row] = await db.select().from(outbox).where(eq(outbox.id, id));
++  return row!.status;
++}
++
++beforeAll(async () => {
++  await getTestDb();
++});
++afterAll(async () => {
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++});
++
++describe("buildServer: worker do outbox", () => {
++  it("em testes não arranca por omissão", async () => {
++    const app = await buildServer({ env: loadEnv(baseEnv) });
++    await app.ready();
++    const e = await enqueue();
++    await new Promise((r) => setTimeout(r, 700));
++    expect(await statusOf(e.id)).toBe("pending");
++    await app.close();
++  });
++
++  it("com disableWorker: false arranca em onReady e pára em close", async () => {
++    const app = await buildServer({
++      env: loadEnv(baseEnv),
++      disableWorker: false,
++    });
++    const e = await enqueue();
++    // Antes de `ready()` (onReady) nada corre.
++    await new Promise((r) => setTimeout(r, 450));
++    expect(await statusOf(e.id)).toBe("pending");
++
++    await app.ready();
++    const start = Date.now();
++    while ((await statusOf(e.id)) !== "done") {
++      if (Date.now() - start > 4000) throw new Error("worker não arrancou");
++      await new Promise((r) => setTimeout(r, 50));
++    }
++    await app.close();
++
++    const e2 = await enqueue();
++    await new Promise((r) => setTimeout(r, 450));
++    expect(await statusOf(e2.id)).toBe("pending");
++  });
++});
