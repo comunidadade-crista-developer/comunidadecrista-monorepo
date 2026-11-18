@@ -222,6 +222,56 @@ describe("POST /sync", () => {
     });
   });
 
+  it("a mesma chave em operações de tipos diferentes: só a primeira passa", async () => {
+    const author = await account();
+    const post = await makePost(author.user.id);
+    const other = await account();
+    const k = key();
+    const like = { ...op.postOp("post.like", post.id), idempotency_key: k };
+    const create = op.create({}, k);
+    const res = await sync(app, other.token, [like, create]);
+    const out = res.body.results as {
+      status: string;
+      error?: { code: string };
+    }[];
+    expect(out.map((r) => [r.status, r.error?.code])).toEqual([
+      ["applied", undefined],
+      ["rejected", "idempotency_key_conflict"],
+    ]);
+    // A criação recusada não deixou nada.
+    const db = await getTestDb();
+    expect(await postsRepo(db).listByAuthor(other.user.id, 10)).toHaveLength(0);
+  });
+
+  it("chave de uma criação já gravada, reutilizada por outro tipo (outro lote) → rejected", async () => {
+    const { token, user } = await account();
+    const post = await makePost(user.id);
+    const k = key();
+    await sync(app, token, [op.create({}, k)]);
+    const del = { ...op.postOp("post.delete", post.id), idempotency_key: k };
+    const res = await sync(app, token, [del]);
+    expect(res.body.results[0]).toMatchObject({
+      status: "rejected",
+      error: { code: "idempotency_key_conflict" },
+    });
+    // O post alheio ao conflito continua lá.
+    const db = await getTestDb();
+    expect((await postsRepo(db).findById(post.id))?.deletedAt).toBeNull();
+  });
+
+  it("chaves iguais mas do mesmo tipo e operações naturalmente idempotentes não conflituam", async () => {
+    const author = await account();
+    const post = await makePost(author.user.id);
+    const other = await account();
+    const k = key();
+    const like = { ...op.postOp("post.like", post.id), idempotency_key: k };
+    const again = { ...op.postOp("post.like", post.id), idempotency_key: k };
+    const res = await sync(app, other.token, [like, again]);
+    expect(
+      (res.body.results as { status: string }[]).map((r) => r.status),
+    ).toEqual(["applied", "duplicate"]);
+  });
+
   it("conta em apagamento: tudo rejected com forbidden", async () => {
     const { token, user } = await account();
     const db = await getTestDb();
