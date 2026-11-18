@@ -5,6 +5,7 @@ import { outboxRepo } from "../../src/repositories/outbox.js";
 import {
   backoffMs,
   processOutboxBatch,
+  startOutboxWorker,
 } from "../../src/workers/outbox-worker.js";
 import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
 
@@ -35,6 +36,20 @@ afterAll(async () => {
 beforeEach(async () => {
   await truncateAll();
 });
+
+const silent = { info: () => {}, warn: () => {} };
+
+async function waitFor(
+  check: () => Promise<boolean>,
+  timeoutMs = 3000,
+): Promise<void> {
+  const start = Date.now();
+  while (!(await check())) {
+    if (Date.now() - start > timeoutMs)
+      throw new Error("waitFor: tempo esgotado");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
 
 describe("outbox worker", () => {
   it("evento sem handler fica concluído (a tabela não cresce)", async () => {
@@ -100,5 +115,71 @@ describe("outbox worker", () => {
     expect(backoffMs(2)).toBe(2000);
     expect(backoffMs(4)).toBe(8000);
     expect(backoffMs(50)).toBe(5 * 60_000);
+  });
+});
+
+describe("outbox worker: concorrência e paragem", () => {
+  it("duas rondas em simultâneo nunca tratam o mesmo evento duas vezes", async () => {
+    const db = await getTestDb();
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await enqueue("post.created")).id);
+
+    const handled: string[] = [];
+    const handlers = {
+      "post.created": async (ev: { id: string }) => {
+        handled.push(ev.id);
+        await new Promise((r) => setTimeout(r, 5));
+      },
+    };
+    const [a, b] = await Promise.all([
+      processOutboxBatch(db, { batchSize: 20, handlers }),
+      processOutboxBatch(db, { batchSize: 20, handlers }),
+    ]);
+
+    expect(a.claimed + b.claimed).toBe(20);
+    expect(handled).toHaveLength(20);
+    expect(new Set(handled).size).toBe(20);
+    expect([...handled].sort()).toEqual([...ids].sort());
+  });
+
+  it("startOutboxWorker processa eventos e stop() espera pela ronda em curso", async () => {
+    const db = await getTestDb();
+    const e = await enqueue("post.created");
+    let finished = false;
+    let started = false;
+
+    const stop = startOutboxWorker({
+      db,
+      log: silent,
+      intervalMs: 10,
+      batchSize: 10,
+      handlers: {
+        "post.created": async () => {
+          started = true;
+          await new Promise((r) => setTimeout(r, 150));
+          finished = true;
+        },
+      },
+    });
+
+    await waitFor(async () => started);
+    await stop(); // a meio do handler: tem de esperar
+    expect(finished).toBe(true);
+    expect((await statusOf(e.id)).status).toBe("done");
+  });
+
+  it("depois de stop() o worker já não consome eventos", async () => {
+    const db = await getTestDb();
+    const stop = startOutboxWorker({
+      db,
+      log: silent,
+      intervalMs: 10,
+      batchSize: 10,
+    });
+    await stop();
+
+    const e = await enqueue("post.liked");
+    await new Promise((r) => setTimeout(r, 150));
+    expect((await statusOf(e.id)).status).toBe("pending");
   });
 });
