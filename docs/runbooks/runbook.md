@@ -15,7 +15,7 @@
 4. Start command: `node apps/api/dist/index.js`
 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
    Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
-   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*` (valores por omissão em `.env.example`).
+   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
    Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
 6. Plano: Free.
 
@@ -65,6 +65,21 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
 - Rodar as chaves de forma planeada (por exemplo, uma vez por ano) para manter o procedimento ensaiado.
 - Nunca colocar a chave privada no repositório, em logs, tickets ou chats.
 
+## Administradores (ADR-015)
+
+O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (shell do Render, ou localmente com `DATABASE_URL` de produção), nunca por HTTP:
+
+```
+pnpm --filter @comunidade/api admin:promote <username>   # a conta já tem de existir
+pnpm --filter @comunidade/api admin:demote  <username>
+```
+
+- A promoção e a despromoção **revogam as sessões** do utilizador: tem de iniciar sessão de novo.
+- Códigos de saída: `0` sucesso (ou nada a fazer), `1` erro de uso/ambiente, `2` utilizador inexistente ou em apagamento, `3` recusado por ser o último admin.
+- Cada acção fica no registo de auditoria (`admin.promoted` / `admin.demoted`, sem moderador = sistema), visível em `GET /admin/moderation-log`.
+- **Perdi o acesso admin** (único admin despromovido, conta perdida): promover outro utilizador por este mesmo comando.
+- Um admin que peça o apagamento da conta, ou seja despromovido, só passa se existir **outro admin activo**.
+
 ## Incidentes
 
 - **API fora**: verificar dashboard Render; ver logs; confirmar Neon e Upstash operacionais.
@@ -72,6 +87,7 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
 - **Feed desactualizado**: a 1.ª página vem de uma cache de `FEED_CACHE_TTL_S` segundos; publicar, apagar e escalar invalidam logo, os likes não. Se uma publicação não aparece, confirmar o Redis (a invalidação é um `INCR` de `cc:v1:feed:version`; se falhar, só se resolve ao fim do TTL). Para forçar: `INCR cc:v1:feed:version` no Redis.
 - **Tabela `outbox` a crescer**: o worker corre no processo da API. Sem consumidores, os eventos passam a `done` e são purgados pela manutenção. Eventos em `failed` indicam um _handler_ a falhar; ver logs `outbox: handler failed` (só tipo e nome do erro).
 - **`/sync` devolve muitos `deferred`**: limite por operação (`rate_limited`, com `retryAfter`) ou prazo do lote; o cliente repete sozinho. Confirmar `SYNC_BATCH_TIMEOUT_MS` e a latência da base de dados.
+- **Fila de moderação parada**: `GET /admin/posts` mostra os `pending_review` do mais antigo. Um post que não se consegue aprovar com `409 invalid_state` já foi decidido ou está `hidden` (conta em apagamento). `429` no painel: limites `RATE_LIMIT_ADMIN_*`.
 - **Rate limit a disparar em produção**: confirmar o Redis (Upstash) acessível; sem Redis o limite aplica-se em memória, por instância.
 
 ## IP do cliente, proxy e Cloudflare
