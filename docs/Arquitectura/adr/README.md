@@ -18,3 +18,4 @@ Um ficheiro por decisão. Estado: **Aceite** salvo indicação em contrário. Um
 | [ADR-012](ADR-012.md) | Apagamento de conta: período de graça de 30 dias            |
 | [ADR-013](ADR-013.md) | Filtro anti-spam no conteúdo                                |
 | [ADR-014](ADR-014.md) | Severidade de denúncias                                     |
+| [ADR-015](ADR-015.md) | Admin: criação e promoção só por CLI, mesmo login           |

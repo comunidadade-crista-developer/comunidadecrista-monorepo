@@ -36,6 +36,20 @@
       "when": 1793700000000,
       "tag": "0004_report_categories_soft_delete",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793800000000,
+      "tag": "0005_admin_moderation_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793900000000,
+      "tag": "0006_moderation_target_user_indexes",
+      "breakpoints": true
     }
   ]
 }
