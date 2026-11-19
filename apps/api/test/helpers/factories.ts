@@ -1,5 +1,13 @@
 import { uuidv7 } from "uuidv7";
-import type { NewPost, NewUser, Post, User } from "../../src/db/schema.js";
+import { eq, sql } from "drizzle-orm";
+import { posts, reports } from "../../src/db/schema.js";
+import type {
+  NewPost,
+  NewUser,
+  Post,
+  Report,
+  User,
+} from "../../src/db/schema.js";
 import { postsRepo, postLikesRepo } from "../../src/repositories/posts.js";
 import { usersRepo } from "../../src/repositories/users.js";
 import { createPasswordService } from "../../src/auth/password.js";
@@ -44,6 +52,40 @@ export async function makePost(
     status: "published",
     ...overrides,
   });
+}
+
+/**
+ * Denúncia inserida directamente (sem as regras de `reportsRepo.file`: idade da conta,
+ * limiares…). Uma denúncia aberta conta em `posts.reports_count`, como em produção.
+ */
+export async function makeReport(
+  postId: string,
+  reporterId: string,
+  overrides: Partial<
+    Pick<Report, "category" | "reason" | "status" | "createdAt">
+  > = {},
+): Promise<Report> {
+  const db = await getTestDb();
+  const category = overrides.category ?? "spam";
+  const status = overrides.status ?? "open";
+  const [row] = await db
+    .insert(reports)
+    .values({
+      postId,
+      reporterId,
+      category,
+      status,
+      reason: overrides.reason ?? (category === "other" ? "motivo" : null),
+      ...(overrides.createdAt ? { createdAt: overrides.createdAt } : {}),
+    })
+    .returning();
+  if (status === "open") {
+    await db
+      .update(posts)
+      .set({ reportsCount: sql`${posts.reportsCount} + 1` })
+      .where(eq(posts.id, postId));
+  }
+  return row!;
 }
 
 export async function makeLike(postId: string, userId: string): Promise<void> {

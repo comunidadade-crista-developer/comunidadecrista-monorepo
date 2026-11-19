@@ -154,6 +154,20 @@ const BaseEnvSchema = z.object({
   RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
 
+  // Painel admin, por administrador: leituras (listas e detalhe) e decisões (aprovar/rejeitar).
+  RATE_LIMIT_ADMIN_READ_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_ADMIN_READ_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
+  RATE_LIMIT_ADMIN_WRITE_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_ADMIN_WRITE_WINDOW_S: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
+
   // Tempo máximo de um lote /sync: as operações que não chegam a correr voltam `deferred`.
   // Abaixo do timeout típico de proxies/CDN (30 s+) para o cliente receber sempre resposta.
   SYNC_BATCH_TIMEOUT_MS: z.coerce

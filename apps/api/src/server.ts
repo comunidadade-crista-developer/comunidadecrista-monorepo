@@ -31,6 +31,7 @@ import {
 import { cardsRepo } from "./repositories/cards.js";
 import { accountRoutes } from "./routes/account.js";
 import { authRoutes } from "./routes/auth.js";
+import { adminRoutes } from "./routes/admin.js";
 import { cardsRoutes } from "./routes/cards.js";
 import { healthRoutes } from "./routes/health.js";
 import { postsRoutes } from "./routes/posts.js";
@@ -216,7 +217,12 @@ export async function buildServer({
       feedCache,
       cardsCache,
     });
-
+    await app.register(adminRoutes, {
+      db: dbBundle.db,
+      jwt,
+      limiters,
+      feedCache,
+    });
     if (!workersDisabled) {
       const db = dbBundle.db;
       let stopMaintenance: (() => Promise<void> | void) | null = null;

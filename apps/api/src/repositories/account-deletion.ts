@@ -1,5 +1,6 @@
 import { and, count, eq, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
+import { lockAdminRoster } from "./admin-roster.js";
 import {
   outbox,
   pendingPasswordResets,
@@ -70,11 +71,7 @@ export function accountDeletionRepo(db: Database) {
         }
 
         if (user.role === "admin") {
-          // Serializa pedidos de administradores: sem isto, dois admins a apagar-se ao mesmo
-          // tempo veriam cada um o outro como «activo» e a plataforma ficava sem admin.
-          await tx.execute(
-            sql`SELECT pg_advisory_xact_lock(hashtext('account-deletion:admin'))`,
-          );
+          await lockAdminRoster(tx);
           const [others] = await tx
             .select({ c: count() })
             .from(users)

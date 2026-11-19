@@ -43,6 +43,9 @@ export interface RateLimiters {
   checkReports(userId: string): Promise<RateLimitResult>;
   /** Pedidos /sync (lotes) por utilizador. */
   checkSyncBatch(userId: string): Promise<RateLimitResult>;
+  /** Painel admin: leituras e decisões, 1 balde por administrador e por tipo. */
+  checkAdminRead(userId: string): Promise<RateLimitResult>;
+  checkAdminWrite(userId: string): Promise<RateLimitResult>;
 }
 
 /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
@@ -173,6 +176,16 @@ export function createRateLimiters(
     env.RATE_LIMIT_SYNC_MAX,
     env.RATE_LIMIT_SYNC_WINDOW_S,
   );
+  const adminRead = make(
+    "rl:admin:read",
+    env.RATE_LIMIT_ADMIN_READ_MAX,
+    env.RATE_LIMIT_ADMIN_READ_WINDOW_S,
+  );
+  const adminWrite = make(
+    "rl:admin:write",
+    env.RATE_LIMIT_ADMIN_WRITE_MAX,
+    env.RATE_LIMIT_ADMIN_WRITE_WINDOW_S,
+  );
 
   const consume = async (
     limiter: RateLimiterAbstract,
@@ -263,5 +276,7 @@ export function createRateLimiters(
     checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
     checkReports: (userId) => consumeAll([[reportsLimiter, anon(userId)]]),
     checkSyncBatch: (userId) => consumeAll([[syncBatch, anon(userId)]]),
+    checkAdminRead: (userId) => consumeAll([[adminRead, anon(userId)]]),
+    checkAdminWrite: (userId) => consumeAll([[adminWrite, anon(userId)]]),
   };
 }
