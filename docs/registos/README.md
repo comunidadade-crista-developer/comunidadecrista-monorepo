@@ -19,9 +19,11 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 
 ## Índice
 
-| Fase | Assunto                                                | Estado |
-| ---- | ------------------------------------------------------ | ------ |
-| E3   | [Gospel cards e cache](E3-gospel-cards-cache.md)       | Feito  |
-| E4-a | [Base de posts, denúncias e filtro](E4a-base-posts-denuncias.md) | Feito  |
-| E4-c | [Rotas, cache do feed e /sync](E4c-rotas-cache-sync.md)          | Feito  |
-| E4-d | [Documentação: ADRs, arquitectura, API](E4d-documentacao.md)     | Feito  |
+| Fase  | Assunto                                                                 | Estado |
+| ----- | ----------------------------------------------------------------------- | ------ |
+| E3    | [Gospel cards e cache](E3-gospel-cards-cache.md)                        | Feito  |
+| E4-a  | [Base de posts, denúncias e filtro](E4a-base-posts-denuncias.md)        | Feito  |
+| E4-b  | [Repositórios e serviços de posts](E4b-servicos-posts.md)               | Feito  |
+| E4-c  | [Rotas, cache do feed e /sync](E4c-rotas-cache-sync.md)                 | Feito  |
+| E4-d  | [Documentação: ADRs, arquitectura, API](E4d-documentacao.md)            | Feito  |
+| E5+E6 | [`/sync`, worker e administração (ADR-015)](E5-E6-sync-worker-admin.md) | Feito  |

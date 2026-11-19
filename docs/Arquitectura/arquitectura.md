@@ -219,7 +219,8 @@ erDiagram
     uuid id PK
     uuid post_id FK
     uuid moderator_id FK
-    enum action "approved|rejected"
+    uuid target_user_id FK "só em admin.promoted/demoted"
+    enum action "approved|rejected|admin.promoted|admin.demoted"
     text reason
     timestamptz created_at
   }
@@ -315,15 +316,20 @@ lista embebida de palavras-passe comuns recusada, não pode conter o username, s
 | POST   | `/sync`           | Lote (até 20) de operações da outbox local. Devolve um resultado por operação (`applied`/`duplicate`/`rejected`/`deferred`).          |
 | GET    | `/sync/bootstrap` | Estado inicial do cliente: cards, 1.ª página do feed, as minhas partilhas, os meus likes e as minhas denúncias (com avisos de corte). |
 
-### Admin (planeado)
+### Admin (ADR-015)
 
-| Método | Rota                                 | Descrição           |
-| ------ | ------------------------------------ | ------------------- |
-| GET    | `/admin/posts?status=pending_review` | Fila de revisão.    |
-| POST   | `/admin/posts/:id/approve`           | Aprova.             |
-| POST   | `/admin/posts/:id/reject`            | Rejeita com motivo. |
-| GET    | `/admin/reports`                     | Denúncias.          |
-| GET    | `/admin/moderation-log`              | Auditoria.          |
+Todas exigem sessão e papel `admin` revalidado na base de dados (`preValidation`: 401/403 antes de validar). Limites por administrador: leituras e decisões (`RATE_LIMIT_ADMIN_*`).
+
+| Método | Rota                       | Descrição                                                                                       |
+| ------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
+| GET    | `/admin/posts`             | Posts por estado (`status`, omissão `pending_review`, do mais antigo); denúncias por categoria. |
+| GET    | `/admin/posts/:id`         | Detalhe: conteúdo, denúncias (com `username`) e decisões anteriores.                            |
+| POST   | `/admin/posts/:id/approve` | Publica. Só a partir de `pending_review` (senão `409 invalid_state`). Invalida o feed.          |
+| POST   | `/admin/posts/:id/reject`  | Rejeita com motivo (10–500). Só a partir de `pending_review`.                                   |
+| GET    | `/admin/reports`           | Denúncias por estado (omissão `open`).                                                          |
+| GET    | `/admin/moderation-log`    | Auditoria (filtros `action`, `postId`).                                                         |
+
+Promover e despromover admins **não** é uma rota: só os scripts `admin:promote` / `admin:demote` (ADR-015).
 
 ### Operação
 
@@ -445,14 +451,15 @@ sequenceDiagram
 - **CORS**: apenas o domínio do frontend.
 - **Passwords e respostas**: argon2id (m=19456 KiB, t=2, p=1).
 - **JWT**: EdDSA (Ed25519) com `kid`; chaves em env vars; rotação com chave anterior só pública (ADR-006), procedimento no runbook.
-- **Rate limiting**: login (IP+username), registo (IP), leitura do feed (IP e utilizador), criação e apagamento de posts (user), likes (user), denúncias (user) e lotes `/sync` (user). Cada operação do `/sync` paga o balde do seu tipo.
+- **Rate limiting**: login (IP+username), registo (IP), leitura do feed (IP e utilizador), criação e apagamento de posts (user), likes (user), denúncias (user) e lotes `/sync` (user) e painel admin (leituras e decisões, por administrador). Cada operação do `/sync` paga o balde do seu tipo.
 - **Validação**: Zod em todos os endpoints.
 - **SQL**: drizzle-orm com prepared statements; sem concatenação.
 - **Logs**: sem passwords, sem tokens, sem PII; username é o único identificador presente.
 - **Privacidade**: sem IP persistido, sem analytics de terceiros, sem cookies de rastreio. Política de privacidade e termos de utilização publicados.
 - **Privacidade das partilhas**: nenhuma resposta expõe o `authorId`; o autor aparece como `{ username }` ou `null` («[removido]») e o cliente sabe que o post é seu por `isMine`. Estados não públicos dão 404 (não 403) a quem não é autor nem admin.
 - **Apagamento de conta**: estado pendente 30 dias (login reactiva); purga pelo job de manutenção; partilhas anonimizadas ou apagadas conforme a escolha do utilizador (ADR-012).
-- **Headers de admin**: middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido.
+- **Admin** (ADR-015): middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido (e recusa contas com apagamento pendente). O primeiro admin e as promoções só existem por CLI no servidor, nunca por HTTP; promover e despromover revoga as sessões. Despromover o último admin é recusado, com bloqueio partilhado com o apagamento de conta (nunca ficam zero admins).
+- **Decisões de moderação**: uma transacção por decisão (linha do post bloqueada, estado, denúncias, auditoria, outbox); só se decide sobre `pending_review`, por isso um post suspenso por apagamento de conta nunca é «ressuscitado». O registo de auditoria não guarda IPs e sobrevive à purga de contas e posts (`SET NULL`).
 
 ## 12. Observabilidade
 

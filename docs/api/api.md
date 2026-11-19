@@ -6,7 +6,7 @@ Formato: JSON
 Autenticação: `Authorization: Bearer <accessToken>` (JWT EdDSA, 15 min). Os tokens de renovação são opacos.
 
 Os schemas de pedido e resposta vivem em `packages/shared` (`auth.ts`, `cards.ts`, `posts.ts`,
-`sync.ts`) e são a fonte de verdade; este documento descreve o comportamento.
+`sync.ts`, `admin.ts`) e são a fonte de verdade; este documento descreve o comportamento.
 
 ## Convenções
 
@@ -41,6 +41,8 @@ campo `isMine` diz se a partilha é do utilizador que pede.
 | Likes (curtir e descurtir)   | 120 por hora                                            |
 | Denúncias (criar e retirar)  | 10 por hora                                             |
 | Pedidos `/sync`              | 60 por hora (e cada operação paga o limite do seu tipo) |
+| Painel admin: leituras       | 120 por 60 s, por administrador                         |
+| Painel admin: decisões       | 30 por 60 s, por administrador                          |
 
 ## Health
 
@@ -242,12 +244,12 @@ filtro anti-spam) e pagando o **mesmo limite por operação** que o REST.
 
 **200** `{ "results": [ { "op_id", "status", "result"?, "error"? } ], "serverTime": "…" }` — um resultado por operação, pela mesma ordem:
 
-| `status`    | Significado                                                                                                                                                                                                                                                                                |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `applied`   | Aplicada agora.                                                                                                                                                                                                                                                                            |
-| `duplicate` | Já estava aplicada (chave repetida, like já dado, partilha já apagada…). O `result` é o estado actual. O cliente dá por concluída.                                                                                                                                                         |
-| `rejected`  | Recusa definitiva: `error.code` ∈ `not_found`, `forbidden` (inclui conta em apagamento), `own_post`, `idempotency_key_conflict`, `gospel_card_not_found`, `contains_link`, `contains_contact`, `internal`. O cliente remove-a da fila e mostra o motivo.                                   |
-| `deferred`  | **Não** foi tentada ou falhou por razões transitórias: limite (`error.code = "rate_limited"`, `error.retryAfter` em segundos), prazo do lote esgotado (`SYNC_BATCH_TIMEOUT_MS`, 8 s) ou falha inesperada (`error.code = "internal"`). O cliente repete mais tarde; é seguro (idempotente). |
+| `status`    | Significado                                                                                                                                                                                                                                                                                                                                                          |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `applied`   | Aplicada agora.                                                                                                                                                                                                                                                                                                                                                      |
+| `duplicate` | Já estava aplicada (chave repetida, like já dado, partilha já apagada…). O `result` é o estado actual. O cliente dá por concluída.                                                                                                                                                                                                                                   |
+| `rejected`  | Recusa definitiva: `error.code` ∈ `not_found`, `forbidden` (inclui conta em apagamento), `own_post`, `idempotency_key_conflict` (chave reutilizada com outro corpo **ou por outro tipo de operação**, no mesmo lote ou em lotes anteriores), `gospel_card_not_found`, `contains_link`, `contains_contact`, `internal`. O cliente remove-a da fila e mostra o motivo. |
+| `deferred`  | **Não** foi tentada ou falhou por razões transitórias: limite (`error.code = "rate_limited"`, `error.retryAfter` em segundos), prazo do lote esgotado (`SYNC_BATCH_TIMEOUT_MS`, 8 s) ou falha inesperada (`error.code = "internal"`). O cliente repete mais tarde; é seguro (idempotente).                                                                           |
 
 Erros do pedido: **400** · **401** · **429** (`Retry-After`, limite de pedidos `/sync`).
 
@@ -259,3 +261,66 @@ Requer sessão. Devolve o estado inicial do cliente: `serverTime`, `user`, `card
 Quando uma flag `…Truncated` é `true`, havia mais itens do que os devolvidos.
 
 **200** · **401** · **403** (`account_inactive`) · **429**
+
+## Admin
+
+Contratos em `packages/shared/src/admin.ts`. Ver ADR-015. Todas as rotas exigem sessão **e** papel `admin`
+(revalidado na base de dados em cada pedido; contas com apagamento pendente → `403`). Sem sessão: `401`; sem ser
+admin: `403`, ambos **antes** de validar a query ou o corpo. Limites por administrador: ver «Convenções».
+
+Nenhuma resposta traz identificadores de utilizadores: autores, denunciantes e moderadores aparecem por
+`{ "username": "…" }` (`null` = removido ou, no registo, acção do sistema).
+
+**Listas e cursores**: `limit` 1–50 (omissão 20) e `cursor` opaco (o `nextCursor` da resposta anterior; `null` na última
+página). Um cursor adulterado ou de outra lista → `400 validation_error`.
+
+### GET /admin/posts
+
+`?status=` (`pending_review` por omissão · `published` · `hidden` · `rejected`). `pending_review` é a fila de trabalho,
+do **mais antigo** para o mais recente; os outros estados, do mais recente. Posts apagados não aparecem.
+
+**200** `{ "posts": [ { id, category, title, excerpt (200 car.), status, author, reviewFlags, reportsCount, reportsByCategory { spam, off_topic, offensive, doctrine, other }, createdAt } ], "nextCursor" }`
+(contagens de denúncias **abertas**).
+
+### GET /admin/posts/:id
+
+**200** `{ "post": { …, content, gospelCardSlug, likesCount, publishedAt }, "reports": [ { id, postId, postTitle, reporter, category, severity, reason, status, createdAt, resolvedAt } ], "moderation": [ { id, action, moderator, target, reason, createdAt, … } ] }`
+· **400** (id inválido) · **404** (inexistente ou apagado).
+
+### POST /admin/posts/:id/approve
+
+Corpo `{ "note"?: "…" }` (1–500 caracteres; campos a mais → `400`). Publica o post, fecha as denúncias abertas como
+`resolved_kept`, regista `approved` na auditoria e invalida a cache do feed.
+
+**200** `{ "post": { id, status: "published", publishedAt } }` · **404** · **409 `invalid_state`** (só se decide sobre
+`pending_review`; um post `hidden`, por exemplo suspenso por apagamento de conta, não se aprova).
+
+### POST /admin/posts/:id/reject
+
+Corpo `{ "reason": "…" }` (**obrigatório**, 10–500 caracteres). Passa o post a `rejected`, fecha as denúncias como
+`resolved_removed` e regista `rejected` com o motivo. O motivo não é mostrado ao autor nesta fase.
+
+**200** `{ "post": { id, status: "rejected", publishedAt } }` · **400** · **404** · **409 `invalid_state`**
+
+Duas decisões em simultâneo sobre o mesmo post: a segunda recebe `409`.
+
+### GET /admin/reports
+
+`?status=` (`open` por omissão · `resolved_kept` · `resolved_removed` · `withdrawn`), das mais recentes.
+**200** `{ "reports": [ { id, postId, postTitle | null, reporter, category, severity, reason, status, createdAt, resolvedAt } ], "nextCursor" }`
+
+### GET /admin/moderation-log
+
+`?action=` (`approved` · `rejected` · `admin.promoted` · `admin.demoted`) e `?postId=`, do mais recente.
+**200** `{ "entries": [ { id, action, postId | null, postTitle | null, moderator | null, target | null, reason | null, createdAt } ], "nextCursor" }`
+
+### Promover e despromover admins
+
+Não há rotas. Só por CLI, no servidor (ADR-015):
+
+```
+pnpm --filter @comunidade/api admin:promote <username>
+pnpm --filter @comunidade/api admin:demote  <username>
+```
+
+Saída: `0` sucesso (incluindo «nada a fazer»), `1` erro de uso ou de ambiente, `2` utilizador inexistente ou em apagamento, `3` recusado (último admin).

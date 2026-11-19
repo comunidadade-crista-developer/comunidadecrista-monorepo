@@ -1,0 +1,293 @@
+diff --git a/docs/Arquitectura/arquitectura.md b/docs/Arquitectura/arquitectura.md
+index 0d9cad7..c97e6d1 100644
+--- a/docs/Arquitectura/arquitectura.md
++++ b/docs/Arquitectura/arquitectura.md
+@@ -219,7 +219,8 @@ erDiagram
+     uuid id PK
+     uuid post_id FK
+     uuid moderator_id FK
+-    enum action "approved|rejected"
++    uuid target_user_id FK "só em admin.promoted/demoted"
++    enum action "approved|rejected|admin.promoted|admin.demoted"
+     text reason
+     timestamptz created_at
+   }
+@@ -315,15 +316,20 @@ lista embebida de palavras-passe comuns recusada, não pode conter o username, s
+ | POST   | `/sync`           | Lote (até 20) de operações da outbox local. Devolve um resultado por operação (`applied`/`duplicate`/`rejected`/`deferred`).          |
+ | GET    | `/sync/bootstrap` | Estado inicial do cliente: cards, 1.ª página do feed, as minhas partilhas, os meus likes e as minhas denúncias (com avisos de corte). |
+ 
+-### Admin (planeado)
++### Admin (ADR-015)
+ 
+-| Método | Rota                                 | Descrição           |
+-| ------ | ------------------------------------ | ------------------- |
+-| GET    | `/admin/posts?status=pending_review` | Fila de revisão.    |
+-| POST   | `/admin/posts/:id/approve`           | Aprova.             |
+-| POST   | `/admin/posts/:id/reject`            | Rejeita com motivo. |
+-| GET    | `/admin/reports`                     | Denúncias.          |
+-| GET    | `/admin/moderation-log`              | Auditoria.          |
++Todas exigem sessão e papel `admin` revalidado na base de dados (`preValidation`: 401/403 antes de validar). Limites por administrador: leituras e decisões (`RATE_LIMIT_ADMIN_*`).
++
++| Método | Rota                       | Descrição                                                                                       |
++| ------ | -------------------------- | ----------------------------------------------------------------------------------------------- |
++| GET    | `/admin/posts`             | Posts por estado (`status`, omissão `pending_review`, do mais antigo); denúncias por categoria. |
++| GET    | `/admin/posts/:id`         | Detalhe: conteúdo, denúncias (com `username`) e decisões anteriores.                            |
++| POST   | `/admin/posts/:id/approve` | Publica. Só a partir de `pending_review` (senão `409 invalid_state`). Invalida o feed.          |
++| POST   | `/admin/posts/:id/reject`  | Rejeita com motivo (10–500). Só a partir de `pending_review`.                                   |
++| GET    | `/admin/reports`           | Denúncias por estado (omissão `open`).                                                          |
++| GET    | `/admin/moderation-log`    | Auditoria (filtros `action`, `postId`).                                                         |
++
++Promover e despromover admins **não** é uma rota: só os scripts `admin:promote` / `admin:demote` (ADR-015).
+ 
+ ### Operação
+ 
+@@ -443,14 +449,15 @@ sequenceDiagram
+ - **CORS**: apenas o domínio do frontend.
+ - **Passwords e respostas**: argon2id (m=19456 KiB, t=2, p=1).
+ - **JWT**: EdDSA (Ed25519) com `kid`; chaves em env vars; rotação com chave anterior só pública (ADR-006), procedimento no runbook.
+-- **Rate limiting**: login (IP+username), registo (IP), leitura do feed (IP e utilizador), criação e apagamento de posts (user), likes (user), denúncias (user) e lotes `/sync` (user). Cada operação do `/sync` paga o balde do seu tipo.
++- **Rate limiting**: login (IP+username), registo (IP), leitura do feed (IP e utilizador), criação e apagamento de posts (user), likes (user), denúncias (user) e lotes `/sync` (user) e painel admin (leituras e decisões, por administrador). Cada operação do `/sync` paga o balde do seu tipo.
+ - **Validação**: Zod em todos os endpoints.
+ - **SQL**: drizzle-orm com prepared statements; sem concatenação.
+ - **Logs**: sem passwords, sem tokens, sem PII; username é o único identificador presente.
+ - **Privacidade**: sem IP persistido, sem analytics de terceiros, sem cookies de rastreio. Política de privacidade e termos de utilização publicados.
+ - **Privacidade das partilhas**: nenhuma resposta expõe o `authorId`; o autor aparece como `{ username }` ou `null` («[removido]») e o cliente sabe que o post é seu por `isMine`. Estados não públicos dão 404 (não 403) a quem não é autor nem admin.
+ - **Apagamento de conta**: estado pendente 30 dias (login reactiva); purga pelo job de manutenção; partilhas anonimizadas ou apagadas conforme a escolha do utilizador (ADR-012).
+-- **Headers de admin**: middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido.
++- **Admin** (ADR-015): middlewares separados (`requireAuth`, `requireAdmin`); `/admin/*` revalida role em **cada** pedido (e recusa contas com apagamento pendente). O primeiro admin e as promoções só existem por CLI no servidor, nunca por HTTP; promover e despromover revoga as sessões. Despromover o último admin é recusado, com bloqueio partilhado com o apagamento de conta (nunca ficam zero admins).
++- **Decisões de moderação**: uma transacção por decisão (linha do post bloqueada, estado, denúncias, auditoria, outbox); só se decide sobre `pending_review`, por isso um post suspenso por apagamento de conta nunca é «ressuscitado». O registo de auditoria não guarda IPs e sobrevive à purga de contas e posts (`SET NULL`).
+ 
+ ## 12. Observabilidade
+ 
+diff --git a/docs/api/api.md b/docs/api/api.md
+index a591c0e..a82213d 100644
+--- a/docs/api/api.md
++++ b/docs/api/api.md
+@@ -6,7 +6,7 @@ Formato: JSON
+ Autenticação: `Authorization: Bearer <accessToken>` (JWT EdDSA, 15 min). Os tokens de renovação são opacos.
+ 
+ Os schemas de pedido e resposta vivem em `packages/shared` (`auth.ts`, `cards.ts`, `posts.ts`,
+-`sync.ts`) e são a fonte de verdade; este documento descreve o comportamento.
++`sync.ts`, `admin.ts`) e são a fonte de verdade; este documento descreve o comportamento.
+ 
+ ## Convenções
+ 
+@@ -41,6 +41,8 @@ campo `isMine` diz se a partilha é do utilizador que pede.
+ | Likes (curtir e descurtir)   | 120 por hora                                            |
+ | Denúncias (criar e retirar)  | 10 por hora                                             |
+ | Pedidos `/sync`              | 60 por hora (e cada operação paga o limite do seu tipo) |
++| Painel admin: leituras       | 120 por 60 s, por administrador                         |
++| Painel admin: decisões       | 30 por 60 s, por administrador                          |
+ 
+ ## Health
+ 
+@@ -242,12 +244,12 @@ filtro anti-spam) e pagando o **mesmo limite por operação** que o REST.
+ 
+ **200** `{ "results": [ { "op_id", "status", "result"?, "error"? } ], "serverTime": "…" }` — um resultado por operação, pela mesma ordem:
+ 
+-| `status`    | Significado                                                                                                                                                                                                                                                                                |
+-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+-| `applied`   | Aplicada agora.                                                                                                                                                                                                                                                                            |
+-| `duplicate` | Já estava aplicada (chave repetida, like já dado, partilha já apagada…). O `result` é o estado actual. O cliente dá por concluída.                                                                                                                                                         |
+-| `rejected`  | Recusa definitiva: `error.code` ∈ `not_found`, `forbidden` (inclui conta em apagamento), `own_post`, `idempotency_key_conflict`, `gospel_card_not_found`, `contains_link`, `contains_contact`, `internal`. O cliente remove-a da fila e mostra o motivo.                                   |
+-| `deferred`  | **Não** foi tentada ou falhou por razões transitórias: limite (`error.code = "rate_limited"`, `error.retryAfter` em segundos), prazo do lote esgotado (`SYNC_BATCH_TIMEOUT_MS`, 8 s) ou falha inesperada (`error.code = "internal"`). O cliente repete mais tarde; é seguro (idempotente). |
++| `status`    | Significado                                                                                                                                                                                                                                                                                                                                                          |
++| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `applied`   | Aplicada agora.                                                                                                                                                                                                                                                                                                                                                      |
++| `duplicate` | Já estava aplicada (chave repetida, like já dado, partilha já apagada…). O `result` é o estado actual. O cliente dá por concluída.                                                                                                                                                                                                                                   |
++| `rejected`  | Recusa definitiva: `error.code` ∈ `not_found`, `forbidden` (inclui conta em apagamento), `own_post`, `idempotency_key_conflict` (chave reutilizada com outro corpo **ou por outro tipo de operação**, no mesmo lote ou em lotes anteriores), `gospel_card_not_found`, `contains_link`, `contains_contact`, `internal`. O cliente remove-a da fila e mostra o motivo. |
++| `deferred`  | **Não** foi tentada ou falhou por razões transitórias: limite (`error.code = "rate_limited"`, `error.retryAfter` em segundos), prazo do lote esgotado (`SYNC_BATCH_TIMEOUT_MS`, 8 s) ou falha inesperada (`error.code = "internal"`). O cliente repete mais tarde; é seguro (idempotente).                                                                           |
+ 
+ Erros do pedido: **400** · **401** · **429** (`Retry-After`, limite de pedidos `/sync`).
+ 
+@@ -259,3 +261,66 @@ Requer sessão. Devolve o estado inicial do cliente: `serverTime`, `user`, `card
+ Quando uma flag `…Truncated` é `true`, havia mais itens do que os devolvidos.
+ 
+ **200** · **401** · **403** (`account_inactive`) · **429**
++
++## Admin
++
++Contratos em `packages/shared/src/admin.ts`. Ver ADR-015. Todas as rotas exigem sessão **e** papel `admin`
++(revalidado na base de dados em cada pedido; contas com apagamento pendente → `403`). Sem sessão: `401`; sem ser
++admin: `403`, ambos **antes** de validar a query ou o corpo. Limites por administrador: ver «Convenções».
++
++Nenhuma resposta traz identificadores de utilizadores: autores, denunciantes e moderadores aparecem por
++`{ "username": "…" }` (`null` = removido ou, no registo, acção do sistema).
++
++**Listas e cursores**: `limit` 1–50 (omissão 20) e `cursor` opaco (o `nextCursor` da resposta anterior; `null` na última
++página). Um cursor adulterado ou de outra lista → `400 validation_error`.
++
++### GET /admin/posts
++
++`?status=` (`pending_review` por omissão · `published` · `hidden` · `rejected`). `pending_review` é a fila de trabalho,
++do **mais antigo** para o mais recente; os outros estados, do mais recente. Posts apagados não aparecem.
++
++**200** `{ "posts": [ { id, category, title, excerpt (200 car.), status, author, reviewFlags, reportsCount, reportsByCategory { spam, off_topic, offensive, doctrine, other }, createdAt } ], "nextCursor" }`
++(contagens de denúncias **abertas**).
++
++### GET /admin/posts/:id
++
++**200** `{ "post": { …, content, gospelCardSlug, likesCount, publishedAt }, "reports": [ { id, postId, postTitle, reporter, category, severity, reason, status, createdAt, resolvedAt } ], "moderation": [ { id, action, moderator, target, reason, createdAt, … } ] }`
++· **400** (id inválido) · **404** (inexistente ou apagado).
++
++### POST /admin/posts/:id/approve
++
++Corpo `{ "note"?: "…" }` (1–500 caracteres; campos a mais → `400`). Publica o post, fecha as denúncias abertas como
++`resolved_kept`, regista `approved` na auditoria e invalida a cache do feed.
++
++**200** `{ "post": { id, status: "published", publishedAt } }` · **404** · **409 `invalid_state`** (só se decide sobre
++`pending_review`; um post `hidden`, por exemplo suspenso por apagamento de conta, não se aprova).
++
++### POST /admin/posts/:id/reject
++
++Corpo `{ "reason": "…" }` (**obrigatório**, 10–500 caracteres). Passa o post a `rejected`, fecha as denúncias como
++`resolved_removed` e regista `rejected` com o motivo. O motivo não é mostrado ao autor nesta fase.
++
++**200** `{ "post": { id, status: "rejected", publishedAt } }` · **400** · **404** · **409 `invalid_state`**
++
++Duas decisões em simultâneo sobre o mesmo post: a segunda recebe `409`.
++
++### GET /admin/reports
++
++`?status=` (`open` por omissão · `resolved_kept` · `resolved_removed` · `withdrawn`), das mais recentes.
++**200** `{ "reports": [ { id, postId, postTitle | null, reporter, category, severity, reason, status, createdAt, resolvedAt } ], "nextCursor" }`
++
++### GET /admin/moderation-log
++
++`?action=` (`approved` · `rejected` · `admin.promoted` · `admin.demoted`) e `?postId=`, do mais recente.
++**200** `{ "entries": [ { id, action, postId | null, postTitle | null, moderator | null, target | null, reason | null, createdAt } ], "nextCursor" }`
++
++### Promover e despromover admins
++
++Não há rotas. Só por CLI, no servidor (ADR-015):
++
++```
++pnpm --filter @comunidade/api admin:promote <username>
++pnpm --filter @comunidade/api admin:demote  <username>
++```
++
++Saída: `0` sucesso (incluindo «nada a fazer»), `1` erro de uso ou de ambiente, `2` utilizador inexistente ou em apagamento, `3` recusado (último admin).
+diff --git a/docs/registos/E5-E6-sync-worker-admin.md b/docs/registos/E5-E6-sync-worker-admin.md
+new file mode 100644
+index 0000000..e2fd442
+--- /dev/null
++++ b/docs/registos/E5-E6-sync-worker-admin.md
+@@ -0,0 +1,75 @@
++# E5 + E6 — Ajustes do `/sync` e do worker; administração (ADR-015)
++
++Data: 2026-11-18 · Resultado da comparação dos ramos `featE5` e `featE6-admins` com o `dev` (mais os blocos E4 já aplicados).
++Os ramos **não** foram fundidos: o que prestava foi reescrito por cima do estado actual.
++
++## 1. Check — o que a comparação mostrou
++
++### E5 (worker do outbox e `/sync`)
++
++| #   | Situação                                                                                                                | Resolução                                                                                          |
++| --- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
++| 1   | O worker do E5 duplicava o nosso (`processOutboxBatch` / `startOutboxWorker` já existem, com `backoff` e paragem limpa) | Mantido o nosso; adoptadas só as ideias em falta                                                   |
++| 2   | `buildServer` sem opção para desligar o worker; arranque no próprio `buildServer`                                       | `disableWorker` (omissão: desligado em `NODE_ENV=test`); worker e manutenção arrancam em `onReady` |
++| 3   | A mesma `idempotency_key` podia servir operações de tipos diferentes no `/sync` sem ser detectada                       | Verificação extra: `rejected` com `idempotency_key_conflict` (no lote e entre lotes)               |
++| 4   | Apagar partilha de outro autor                                                                                          | Decisão: mantém-se `not_found`                                                                     |
++| 5   | Faltavam testes de concorrência e de `stop()` do worker                                                                 | Acrescentados                                                                                      |
++
++### E6 (admin)
++
++| #   | Situação no `featE6-admins`                                                                                         | Resolução                                                                                 |
++| --- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
++| 1   | Aprovar/rejeitar lia o post fora da transacção: dois admins em simultâneo passavam ambos a verificação de estado    | Transacção com `FOR UPDATE`; o segundo recebe `409`                                       |
++| 2   | Aprovava qualquer estado diferente do pedido: um post `hidden` (suspenso por apagamento de conta) podia ressuscitar | Só se decide sobre `pending_review`                                                       |
++| 3   | Cursores `z.string()` sem validação                                                                                 | Cursores compostos opacos, um tipo por lista; inválido ou de outra lista → `400`          |
++| 4   | N+1 (`findById` por post, em `/admin/reports` e `/admin/moderation-log`)                                            | Uma query de títulos por página                                                           |
++| 5   | Sem filtro `deleted_at`                                                                                             | Posts apagados fora das listas e do detalhe                                               |
++| 6   | Sem limites no painel; auth em `preHandler`                                                                         | `RATE_LIMIT_ADMIN_READ_*` / `_WRITE_*`; `preValidation` (401/403 antes de validar)        |
++| 7   | Contagem por severidade (`basic/medium/high`)                                                                       | Por **categoria** (ADR-014), só denúncias abertas                                         |
++| 8   | CLI com SQL cru; `demote` contava admins sem bloqueio (dois `demote` em simultâneo deixavam zero admins)            | Serviço `admin-roles.ts` transaccional, com bloqueio partilhado com o apagamento de conta |
++| 9   | Respostas com `reporterId`/`moderatorId`                                                                            | Só `username` (`null` = removido ou sistema)                                              |
++| 10  | `server.ts` do ramo com registos duplicados de cards, posts e sync                                                  | Mantido o nosso `server.ts`; só se acrescenta o registo do `adminRoutes`                  |
++
++## 2. Alterações
++
++**E5-follow-up** (`bloco-E5-followup-sync-worker.patch`)
++
++- `routes/sync.ts`: `hasKeyConflict` (mapa por lote + consulta à chave gravada).
++- `server.ts`: `disableWorker`; worker do outbox e manutenção em `onReady`, paragem em `onClose`.
++- Testes: 3 em `sync.test.ts`; 3 em `outbox-worker.test.ts` (concorrência, `stop()` espera a ronda, sem consumo depois de parar); `server-worker.test.ts` (2).
++
++**E6-a** (`bloco-E6a-schema-migracoes-shared-adr.patch`)
++
++- Migração `0005` (`ADD VALUE` `admin.promoted` / `admin.demoted`, sozinha) e `0006` (`moderation_log.target_user_id`, índices `moderation_log_created_idx` e `reports_status_created_idx`), com snapshots e journal. Validadas num Postgres limpo.
++- `packages/shared/src/admin.ts` (contratos) e novos tipos de cursor `admin_posts` / `admin_reports` / `admin_log` em `posts.ts`.
++- ADR-015 e índices.
++
++**E6-b/c** (`bloco-E6b-admin-servicos-rotas-cli.patch`)
++
++- `repositories/admin.ts`, `repositories/admin-roster.ts` (`lockAdminRoster`, usado também pelo apagamento de conta; ordem de bloqueios: linha do utilizador → bloqueio do conjunto).
++- `services/admin.ts`, `services/admin-roles.ts`; `routes/admin.ts`; limites e env; scripts `admin-promote`, `admin-demote` (+ `admin-role-cli.ts`) e `package.json`; `tsconfig` passa a incluir `scripts/`.
++- Testes: serviços (`admin.test.ts`), papéis com concorrência (`admin-roles.test.ts`), rotas (`admin.test.ts`), schemas partilhados, limites.
++
++## 3. Decisões
++
++| Tema                           | Escolha                                                                            |
++| ------------------------------ | ---------------------------------------------------------------------------------- |
++| Ordem da fila `pending_review` | Do mais antigo para o mais recente (outros estados: mais recente primeiro)         |
++| Estados decidíveis             | Só `pending_review` (aprovar e rejeitar)                                           |
++| Migrações                      | Escritas à mão (enum à parte); `pnpm db:generate` deve dizer que não há alterações |
++| Frontend                       | Fora deste bloco (o ramo não traz `apps/web`)                                      |
++| Invalidação do feed            | Só ao aprovar (um post em revisão nunca esteve no feed público)                    |
++| Motivo da rejeição             | Não é mostrado ao autor nesta fase (virá nas rotas `/users/me/posts`)              |
++| Limites do painel              | Leituras 120/60 s, decisões 30/60 s, por administrador                             |
++| Excerto nas listas             | 200 caracteres; o texto completo só no detalhe                                     |
++
++## 4. Verificação
++
++- Feito aqui: migrações num Postgres 16 limpo (0000 → 0006), `tsc` do pacote `shared`, comportamento dos schemas partilhados, `prettier`, `git apply --check` de cada patch sobre o estado anterior.
++- Por fazer do lado do projecto (a sandbox não tem as dependências da API): `pnpm db:generate` (sem alterações), `pnpm typecheck`, `pnpm test`.
++
++## 5. Fica para depois
++
++- Painel `/admin` em `apps/web` (E11) e rotas `/users/me/posts|reports`.
++- Segundo factor (TOTP) para admins (pós-MVP, ADR-015).
++- Retenção do registo de auditoria (hoje sem prazo; não tem dados pessoais além de nomes de utilizador).
+diff --git a/docs/runbooks/runbook.md b/docs/runbooks/runbook.md
+index 5a34d36..1b4e701 100644
+--- a/docs/runbooks/runbook.md
++++ b/docs/runbooks/runbook.md
+@@ -15,7 +15,7 @@
+ 4. Start command: `node apps/api/dist/index.js`
+ 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
+    Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
+-   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*` (valores por omissão em `.env.example`).
++   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
+    Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
+ 6. Plano: Free.
+ 
+@@ -65,6 +65,21 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
+ - Rodar as chaves de forma planeada (por exemplo, uma vez por ano) para manter o procedimento ensaiado.
+ - Nunca colocar a chave privada no repositório, em logs, tickets ou chats.
+ 
++## Administradores (ADR-015)
++
++O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (shell do Render, ou localmente com `DATABASE_URL` de produção), nunca por HTTP:
++
++```
++pnpm --filter @comunidade/api admin:promote <username>   # a conta já tem de existir
++pnpm --filter @comunidade/api admin:demote  <username>
++```
++
++- A promoção e a despromoção **revogam as sessões** do utilizador: tem de iniciar sessão de novo.
++- Códigos de saída: `0` sucesso (ou nada a fazer), `1` erro de uso/ambiente, `2` utilizador inexistente ou em apagamento, `3` recusado por ser o último admin.
++- Cada acção fica no registo de auditoria (`admin.promoted` / `admin.demoted`, sem moderador = sistema), visível em `GET /admin/moderation-log`.
++- **Perdi o acesso admin** (único admin despromovido, conta perdida): promover outro utilizador por este mesmo comando.
++- Um admin que peça o apagamento da conta, ou seja despromovido, só passa se existir **outro admin activo**.
++
+ ## Incidentes
+ 
+ - **API fora**: verificar dashboard Render; ver logs; confirmar Neon e Upstash operacionais.
+@@ -72,6 +87,7 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
+ - **Feed desactualizado**: a 1.ª página vem de uma cache de `FEED_CACHE_TTL_S` segundos; publicar, apagar e escalar invalidam logo, os likes não. Se uma publicação não aparece, confirmar o Redis (a invalidação é um `INCR` de `cc:v1:feed:version`; se falhar, só se resolve ao fim do TTL). Para forçar: `INCR cc:v1:feed:version` no Redis.
+ - **Tabela `outbox` a crescer**: o worker corre no processo da API. Sem consumidores, os eventos passam a `done` e são purgados pela manutenção. Eventos em `failed` indicam um _handler_ a falhar; ver logs `outbox: handler failed` (só tipo e nome do erro).
+ - **`/sync` devolve muitos `deferred`**: limite por operação (`rate_limited`, com `retryAfter`) ou prazo do lote; o cliente repete sozinho. Confirmar `SYNC_BATCH_TIMEOUT_MS` e a latência da base de dados.
++- **Fila de moderação parada**: `GET /admin/posts` mostra os `pending_review` do mais antigo. Um post que não se consegue aprovar com `409 invalid_state` já foi decidido ou está `hidden` (conta em apagamento). `429` no painel: limites `RATE_LIMIT_ADMIN_*`.
+ - **Rate limit a disparar em produção**: confirmar o Redis (Upstash) acessível; sem Redis o limite aplica-se em memória, por instância.
+ 
+ ## IP do cliente, proxy e Cloudflare
