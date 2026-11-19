@@ -9,6 +9,7 @@ import {
   lt,
   sql,
 } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { decodeCursor, encodeCursor } from "@comunidade/shared";
 import type { FeedFilter, PostCategory, PostStatus } from "@comunidade/shared";
 import type { Executor } from "../db/client.js";
@@ -29,7 +30,6 @@ export interface ListOptions {
   gospelCardId?: string;
   category?: PostCategory;
   filter?: FeedFilter;
-  /** Cursor opaco devolvido por uma chamada anterior (`nextCursor`). */
   cursor?: string;
   limit?: number;
   viewerId?: string;
@@ -40,11 +40,7 @@ export interface ListResult {
   nextCursor: string | null;
 }
 
-/**
- * Timestamp EXACTO (microssegundos) como texto ISO, para o cursor. Um `Date` do JavaScript
- * só tem milissegundos: usá-lo no cursor saltaria linhas criadas no mesmo milissegundo.
- */
-function exactTs(column: typeof posts.createdAt | typeof postLikes.createdAt) {
+export function exactTs(column: AnyPgColumn) {
   return sql<string>`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 }
 
@@ -60,10 +56,6 @@ export function postsRepo(db: Executor) {
       return row!;
     },
 
-    /**
-     * O último post do autor (por defeito só publicado ou em revisão) — usado para o autor ver
-     * a sua partilha acabada de criar mesmo que ainda esteja em revisão. Nunca apagados.
-     */
     async findLatestByAuthorInFilter(
       authorId: string,
       opts: {
@@ -89,10 +81,6 @@ export function postsRepo(db: Executor) {
       return row ?? null;
     },
 
-    /**
-     * Por defeito não devolve posts apagados pelo autor (falha fechada). Os serviços que
-     * precisam de os ver (apagar de novo é idempotente) pedem `includeDeleted`.
-     */
     async findById(
       id: string,
       opts: { includeDeleted?: boolean } = {},
@@ -107,10 +95,6 @@ export function postsRepo(db: Executor) {
       return row ?? null;
     },
 
-    /**
-     * Apagar pelo autor: soft delete. A linha (com as denúncias e likes) fica como evidência até
-     * à purga (`purgeDeleted`). `true` só se este pedido foi o que apagou.
-     */
     async softDelete(id: string, authorId: string): Promise<boolean> {
       const rows = await db
         .update(posts)
@@ -126,10 +110,6 @@ export function postsRepo(db: Executor) {
       return rows.length > 0;
     },
 
-    /**
-     * Apaga DE VEZ (com likes e denúncias, por cascata) os posts apagados pelo autor há mais
-     * de `olderThan`. Em lotes, para não bloquear a base de dados.
-     */
     async purgeDeleted(olderThan: Date, batch = 500): Promise<number> {
       const due = await db
         .select({ id: posts.id })
@@ -154,12 +134,6 @@ export function postsRepo(db: Executor) {
       await db.delete(posts).where(eq(posts.id, id));
     },
 
-    /**
-     * Feed público: só `published` e não apagados. Paginação por chave composta (cursor
-     * opaco), estável mesmo com posts novos ou criados no mesmo instante. No filtro `top` a
-     * chave inclui `likesCount`, que muda entre páginas: o resultado é aproximado (pode, raramente,
-     * repetir ou saltar um post quando os likes mudam a meio).
-     */
     async list(opts: ListOptions = {}): Promise<ListResult> {
       const {
         category,
@@ -273,10 +247,6 @@ export function postsRepo(db: Executor) {
         .limit(limit);
     },
 
-    /**
-     * Muda o estado de moderação. Ao aprovar (`published`) preenche `publishedAt` se ainda
-     * não tinha (um post que esteve em revisão nunca foi publicado).
-     */
     async setStatus(id: string, status: Post["status"]): Promise<Post | null> {
       const [row] = await db
         .update(posts)
@@ -356,10 +326,6 @@ export function postLikesRepo(db: Executor) {
       return rows.map((r) => r.postId);
     },
 
-    /**
-     * Os likes mais recentes do utilizador, com limite. `truncated` diz se havia mais (o
-     * cliente não fica com uma lista cortada em silêncio).
-     */
     async listLikedPostIds(
       userId: string,
       limit = 500,

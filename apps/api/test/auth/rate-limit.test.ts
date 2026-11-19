@@ -141,6 +141,8 @@ describe("rate limit — escritas por utilizador", () => {
     ["checkLikes", "RATE_LIMIT_LIKES_MAX"],
     ["checkReports", "RATE_LIMIT_REPORTS_MAX"],
     ["checkSyncBatch", "RATE_LIMIT_SYNC_MAX"],
+    ["checkAdminRead", "RATE_LIMIT_ADMIN_READ_MAX"],
+    ["checkAdminWrite", "RATE_LIMIT_ADMIN_WRITE_MAX"],
   ] as const;
 
   it.each(cases)(

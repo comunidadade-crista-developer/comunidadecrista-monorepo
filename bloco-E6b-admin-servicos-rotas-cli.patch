@@ -1,0 +1,2574 @@
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index bab2ee2..6515a10 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -77,6 +77,11 @@ RATE_LIMIT_REPORTS_WINDOW_S=3600
+ # Pedidos /sync por utilizador (até 20 operações cada)
+ RATE_LIMIT_SYNC_MAX=60
+ RATE_LIMIT_SYNC_WINDOW_S=3600
++# Painel admin, por administrador
++RATE_LIMIT_ADMIN_READ_MAX=120
++RATE_LIMIT_ADMIN_READ_WINDOW_S=60
++RATE_LIMIT_ADMIN_WRITE_MAX=30
++RATE_LIMIT_ADMIN_WRITE_WINDOW_S=60
+ # Tempo máximo de um lote /sync (ms); o que não chega a correr volta como "deferred"
+ SYNC_BATCH_TIMEOUT_MS=8000
+ # Validade (s) da primeira página do feed em cache
+diff --git a/apps/api/package.json b/apps/api/package.json
+index 4d9f44d..bc8dd0f 100644
+--- a/apps/api/package.json
++++ b/apps/api/package.json
+@@ -17,7 +17,9 @@
+     "db:migrate": "tsx src/db/run-migrations.ts",
+     "db:seed": "tsx src/db/seed.ts",
+     "db:studio": "drizzle-kit studio",
+-    "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts"
++    "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts",
++    "admin:promote": "tsx scripts/admin-promote.ts",
++    "admin:demote": "tsx scripts/admin-demote.ts"
+   },
+   "dependencies": {
+     "@comunidade/shared": "workspace:*",
+diff --git a/apps/api/scripts/admin-demote.ts b/apps/api/scripts/admin-demote.ts
+new file mode 100644
+index 0000000..c3f5aa7
+--- /dev/null
++++ b/apps/api/scripts/admin-demote.ts
+@@ -0,0 +1,3 @@
++import { runRoleCommand } from "./admin-role-cli.js";
++
++await runRoleCommand("demote");
+diff --git a/apps/api/scripts/admin-promote.ts b/apps/api/scripts/admin-promote.ts
+new file mode 100644
+index 0000000..58676ec
+--- /dev/null
++++ b/apps/api/scripts/admin-promote.ts
+@@ -0,0 +1,3 @@
++import { runRoleCommand } from "./admin-role-cli.js";
++
++await runRoleCommand("promote");
+diff --git a/apps/api/scripts/admin-role-cli.ts b/apps/api/scripts/admin-role-cli.ts
+new file mode 100644
+index 0000000..3181fe0
+--- /dev/null
++++ b/apps/api/scripts/admin-role-cli.ts
+@@ -0,0 +1,112 @@
++import { Username } from "@comunidade/shared";
++import { createDb } from "../src/db/client.js";
++import { loadEnv } from "../src/env.js";
++import {
++  demoteAdmin,
++  promoteAdmin,
++  type RoleChangeResult,
++} from "../src/services/admin-roles.js";
++
++/**
++ * Código de saída: 0 sucesso (incluindo «nada a fazer»), 1 erro de uso ou de ambiente,
++ * 2 utilizador inexistente ou inactivo, 3 recusado (último admin).
++ */
++export const EXIT = { ok: 0, usage: 1, notFound: 2, refused: 3 } as const;
++
++function describe(
++  kind: "promote" | "demote",
++  username: string,
++  r: RoleChangeResult,
++): { message: string; code: number } {
++  if (r.ok) {
++    switch (r.data.outcome) {
++      case "promoted":
++        return {
++          message: `"${username}" promovido a admin. As sessões existentes foram revogadas (tem de iniciar sessão de novo).`,
++          code: EXIT.ok,
++        };
++      case "already_admin":
++        return {
++          message: `"${username}" já é admin. Nada a fazer.`,
++          code: EXIT.ok,
++        };
++      case "demoted":
++        return {
++          message: `"${username}" deixou de ser admin. As sessões existentes foram revogadas.`,
++          code: EXIT.ok,
++        };
++      case "already_user":
++        return {
++          message: `"${username}" não é admin. Nada a fazer.`,
++          code: EXIT.ok,
++        };
++    }
++  }
++  switch (r.error.code) {
++    case "not_found":
++      return {
++        message: `O utilizador "${username}" não existe.`,
++        code: EXIT.notFound,
++      };
++    case "inactive":
++      return {
++        message: `A conta "${username}" está em apagamento: não é possível ${kind === "promote" ? "promovê-la" : "alterá-la"}.`,
++        code: EXIT.notFound,
++      };
++    case "last_admin":
++      return {
++        message: `Recusado: "${username}" é o último admin activo. Promove outro utilizador antes de o despromover.`,
++        code: EXIT.refused,
++      };
++  }
++}
++
++export async function runRoleCommand(
++  kind: "promote" | "demote",
++): Promise<void> {
++  const username = process.argv[2]?.trim();
++  if (
++    !username ||
++    process.argv.length > 3 ||
++    !Username.safeParse(username).success
++  ) {
++    console.error(
++      `Uso: pnpm --filter @comunidade/api admin:${kind} <username>`,
++    );
++    process.exitCode = EXIT.usage;
++    return;
++  }
++
++  const env = loadEnv();
++  if (!env.DATABASE_URL) {
++    console.error("DATABASE_URL não está definido.");
++    process.exitCode = EXIT.usage;
++    return;
++  }
++
++  const { db, pool } = createDb(env.DATABASE_URL, {
++    poolMax: 2,
++    applicationName: `admin-${kind}`,
++  });
++  try {
++    const result =
++      kind === "promote"
++        ? await promoteAdmin(db, username)
++        : await demoteAdmin(db, username);
++    const { message, code } = describe(kind, username, result);
++    (code === EXIT.ok ? console.log : console.error)(message);
++    process.exitCode = code;
++  } catch (err) {
++    // Sem a mensagem do erro: pode trazer dados. O nome e o código bastam para diagnosticar.
++    console.error(
++      "Erro inesperado:",
++      err instanceof Error ? err.name : typeof err,
++      typeof err === "object" && err !== null && "code" in err
++        ? String((err as { code: unknown }).code)
++        : "",
++    );
++    process.exitCode = EXIT.usage;
++  } finally {
++    await pool.end().catch(() => {});
++  }
++}
+diff --git a/apps/api/src/auth/rate-limit.ts b/apps/api/src/auth/rate-limit.ts
+index eac68e2..7f68c64 100644
+--- a/apps/api/src/auth/rate-limit.ts
++++ b/apps/api/src/auth/rate-limit.ts
+@@ -43,6 +43,9 @@ export interface RateLimiters {
+   checkReports(userId: string): Promise<RateLimitResult>;
+   /** Pedidos /sync (lotes) por utilizador. */
+   checkSyncBatch(userId: string): Promise<RateLimitResult>;
++  /** Painel admin: leituras e decisões, 1 balde por administrador e por tipo. */
++  checkAdminRead(userId: string): Promise<RateLimitResult>;
++  checkAdminWrite(userId: string): Promise<RateLimitResult>;
+ }
+ 
+ /** Subconjunto do logger do Fastify: nunca recebe IP, username nem o erro completo. */
+@@ -173,6 +176,16 @@ export function createRateLimiters(
+     env.RATE_LIMIT_SYNC_MAX,
+     env.RATE_LIMIT_SYNC_WINDOW_S,
+   );
++  const adminRead = make(
++    "rl:admin:read",
++    env.RATE_LIMIT_ADMIN_READ_MAX,
++    env.RATE_LIMIT_ADMIN_READ_WINDOW_S,
++  );
++  const adminWrite = make(
++    "rl:admin:write",
++    env.RATE_LIMIT_ADMIN_WRITE_MAX,
++    env.RATE_LIMIT_ADMIN_WRITE_WINDOW_S,
++  );
+ 
+   const consume = async (
+     limiter: RateLimiterAbstract,
+@@ -265,5 +278,7 @@ export function createRateLimiters(
+     checkLikes: (userId) => consumeAll([[likes, anon(userId)]]),
+     checkReports: (userId) => consumeAll([[reportsLimiter, anon(userId)]]),
+     checkSyncBatch: (userId) => consumeAll([[syncBatch, anon(userId)]]),
++    checkAdminRead: (userId) => consumeAll([[adminRead, anon(userId)]]),
++    checkAdminWrite: (userId) => consumeAll([[adminWrite, anon(userId)]]),
+   };
+ }
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index 765e06b..80821ef 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -155,6 +155,20 @@ const BaseEnvSchema = z.object({
+   RATE_LIMIT_SYNC_MAX: z.coerce.number().int().positive().default(60),
+   RATE_LIMIT_SYNC_WINDOW_S: z.coerce.number().int().positive().default(3600),
+ 
++  // Painel admin, por administrador: leituras (listas e detalhe) e decisões (aprovar/rejeitar).
++  RATE_LIMIT_ADMIN_READ_MAX: z.coerce.number().int().positive().default(120),
++  RATE_LIMIT_ADMIN_READ_WINDOW_S: z.coerce
++    .number()
++    .int()
++    .positive()
++    .default(60),
++  RATE_LIMIT_ADMIN_WRITE_MAX: z.coerce.number().int().positive().default(30),
++  RATE_LIMIT_ADMIN_WRITE_WINDOW_S: z.coerce
++    .number()
++    .int()
++    .positive()
++    .default(60),
++
+   // Tempo máximo de um lote /sync: as operações que não chegam a correr voltam `deferred`.
+   // Abaixo do timeout típico de proxies/CDN (30 s+) para o cliente receber sempre resposta.
+   SYNC_BATCH_TIMEOUT_MS: z.coerce
+diff --git a/apps/api/src/repositories/account-deletion.ts b/apps/api/src/repositories/account-deletion.ts
+index d1181bb..2efd914 100644
+--- a/apps/api/src/repositories/account-deletion.ts
++++ b/apps/api/src/repositories/account-deletion.ts
+@@ -1,5 +1,6 @@
+ import { and, count, eq, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
+ import type { Database } from "../db/client.js";
++import { lockAdminRoster } from "./admin-roster.js";
+ import {
+   outbox,
+   pendingPasswordResets,
+@@ -72,9 +73,7 @@ export function accountDeletionRepo(db: Database) {
+         if (user.role === "admin") {
+           // Serializa pedidos de administradores: sem isto, dois admins a apagar-se ao mesmo
+           // tempo veriam cada um o outro como «activo» e a plataforma ficava sem admin.
+-          await tx.execute(
+-            sql`SELECT pg_advisory_xact_lock(hashtext('account-deletion:admin'))`,
+-          );
++          await lockAdminRoster(tx);
+           const [others] = await tx
+             .select({ c: count() })
+             .from(users)
+diff --git a/apps/api/src/repositories/admin-roster.ts b/apps/api/src/repositories/admin-roster.ts
+new file mode 100644
+index 0000000..c96d04c
+--- /dev/null
++++ b/apps/api/src/repositories/admin-roster.ts
+@@ -0,0 +1,15 @@
++import { sql } from "drizzle-orm";
++import type { DbTransaction } from "../db/client.js";
++
++/**
++ * Serializa tudo o que pode reduzir o número de administradores activos: o pedido de
++ * apagamento de conta de um admin e a despromoção (`admin:demote`). Sem isto, dois admins a
++ * sair ao mesmo tempo veriam cada um o outro como «activo» e a plataforma ficava sem admin.
++ *
++ * Bloqueio consultivo ao nível da transacção (libertado no commit/rollback). Ordem de
++ * bloqueios, igual em todos os chamadores para não haver deadlock: primeiro a linha do
++ * utilizador (`FOR UPDATE`), depois este bloqueio.
++ */
++export async function lockAdminRoster(tx: DbTransaction): Promise<void> {
++  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('admin-roster'))`);
++}
+diff --git a/apps/api/src/repositories/admin.ts b/apps/api/src/repositories/admin.ts
+new file mode 100644
+index 0000000..b0a706e
+--- /dev/null
++++ b/apps/api/src/repositories/admin.ts
+@@ -0,0 +1,253 @@
++import {
++  and,
++  asc,
++  count,
++  desc,
++  eq,
++  inArray,
++  isNull,
++  sql,
++  type SQL,
++} from "drizzle-orm";
++import { decodeCursor, encodeCursor } from "@comunidade/shared";
++import type {
++  AdminModerationAction,
++  AdminReportStatus,
++  AdminReportsByCategory,
++  CursorKind,
++  PostStatus,
++  ReportCategory,
++} from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
++import { moderationLog, posts, reports } from "../db/schema.js";
++import type { ModerationLogEntry, Post, Report } from "../db/schema.js";
++import { InvalidCursorError, exactTs } from "./posts.js";
++
++export interface AdminPage<T> {
++  items: T[];
++  nextCursor: string | null;
++}
++
++interface KeysetRow<T> {
++  row: T;
++  ts: string;
++  id: string;
++}
++
++/**
++ * Corta a página (`limit`) e gera o cursor da última linha. Pede-se sempre `limit + 1`
++ * linhas: se a mais existir, há página seguinte.
++ */
++function toPage<T>(
++  rows: KeysetRow<T>[],
++  limit: number,
++  kind: "admin_posts" | "admin_reports" | "admin_log",
++): AdminPage<T> {
++  const page = rows.slice(0, limit);
++  const last = page[page.length - 1];
++  return {
++    items: page.map((r) => r.row),
++    nextCursor:
++      rows.length > limit && last
++        ? encodeCursor({ k: kind, t: last.ts, id: last.id })
++        : null,
++  };
++}
++
++function readCursor(
++  cursor: string | undefined,
++  kind: CursorKind,
++): { t: string; id: string } | null {
++  if (cursor === undefined) return null;
++  const parsed = decodeCursor(cursor, kind);
++  // `t` e `id` existem em todos os tipos do painel; o `k` já foi verificado acima.
++  if (parsed === null || parsed.k === "top") throw new InvalidCursorError();
++  return { t: parsed.t, id: parsed.id };
++}
++
++export const EMPTY_REPORTS_BY_CATEGORY: Readonly<AdminReportsByCategory> = {
++  spam: 0,
++  off_topic: 0,
++  offensive: 0,
++  doctrine: 0,
++  other: 0,
++};
++
++/** Leituras e bloqueios do painel de administração (ADR-015). */
++export function adminRepo(db: Executor) {
++  return {
++    /**
++     * Fila de posts por estado, sem os apagados. `pending_review` é a fila de trabalho: do mais
++     * antigo para o mais recente (nada fica esquecido); os restantes estados são consulta,
++     * do mais recente. Cursor composto `(created_at, id)`.
++     */
++    async listPostsPage(args: {
++      status: PostStatus;
++      cursor?: string | undefined;
++      limit: number;
++    }): Promise<AdminPage<Post>> {
++      const cur = readCursor(args.cursor, "admin_posts");
++      const oldestFirst = args.status === "pending_review";
++      const conds = [eq(posts.status, args.status), isNull(posts.deletedAt)];
++      if (cur) {
++        conds.push(
++          oldestFirst
++            ? sql`(${posts.createdAt}, ${posts.id}) > (${cur.t}::timestamptz, ${cur.id}::uuid)`
++            : sql`(${posts.createdAt}, ${posts.id}) < (${cur.t}::timestamptz, ${cur.id}::uuid)`,
++        );
++      }
++      const rows = await db
++        .select({ post: posts, ts: exactTs(posts.createdAt) })
++        .from(posts)
++        .where(and(...conds))
++        .orderBy(
++          ...(oldestFirst
++            ? [asc(posts.createdAt), asc(posts.id)]
++            : [desc(posts.createdAt), desc(posts.id)]),
++        )
++        .limit(args.limit + 1);
++      return toPage(
++        rows.map((r) => ({ row: r.post, ts: r.ts, id: r.post.id })),
++        args.limit,
++        "admin_posts",
++      );
++    },
++
++    /** Post por id para o detalhe (nunca apagado). */
++    async findPost(id: string): Promise<Post | null> {
++      const [row] = await db
++        .select()
++        .from(posts)
++        .where(and(eq(posts.id, id), isNull(posts.deletedAt)))
++        .limit(1);
++      return row ?? null;
++    },
++
++    /**
++     * Lê o post a decidir BLOQUEANDO a linha até ao fim da transacção: dois admins a decidir o
++     * mesmo post em simultâneo ficam em série e o segundo vê o estado já mudado.
++     */
++    async lockPostForDecision(id: string): Promise<Post | null> {
++      const [row] = await db
++        .select()
++        .from(posts)
++        .where(and(eq(posts.id, id), isNull(posts.deletedAt)))
++        .for("update")
++        .limit(1);
++      return row ?? null;
++    },
++
++    /** Denúncias ABERTAS por post e categoria (uma query para a página inteira). */
++    async openReportsByPosts(
++      postIds: string[],
++    ): Promise<Map<string, AdminReportsByCategory>> {
++      const out = new Map<string, AdminReportsByCategory>();
++      if (postIds.length === 0) return out;
++      const rows = await db
++        .select({
++          postId: reports.postId,
++          category: reports.category,
++          n: count(),
++        })
++        .from(reports)
++        .where(
++          and(inArray(reports.postId, postIds), eq(reports.status, "open")),
++        )
++        .groupBy(reports.postId, reports.category);
++      for (const r of rows) {
++        const entry = out.get(r.postId) ?? { ...EMPTY_REPORTS_BY_CATEGORY };
++        entry[r.category as ReportCategory] = Number(r.n);
++        out.set(r.postId, entry);
++      }
++      return out;
++    },
++
++    /** Títulos por id (inclui posts apagados, que ainda existem durante a retenção). */
++    async titlesByIds(ids: string[]): Promise<Map<string, string>> {
++      if (ids.length === 0) return new Map();
++      const rows = await db
++        .select({ id: posts.id, title: posts.title })
++        .from(posts)
++        .where(inArray(posts.id, ids));
++      return new Map(rows.map((r) => [r.id, r.title]));
++    },
++
++    /** Todas as denúncias de um post (qualquer estado), das mais recentes. */
++    async reportsForPost(postId: string, limit = 200): Promise<Report[]> {
++      return db
++        .select()
++        .from(reports)
++        .where(eq(reports.postId, postId))
++        .orderBy(desc(reports.createdAt), desc(reports.id))
++        .limit(limit);
++    },
++
++    /** Denúncias por estado, das mais recentes. Cursor composto `(created_at, id)`. */
++    async listReportsPage(args: {
++      status: AdminReportStatus;
++      cursor?: string | undefined;
++      limit: number;
++    }): Promise<AdminPage<Report>> {
++      const cur = readCursor(args.cursor, "admin_reports");
++      const conds = [eq(reports.status, args.status)];
++      if (cur) {
++        conds.push(
++          sql`(${reports.createdAt}, ${reports.id}) < (${cur.t}::timestamptz, ${cur.id}::uuid)`,
++        );
++      }
++      const rows = await db
++        .select({ report: reports, ts: exactTs(reports.createdAt) })
++        .from(reports)
++        .where(and(...conds))
++        .orderBy(desc(reports.createdAt), desc(reports.id))
++        .limit(args.limit + 1);
++      return toPage(
++        rows.map((r) => ({ row: r.report, ts: r.ts, id: r.report.id })),
++        args.limit,
++        "admin_reports",
++      );
++    },
++
++    /** Registo de auditoria, do mais recente. Cursor composto `(created_at, id)`. */
++    async listLogPage(args: {
++      action?: AdminModerationAction | undefined;
++      postId?: string | undefined;
++      cursor?: string | undefined;
++      limit: number;
++    }): Promise<AdminPage<ModerationLogEntry>> {
++      const cur = readCursor(args.cursor, "admin_log");
++      const conds: SQL[] = [];
++      if (args.action) conds.push(eq(moderationLog.action, args.action));
++      if (args.postId) conds.push(eq(moderationLog.postId, args.postId));
++      if (cur) {
++        conds.push(
++          sql`(${moderationLog.createdAt}, ${moderationLog.id}) < (${cur.t}::timestamptz, ${cur.id}::uuid)`,
++        );
++      }
++      const rows = await db
++        .select({ entry: moderationLog, ts: exactTs(moderationLog.createdAt) })
++        .from(moderationLog)
++        .where(conds.length > 0 ? and(...conds) : undefined)
++        .orderBy(desc(moderationLog.createdAt), desc(moderationLog.id))
++        .limit(args.limit + 1);
++      return toPage(
++        rows.map((r) => ({ row: r.entry, ts: r.ts, id: r.entry.id })),
++        args.limit,
++        "admin_log",
++      );
++    },
++
++    /** Decisões anteriores sobre um post, das mais recentes. */
++    async logForPost(
++      postId: string,
++      limit = 100,
++    ): Promise<ModerationLogEntry[]> {
++      return db
++        .select()
++        .from(moderationLog)
++        .where(eq(moderationLog.postId, postId))
++        .orderBy(desc(moderationLog.createdAt), desc(moderationLog.id))
++        .limit(limit);
++    },
++  };
++}
+diff --git a/apps/api/src/repositories/posts.ts b/apps/api/src/repositories/posts.ts
+index 50cd228..a3b1024 100644
+--- a/apps/api/src/repositories/posts.ts
++++ b/apps/api/src/repositories/posts.ts
+@@ -9,6 +9,7 @@ import {
+   lt,
+   sql,
+ } from "drizzle-orm";
++import type { AnyPgColumn } from "drizzle-orm/pg-core";
+ import { decodeCursor, encodeCursor } from "@comunidade/shared";
+ import type { FeedFilter, PostCategory, PostStatus } from "@comunidade/shared";
+ import type { Executor } from "../db/client.js";
+@@ -44,7 +45,7 @@ export interface ListResult {
+  * Timestamp EXACTO (microssegundos) como texto ISO, para o cursor. Um `Date` do JavaScript
+  * só tem milissegundos: usá-lo no cursor saltaria linhas criadas no mesmo milissegundo.
+  */
+-function exactTs(column: typeof posts.createdAt | typeof postLikes.createdAt) {
++export function exactTs(column: AnyPgColumn) {
+   return sql<string>`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+ }
+ 
+diff --git a/apps/api/src/routes/admin.ts b/apps/api/src/routes/admin.ts
+new file mode 100644
+index 0000000..b592871
+--- /dev/null
++++ b/apps/api/src/routes/admin.ts
+@@ -0,0 +1,199 @@
++import {
++  AdminApproveRequest,
++  AdminListPostsQuery,
++  AdminListPostsResponse,
++  AdminListReportsQuery,
++  AdminModerationLogQuery,
++  AdminModerationLogResponse,
++  AdminModerationResponse,
++  AdminPostDetailResponse,
++  AdminRejectRequest,
++  AdminReportListResponse,
++  ErrorResponse,
++  PostIdParams,
++} from "@comunidade/shared";
++import type { FastifyInstance, FastifyReply } from "fastify";
++import type { ZodTypeProvider } from "fastify-type-provider-zod";
++import type { JwtService } from "../auth/jwt.js";
++import { requireAdmin, requireAuth } from "../auth/middleware.js";
++import type { RateLimitResult, RateLimiters } from "../auth/rate-limit.js";
++import type { FeedCache } from "../cache/feed-cache.js";
++import type { Database } from "../db/client.js";
++import {
++  approvePost,
++  getAdminPostDetail,
++  listAdminModerationLog,
++  listAdminPosts,
++  listAdminReports,
++  rejectPost,
++  type AdminServiceError,
++} from "../services/admin.js";
++
++export interface AdminRoutesOptions {
++  db: Database;
++  jwt: JwtService;
++  limiters: RateLimiters;
++  feedCache: FeedCache;
++}
++
++/** Erro no formato único `{ error }` (o `ErrorResponse` de cada rota já o declara). */
++function sendError(
++  reply: object,
++  status: number,
++  error: string,
++  retryAfter?: number,
++): FastifyReply {
++  const r = (reply as FastifyReply).code(status);
++  if (retryAfter !== undefined) r.header("Retry-After", String(retryAfter));
++  return r.send({ error });
++}
++
++function tooMany(reply: object, rl: RateLimitResult): FastifyReply {
++  return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
++}
++
++function sendServiceError(reply: object, e: AdminServiceError): FastifyReply {
++  return sendError(reply, e.status, e.code);
++}
++
++const ReadErrors = {
++  400: ErrorResponse,
++  401: ErrorResponse,
++  403: ErrorResponse,
++  429: ErrorResponse,
++} as const;
++
++const DecisionErrors = {
++  ...ReadErrors,
++  404: ErrorResponse,
++  409: ErrorResponse,
++} as const;
++
++/**
++ * Painel de administração (ADR-015). Todas as rotas exigem sessão válida E papel de admin
++ * revalidado na base de dados, em `preValidation`: sem isso o pedido é recusado (401/403)
++ * antes de se olhar para o corpo ou a query, e quem não é admin não aprende nada sobre o
++ * formato dos pedidos.
++ */
++export async function adminRoutes(
++  app: FastifyInstance,
++  { db, jwt, limiters, feedCache }: AdminRoutesOptions,
++): Promise<void> {
++  const f = app.withTypeProvider<ZodTypeProvider>();
++  const adminPre = [requireAuth(jwt), requireAdmin(db)];
++
++  f.get(
++    "/admin/posts",
++    {
++      preValidation: adminPre,
++      schema: {
++        querystring: AdminListPostsQuery,
++        response: { 200: AdminListPostsResponse, ...ReadErrors },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkAdminRead(request.user!.id);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await listAdminPosts(db, request.query);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      return reply.code(200).send(r.data);
++    },
++  );
++
++  f.get(
++    "/admin/posts/:id",
++    {
++      preValidation: adminPre,
++      schema: {
++        params: PostIdParams,
++        response: { 200: AdminPostDetailResponse, ...DecisionErrors },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkAdminRead(request.user!.id);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await getAdminPostDetail(db, request.params.id);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      return reply.code(200).send(r.data);
++    },
++  );
++
++  f.post(
++    "/admin/posts/:id/approve",
++    {
++      preValidation: adminPre,
++      schema: {
++        params: PostIdParams,
++        body: AdminApproveRequest,
++        response: { 200: AdminModerationResponse, ...DecisionErrors },
++      },
++    },
++    async (request, reply) => {
++      const adminId = request.user!.id;
++      const rl = await limiters.checkAdminWrite(adminId);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await approvePost(db, adminId, request.params.id, request.body);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      // Só a aprovação muda o que o feed público mostra (passa a haver um post novo).
++      await feedCache.invalidate();
++      return reply.code(200).send(r.data);
++    },
++  );
++
++  f.post(
++    "/admin/posts/:id/reject",
++    {
++      preValidation: adminPre,
++      schema: {
++        params: PostIdParams,
++        body: AdminRejectRequest,
++        response: { 200: AdminModerationResponse, ...DecisionErrors },
++      },
++    },
++    async (request, reply) => {
++      const adminId = request.user!.id;
++      const rl = await limiters.checkAdminWrite(adminId);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await rejectPost(db, adminId, request.params.id, request.body);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      // Um post em revisão nunca esteve no feed público: não há nada a invalidar.
++      return reply.code(200).send(r.data);
++    },
++  );
++
++  f.get(
++    "/admin/reports",
++    {
++      preValidation: adminPre,
++      schema: {
++        querystring: AdminListReportsQuery,
++        response: { 200: AdminReportListResponse, ...ReadErrors },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkAdminRead(request.user!.id);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await listAdminReports(db, request.query);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      return reply.code(200).send(r.data);
++    },
++  );
++
++  f.get(
++    "/admin/moderation-log",
++    {
++      preValidation: adminPre,
++      schema: {
++        querystring: AdminModerationLogQuery,
++        response: { 200: AdminModerationLogResponse, ...ReadErrors },
++      },
++    },
++    async (request, reply) => {
++      const rl = await limiters.checkAdminRead(request.user!.id);
++      if (!rl.allowed) return tooMany(reply, rl);
++      const r = await listAdminModerationLog(db, request.query);
++      if (!r.ok) return sendServiceError(reply, r.error);
++      return reply.code(200).send(r.data);
++    },
++  );
++}
+diff --git a/apps/api/src/services/admin-roles.ts b/apps/api/src/services/admin-roles.ts
+new file mode 100644
+index 0000000..3d33445
+--- /dev/null
++++ b/apps/api/src/services/admin-roles.ts
+@@ -0,0 +1,142 @@
++import { and, count, eq, isNull, ne } from "drizzle-orm";
++import type { Database, DbTransaction } from "../db/client.js";
++import { refreshTokens, users } from "../db/schema.js";
++import type { User } from "../db/schema.js";
++import { lockAdminRoster } from "../repositories/admin-roster.js";
++import { moderationLogRepo } from "../repositories/reports.js";
++
++/**
++ * Promoção e despromoção de administradores (ADR-015). Só são chamadas pelos scripts
++ * `admin:promote` e `admin:demote`: nenhuma rota HTTP eleva privilégio.
++ */
++
++export type RoleChangeOutcome =
++  | "promoted"
++  | "already_admin"
++  | "demoted"
++  | "already_user";
++
++export type RoleChangeError =
++  /** O utilizador não existe. */
++  | { code: "not_found" }
++  /** Conta apagada ou em apagamento: não se promove (nem se mexe nela). */
++  | { code: "inactive" }
++  /** Despromover deixaria a plataforma sem nenhum admin activo. */
++  | { code: "last_admin" };
++
++export type RoleChangeResult =
++  | { ok: true; data: { outcome: RoleChangeOutcome; userId: string } }
++  | { ok: false; error: RoleChangeError };
++
++const fail = (error: RoleChangeError): RoleChangeResult => ({
++  ok: false,
++  error,
++});
++
++function isActive(u: Pick<User, "deletedAt" | "deletionRequestedAt">): boolean {
++  return !u.deletedAt && !u.deletionRequestedAt;
++}
++
++/** Linha do utilizador bloqueada até ao fim da transacção (nome insensível a maiúsculas). */
++async function lockUserByUsername(
++  tx: DbTransaction,
++  username: string,
++): Promise<User | null> {
++  const [row] = await tx
++    .select()
++    .from(users)
++    .where(and(eq(users.username, username), isNull(users.deletedAt)))
++    .for("update")
++    .limit(1);
++  return row ?? null;
++}
++
++/** Um papel novo invalida as sessões: o novo login traz o papel certo. */
++async function revokeSessions(tx: DbTransaction, userId: string) {
++  await tx
++    .update(refreshTokens)
++    .set({ revokedAt: new Date() })
++    .where(
++      and(eq(refreshTokens.userId, userId), isNull(refreshTokens.revokedAt)),
++    );
++}
++
++export async function promoteAdmin(
++  db: Database,
++  username: string,
++): Promise<RoleChangeResult> {
++  return db.transaction(async (tx) => {
++    const user = await lockUserByUsername(tx, username);
++    if (!user) return fail({ code: "not_found" });
++    if (!isActive(user)) return fail({ code: "inactive" });
++    if (user.role === "admin") {
++      return {
++        ok: true,
++        data: { outcome: "already_admin", userId: user.id },
++      } as const;
++    }
++
++    await tx.update(users).set({ role: "admin" }).where(eq(users.id, user.id));
++    await revokeSessions(tx, user.id);
++    await moderationLogRepo(tx).create({
++      action: "admin.promoted",
++      moderatorId: null,
++      targetUserId: user.id,
++      postId: null,
++      reason: null,
++    });
++    return {
++      ok: true,
++      data: { outcome: "promoted", userId: user.id },
++    } as const;
++  });
++}
++
++export async function demoteAdmin(
++  db: Database,
++  username: string,
++): Promise<RoleChangeResult> {
++  return db.transaction(async (tx) => {
++    const user = await lockUserByUsername(tx, username);
++    if (!user) return fail({ code: "not_found" });
++    if (user.role !== "admin") {
++      return {
++        ok: true,
++        data: { outcome: "already_user", userId: user.id },
++      } as const;
++    }
++
++    // Ordem de bloqueios: linha do utilizador, depois o bloqueio do conjunto de admins (igual
++    // ao do apagamento de conta, ver `lockAdminRoster`). Dois `demote` em simultâneo, ou um
++    // `demote` e um apagamento, ficam em série e o segundo vê o resultado do primeiro.
++    await lockAdminRoster(tx);
++    if (isActive(user)) {
++      const [others] = await tx
++        .select({ c: count() })
++        .from(users)
++        .where(
++          and(
++            eq(users.role, "admin"),
++            ne(users.id, user.id),
++            isNull(users.deletionRequestedAt),
++            isNull(users.deletedAt),
++          ),
++        );
++      if (Number(others?.c ?? 0) === 0) return fail({ code: "last_admin" });
++    }
++
++    await tx.update(users).set({ role: "user" }).where(eq(users.id, user.id));
++    await revokeSessions(tx, user.id);
++    await moderationLogRepo(tx).create({
++      action: "admin.demoted",
++      moderatorId: null,
++      targetUserId: user.id,
++      postId: null,
++      reason: null,
++    });
++    return {
++      ok: true,
++      data: { outcome: "demoted", userId: user.id },
++    } as const;
++  });
++}
+diff --git a/apps/api/src/services/admin.ts b/apps/api/src/services/admin.ts
+new file mode 100644
+index 0000000..bae248e
+--- /dev/null
++++ b/apps/api/src/services/admin.ts
+@@ -0,0 +1,333 @@
++import type {
++  AdminListPostsQuery,
++  AdminListPostsResponse,
++  AdminListReportsQuery,
++  AdminModerationLogQuery,
++  AdminModerationLogResponse,
++  AdminModerationResponse,
++  AdminPostDetailResponse,
++  AdminReportListResponse,
++  AdminReportsByCategory,
++} from "@comunidade/shared";
++import { ADMIN_EXCERPT_MAX } from "@comunidade/shared";
++import type { Executor } from "../db/client.js";
++import type { ModerationLogEntry, Report, User } from "../db/schema.js";
++import { adminRepo, EMPTY_REPORTS_BY_CATEGORY } from "../repositories/admin.js";
++import { cardsRepo } from "../repositories/cards.js";
++import { outboxRepo } from "../repositories/outbox.js";
++import { InvalidCursorError, postsRepo } from "../repositories/posts.js";
++import { moderationLogRepo, reportsRepo } from "../repositories/reports.js";
++import { usersRepo } from "../repositories/users.js";
++
++export type AdminServiceError =
++  | { code: "not_found"; status: 404 }
++  /** Só se decide sobre posts em `pending_review`. */
++  | { code: "invalid_state"; status: 409 }
++  | { code: "invalid_cursor"; status: 400 };
++
++export type AdminResult<T> =
++  | { ok: true; data: T }
++  | { ok: false; error: AdminServiceError };
++
++const ok = <T>(data: T): AdminResult<T> => ({ ok: true, data });
++const fail = (error: AdminServiceError): AdminResult<never> => ({
++  ok: false,
++  error,
++});
++
++type Username = { username: string } | null;
++
++/** Contas removidas (ou inexistentes) aparecem como `null` («[removido]»). */
++function usernameOf(user: User | undefined): Username {
++  return user && !user.deletedAt ? { username: user.username } : null;
++}
++
++async function usersById(
++  db: Executor,
++  ids: (string | null)[],
++): Promise<Map<string, User>> {
++  const unique = Array.from(
++    new Set(ids.filter((id): id is string => id !== null)),
++  );
++  const rows = await usersRepo(db).findManyByIds(unique);
++  return new Map(rows.map((u) => [u.id, u]));
++}
++
++/** Excerto sem cortar um par substituto (emoji) ao meio. */
++function excerpt(content: string): string {
++  const chars = Array.from(content);
++  if (chars.length <= ADMIN_EXCERPT_MAX) return content;
++  return `${chars.slice(0, ADMIN_EXCERPT_MAX).join("").trimEnd()}…`;
++}
++
++function sumReports(by: AdminReportsByCategory): number {
++  return by.spam + by.off_topic + by.offensive + by.doctrine + by.other;
++}
++
++function reportItem(
++  r: Report,
++  titles: Map<string, string>,
++  users: Map<string, User>,
++) {
++  return {
++    id: r.id,
++    postId: r.postId,
++    postTitle: titles.get(r.postId) ?? null,
++    reporter: usernameOf(users.get(r.reporterId)),
++    category: r.category,
++    severity: r.severity,
++    reason: r.reason,
++    status: r.status,
++    createdAt: r.createdAt.toISOString(),
++    resolvedAt: r.resolvedAt ? r.resolvedAt.toISOString() : null,
++  };
++}
++
++function logItem(
++  e: ModerationLogEntry,
++  titles: Map<string, string>,
++  users: Map<string, User>,
++) {
++  return {
++    id: e.id,
++    action: e.action,
++    postId: e.postId,
++    postTitle: e.postId ? (titles.get(e.postId) ?? null) : null,
++    moderator: e.moderatorId ? usernameOf(users.get(e.moderatorId)) : null,
++    target: e.targetUserId ? usernameOf(users.get(e.targetUserId)) : null,
++    reason: e.reason,
++    createdAt: e.createdAt.toISOString(),
++  };
++}
++
++// ---------- Posts ----------
++
++export async function listAdminPosts(
++  db: Executor,
++  query: AdminListPostsQuery,
++): Promise<AdminResult<AdminListPostsResponse>> {
++  try {
++    const page = await adminRepo(db).listPostsPage({
++      status: query.status,
++      cursor: query.cursor,
++      limit: query.limit,
++    });
++    const [counts, users] = await Promise.all([
++      adminRepo(db).openReportsByPosts(page.items.map((p) => p.id)),
++      usersById(
++        db,
++        page.items.map((p) => p.authorId),
++      ),
++    ]);
++    return ok({
++      posts: page.items.map((p) => {
++        const by = counts.get(p.id) ?? { ...EMPTY_REPORTS_BY_CATEGORY };
++        return {
++          id: p.id,
++          category: p.category,
++          title: p.title,
++          excerpt: excerpt(p.content),
++          status: p.status,
++          author: p.authorId ? usernameOf(users.get(p.authorId)) : null,
++          reviewFlags: p.reviewFlags ?? [],
++          reportsCount: sumReports(by),
++          reportsByCategory: by,
++          createdAt: p.createdAt.toISOString(),
++        };
++      }),
++      nextCursor: page.nextCursor,
++    });
++  } catch (err) {
++    if (err instanceof InvalidCursorError) {
++      return fail({ code: "invalid_cursor", status: 400 });
++    }
++    throw err;
++  }
++}
++
++export async function getAdminPostDetail(
++  db: Executor,
++  postId: string,
++): Promise<AdminResult<AdminPostDetailResponse>> {
++  const repo = adminRepo(db);
++  const post = await repo.findPost(postId);
++  if (!post) return fail({ code: "not_found", status: 404 });
++
++  const [reportRows, logRows, counts, cards] = await Promise.all([
++    repo.reportsForPost(postId),
++    repo.logForPost(postId),
++    repo.openReportsByPosts([postId]),
++    post.gospelCardId
++      ? cardsRepo(db).findByIds([post.gospelCardId])
++      : Promise.resolve([]),
++  ]);
++  const users = await usersById(db, [
++    post.authorId,
++    ...reportRows.map((r) => r.reporterId),
++    ...logRows.map((e) => e.moderatorId),
++  ]);
++  const titles = new Map([[post.id, post.title]]);
++  const by = counts.get(postId) ?? { ...EMPTY_REPORTS_BY_CATEGORY };
++
++  return ok({
++    post: {
++      id: post.id,
++      category: post.category,
++      title: post.title,
++      content: post.content,
++      status: post.status,
++      author: post.authorId ? usernameOf(users.get(post.authorId)) : null,
++      gospelCardSlug: cards[0]?.slug ?? null,
++      reviewFlags: post.reviewFlags ?? [],
++      likesCount: post.likesCount,
++      reportsCount: sumReports(by),
++      reportsByCategory: by,
++      createdAt: post.createdAt.toISOString(),
++      publishedAt: post.publishedAt ? post.publishedAt.toISOString() : null,
++    },
++    reports: reportRows.map((r) => reportItem(r, titles, users)),
++    moderation: logRows.map((e) => logItem(e, titles, users)),
++  });
++}
++
++// ---------- Decisões ----------
++
++type Decision = "approve" | "reject";
++
++/**
++ * Decide um post em revisão. Tudo numa transacção: bloqueio da linha, mudança de estado,
++ * resolução das denúncias abertas, registo de auditoria e evento no outbox. Só se decide
++ * sobre `pending_review`: um post `hidden` (suspenso por apagamento de conta) ou já decidido
++ * dá `invalid_state`, para uma decisão não ressuscitar o que outra regra escondeu.
++ */
++async function decide(
++  db: Executor,
++  adminId: string,
++  postId: string,
++  decision: Decision,
++  text: string | undefined,
++): Promise<AdminResult<AdminModerationResponse>> {
++  return db.transaction(async (tx) => {
++    const locked = await adminRepo(tx).lockPostForDecision(postId);
++    if (!locked) return fail({ code: "not_found", status: 404 });
++    if (locked.status !== "pending_review") {
++      return fail({ code: "invalid_state", status: 409 });
++    }
++
++    const approve = decision === "approve";
++    const updated = await postsRepo(tx).setStatus(
++      postId,
++      approve ? "published" : "rejected",
++    );
++    if (!updated) return fail({ code: "not_found", status: 404 });
++
++    await reportsRepo(tx).resolveAllForPost(
++      postId,
++      approve ? "resolved_kept" : "resolved_removed",
++      adminId,
++    );
++    await moderationLogRepo(tx).create({
++      postId,
++      moderatorId: adminId,
++      action: approve ? "approved" : "rejected",
++      reason: text ?? null,
++    });
++    await outboxRepo(tx).enqueue({
++      aggregateType: "post",
++      aggregateId: postId,
++      eventType: approve ? "post.approved" : "post.rejected",
++      payload: { postId },
++    });
++
++    return ok({
++      post: {
++        id: updated.id,
++        status: updated.status,
++        publishedAt: updated.publishedAt
++          ? updated.publishedAt.toISOString()
++          : null,
++      },
++    });
++  });
++}
++
++export function approvePost(
++  db: Executor,
++  adminId: string,
++  postId: string,
++  body: { note?: string | undefined },
++): Promise<AdminResult<AdminModerationResponse>> {
++  return decide(db, adminId, postId, "approve", body.note);
++}
++
++export function rejectPost(
++  db: Executor,
++  adminId: string,
++  postId: string,
++  body: { reason: string },
++): Promise<AdminResult<AdminModerationResponse>> {
++  return decide(db, adminId, postId, "reject", body.reason);
++}
++
++// ---------- Denúncias e auditoria ----------
++
++export async function listAdminReports(
++  db: Executor,
++  query: AdminListReportsQuery,
++): Promise<AdminResult<AdminReportListResponse>> {
++  try {
++    const page = await adminRepo(db).listReportsPage({
++      status: query.status,
++      cursor: query.cursor,
++      limit: query.limit,
++    });
++    const [titles, users] = await Promise.all([
++      adminRepo(db).titlesByIds(page.items.map((r) => r.postId)),
++      usersById(
++        db,
++        page.items.map((r) => r.reporterId),
++      ),
++    ]);
++    return ok({
++      reports: page.items.map((r) => reportItem(r, titles, users)),
++      nextCursor: page.nextCursor,
++    });
++  } catch (err) {
++    if (err instanceof InvalidCursorError) {
++      return fail({ code: "invalid_cursor", status: 400 });
++    }
++    throw err;
++  }
++}
++
++export async function listAdminModerationLog(
++  db: Executor,
++  query: AdminModerationLogQuery,
++): Promise<AdminResult<AdminModerationLogResponse>> {
++  try {
++    const page = await adminRepo(db).listLogPage({
++      action: query.action,
++      postId: query.postId,
++      cursor: query.cursor,
++      limit: query.limit,
++    });
++    const [titles, users] = await Promise.all([
++      adminRepo(db).titlesByIds(
++        page.items.map((e) => e.postId).filter((id): id is string => !!id),
++      ),
++      usersById(db, [
++        ...page.items.map((e) => e.moderatorId),
++        ...page.items.map((e) => e.targetUserId),
++      ]),
++    ]);
++    return ok({
++      entries: page.items.map((e) => logItem(e, titles, users)),
++      nextCursor: page.nextCursor,
++    });
++  } catch (err) {
++    if (err instanceof InvalidCursorError) {
++      return fail({ code: "invalid_cursor", status: 400 });
++    }
++    throw err;
++  }
++}
+diff --git a/apps/api/test/auth/rate-limit.test.ts b/apps/api/test/auth/rate-limit.test.ts
+index a72cdc3..6d2b8f4 100644
+--- a/apps/api/test/auth/rate-limit.test.ts
++++ b/apps/api/test/auth/rate-limit.test.ts
+@@ -141,6 +141,8 @@ describe("rate limit — escritas por utilizador", () => {
+     ["checkLikes", "RATE_LIMIT_LIKES_MAX"],
+     ["checkReports", "RATE_LIMIT_REPORTS_MAX"],
+     ["checkSyncBatch", "RATE_LIMIT_SYNC_MAX"],
++    ["checkAdminRead", "RATE_LIMIT_ADMIN_READ_MAX"],
++    ["checkAdminWrite", "RATE_LIMIT_ADMIN_WRITE_MAX"],
+   ] as const;
+ 
+   it.each(cases)(
+diff --git a/apps/api/test/helpers/factories.ts b/apps/api/test/helpers/factories.ts
+index 9525068..d3684d2 100644
+--- a/apps/api/test/helpers/factories.ts
++++ b/apps/api/test/helpers/factories.ts
+@@ -1,5 +1,13 @@
+ import { uuidv7 } from "uuidv7";
+-import type { NewPost, NewUser, Post, User } from "../../src/db/schema.js";
++import { eq, sql } from "drizzle-orm";
++import { posts, reports } from "../../src/db/schema.js";
++import type {
++  NewPost,
++  NewUser,
++  Post,
++  Report,
++  User,
++} from "../../src/db/schema.js";
+ import { postsRepo, postLikesRepo } from "../../src/repositories/posts.js";
+ import { usersRepo } from "../../src/repositories/users.js";
+ import { createPasswordService } from "../../src/auth/password.js";
+@@ -46,6 +54,40 @@ export async function makePost(
+   });
+ }
+ 
++/**
++ * Denúncia inserida directamente (sem as regras de `reportsRepo.file`: idade da conta,
++ * limiares…). Uma denúncia aberta conta em `posts.reports_count`, como em produção.
++ */
++export async function makeReport(
++  postId: string,
++  reporterId: string,
++  overrides: Partial<
++    Pick<Report, "category" | "reason" | "status" | "createdAt">
++  > = {},
++): Promise<Report> {
++  const db = await getTestDb();
++  const category = overrides.category ?? "spam";
++  const status = overrides.status ?? "open";
++  const [row] = await db
++    .insert(reports)
++    .values({
++      postId,
++      reporterId,
++      category,
++      status,
++      reason: overrides.reason ?? (category === "other" ? "motivo" : null),
++      ...(overrides.createdAt ? { createdAt: overrides.createdAt } : {}),
++    })
++    .returning();
++  if (status === "open") {
++    await db
++      .update(posts)
++      .set({ reportsCount: sql`${posts.reportsCount} + 1` })
++      .where(eq(posts.id, postId));
++  }
++  return row!;
++}
++
+ export async function makeLike(postId: string, userId: string): Promise<void> {
+   const db = await getTestDb();
+   await postLikesRepo(db).like(postId, userId);
+diff --git a/apps/api/test/routes/admin.test.ts b/apps/api/test/routes/admin.test.ts
+new file mode 100644
+index 0000000..399e733
+--- /dev/null
++++ b/apps/api/test/routes/admin.test.ts
+@@ -0,0 +1,474 @@
++import { eq } from "drizzle-orm";
++import { Redis } from "ioredis";
++import request from "supertest";
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { encodeCursor } from "@comunidade/shared";
++import { users } from "../../src/db/schema.js";
++import { loadEnv } from "../../src/env.js";
++import { buildServer } from "../../src/server.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import {
++  makePost,
++  makeReport,
++  makeUser,
++  makeUserWithPassword,
++} from "../helpers/factories.js";
++
++const baseEnv = {
++  NODE_ENV: "test",
++  LOG_LEVEL: "fatal",
++  APP_VERSION: "test",
++} as const;
++
++type App = Awaited<ReturnType<typeof buildServer>>;
++
++let app: App;
++let redis: Redis | null = null;
++
++async function loginAs(target: App, role: "user" | "admin", username?: string) {
++  const { user, plainPassword } = await makeUserWithPassword({
++    role,
++    ...(username ? { username } : {}),
++  });
++  const res = await request(target.server)
++    .post("/auth/login")
++    .send({ username: user.username, password: plainPassword });
++  expect(res.status).toBe(200);
++  return { user, token: res.body.accessToken as string };
++}
++
++const admin = () => loginAs(app, "admin");
++const bearer = (t: string) => ({ Authorization: `Bearer ${t}` });
++
++async function clearRedis() {
++  if (!redis) return;
++  for (const pattern of ["cc:v1:feed:*", "rl:*"]) {
++    const keys = await redis.keys(pattern);
++    if (keys.length > 0) await redis.del(...keys);
++  }
++}
++
++beforeAll(async () => {
++  await getTestDb();
++  if (process.env.REDIS_URL) redis = new Redis(process.env.REDIS_URL);
++  app = await buildServer({ env: loadEnv(baseEnv) });
++  await app.ready();
++});
++afterAll(async () => {
++  await app.close();
++  await redis?.quit();
++  await closeTestDb();
++});
++beforeEach(async () => {
++  await truncateAll();
++  await clearRedis();
++});
++
++const ID = "0190a0a0-0000-7000-8000-000000000001";
++
++describe("autenticação e autorização", () => {
++  const routes = [
++    ["get", "/admin/posts"],
++    ["get", `/admin/posts/${ID}`],
++    ["post", `/admin/posts/${ID}/approve`],
++    ["post", `/admin/posts/${ID}/reject`],
++    ["get", "/admin/reports"],
++    ["get", "/admin/moderation-log"],
++  ] as const;
++
++  it.each(routes)("%s %s sem sessão → 401", async (method, path) => {
++    const res = await request(app.server)[method](path);
++    expect(res.status).toBe(401);
++  });
++
++  it("sem sessão, o 401 precede a validação (corpo e query inválidos)", async () => {
++    const bad = await request(app.server)
++      .post(`/admin/posts/${ID}/reject`)
++      .send({ reason: 1, extra: true });
++    expect(bad.status).toBe(401);
++    const query = await request(app.server).get("/admin/posts?limit=9999");
++    expect(query.status).toBe(401);
++  });
++
++  it("token inválido → 401", async () => {
++    const res = await request(app.server)
++      .get("/admin/posts")
++      .set(bearer("isto-nao-e-um-jwt"));
++    expect(res.status).toBe(401);
++  });
++
++  it.each(routes)("%s %s com utilizador comum → 403", async (method, path) => {
++    const { token } = await loginAs(app, "user");
++    const res = await request(app.server)[method](path).set(bearer(token));
++    expect(res.status).toBe(403);
++  });
++
++  it("um utilizador comum não vê a validação: 403 mesmo com corpo inválido", async () => {
++    const { token } = await loginAs(app, "user");
++    const res = await request(app.server)
++      .post(`/admin/posts/${ID}/reject`)
++      .set(bearer(token))
++      .send({ reason: 1 });
++    expect(res.status).toBe(403);
++  });
++
++  it("admin com apagamento de conta pendente → 403", async () => {
++    const a = await admin();
++    const db = await getTestDb();
++    await db
++      .update(users)
++      .set({ deletionRequestedAt: new Date() })
++      .where(eq(users.id, a.user.id));
++    const res = await request(app.server)
++      .get("/admin/posts")
++      .set(bearer(a.token));
++    expect(res.status).toBe(403);
++  });
++
++  it("despromovido depois do login → 403 no pedido seguinte (token ainda válido)", async () => {
++    const a = await admin();
++    const db = await getTestDb();
++    await db.update(users).set({ role: "user" }).where(eq(users.id, a.user.id));
++    const res = await request(app.server)
++      .get("/admin/posts")
++      .set(bearer(a.token));
++    expect(res.status).toBe(403);
++  });
++});
++
++describe("GET /admin/posts", () => {
++  it("lista a fila do mais antigo para o mais recente, sem expor identificadores de utilizador", async () => {
++    const a = await admin();
++    const author = await makeUser({ username: "autora" });
++    await makePost(author.id, {
++      status: "pending_review",
++      title: "Segundo",
++      createdAt: new Date("2026-01-02T00:00:00Z"),
++    });
++    await makePost(author.id, {
++      status: "pending_review",
++      title: "Primeiro",
++      createdAt: new Date("2026-01-01T00:00:00Z"),
++    });
++    await makePost(author.id, { status: "published", title: "Publicado" });
++
++    const res = await request(app.server)
++      .get("/admin/posts")
++      .set(bearer(a.token));
++    expect(res.status).toBe(200);
++    expect(res.body.posts.map((p: { title: string }) => p.title)).toEqual([
++      "Primeiro",
++      "Segundo",
++    ]);
++    expect(res.body.posts[0]).toMatchObject({
++      author: { username: "autora" },
++      reportsCount: 0,
++      status: "pending_review",
++    });
++    expect(JSON.stringify(res.body)).not.toContain(author.id);
++    expect(res.headers["cache-control"]).toBe("no-store");
++  });
++
++  it("pagina com nextCursor", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    for (let i = 0; i < 3; i++) {
++      await makePost(author.id, {
++        status: "pending_review",
++        createdAt: new Date(Date.UTC(2026, 0, 1, 0, i)),
++      });
++    }
++    const p1 = await request(app.server)
++      .get("/admin/posts?limit=2")
++      .set(bearer(a.token));
++    expect(p1.body.posts).toHaveLength(2);
++    expect(p1.body.nextCursor).toEqual(expect.any(String));
++    const p2 = await request(app.server)
++      .get(`/admin/posts?limit=2&cursor=${p1.body.nextCursor}`)
++      .set(bearer(a.token));
++    expect(p2.status).toBe(200);
++    expect(p2.body.posts).toHaveLength(1);
++    expect(p2.body.nextCursor).toBeNull();
++  });
++
++  it("parâmetros inválidos → 400 (limite, estado, cursor adulterado ou de outra lista)", async () => {
++    const a = await admin();
++    const otherList = encodeCursor({
++      k: "admin_log",
++      t: "2026-01-01T00:00:00.000000Z",
++      id: ID,
++    });
++    for (const qs of [
++      "limit=51",
++      "limit=0",
++      "status=inventado",
++      "cursor=%%%",
++      "cursor=YWJj",
++      `cursor=${otherList}`,
++    ]) {
++      const res = await request(app.server)
++        .get(`/admin/posts?${qs}`)
++        .set(bearer(a.token));
++      expect(res.status, qs).toBe(400);
++    }
++  });
++});
++
++describe("GET /admin/posts/:id", () => {
++  it("200 com detalhe, denúncias e decisões", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, {
++      status: "pending_review",
++      content: "Conteúdo completo",
++    });
++    await makeReport(post.id, (await makeUser({ username: "quem" })).id, {
++      category: "doctrine",
++    });
++    const res = await request(app.server)
++      .get(`/admin/posts/${post.id}`)
++      .set(bearer(a.token));
++    expect(res.status).toBe(200);
++    expect(res.body.post.content).toBe("Conteúdo completo");
++    expect(res.body.reports[0]).toMatchObject({
++      reporter: { username: "quem" },
++      category: "doctrine",
++    });
++    expect(res.body.moderation).toEqual([]);
++  });
++
++  it("inexistente → 404; id que não é UUID → 400", async () => {
++    const a = await admin();
++    const missing = await request(app.server)
++      .get(`/admin/posts/${ID}`)
++      .set(bearer(a.token));
++    expect(missing.status).toBe(404);
++    expect(missing.body).toEqual({ error: "not_found" });
++    const bad = await request(app.server)
++      .get("/admin/posts/nao-e-uuid")
++      .set(bearer(a.token));
++    expect(bad.status).toBe(400);
++  });
++});
++
++describe("POST /admin/posts/:id/approve", () => {
++  it("aprova, publica e o feed passa a mostrar o post (cache invalidada)", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, {
++      status: "pending_review",
++      title: "Para aprovar",
++    });
++
++    // Aquece a cache do feed sem o post.
++    const before = await request(app.server).get("/posts");
++    expect(before.body.posts).toHaveLength(0);
++
++    const res = await request(app.server)
++      .post(`/admin/posts/${post.id}/approve`)
++      .set(bearer(a.token))
++      .send({});
++    expect(res.status).toBe(200);
++    expect(res.body.post).toMatchObject({ id: post.id, status: "published" });
++
++    const after = await request(app.server).get("/posts");
++    expect(after.body.posts.map((p: { id: string }) => p.id)).toEqual([
++      post.id,
++    ]);
++  });
++
++  it("repetir → 409 invalid_state; nota vazia ou campo desconhecido → 400", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const url = `/admin/posts/${post.id}/approve`;
++
++    for (const body of [{ note: "   " }, { outro: 1 }]) {
++      const bad = await request(app.server)
++        .post(url)
++        .set(bearer(a.token))
++        .send(body);
++      expect(bad.status).toBe(400);
++    }
++    const ok = await request(app.server)
++      .post(url)
++      .set(bearer(a.token))
++      .send({ note: "ok" });
++    expect(ok.status).toBe(200);
++    const again = await request(app.server)
++      .post(url)
++      .set(bearer(a.token))
++      .send({});
++    expect(again.status).toBe(409);
++    expect(again.body).toEqual({ error: "invalid_state" });
++  });
++
++  it("post suspenso (hidden) → 409; inexistente → 404", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const hidden = await makePost(author.id, {
++      status: "hidden",
++      suspendedStatus: "pending_review",
++    });
++    const suspended = await request(app.server)
++      .post(`/admin/posts/${hidden.id}/approve`)
++      .set(bearer(a.token))
++      .send({});
++    expect(suspended.status).toBe(409);
++    const missing = await request(app.server)
++      .post(`/admin/posts/${ID}/approve`)
++      .set(bearer(a.token))
++      .send({});
++    expect(missing.status).toBe(404);
++  });
++});
++
++describe("POST /admin/posts/:id/reject", () => {
++  it("exige motivo de 10 a 500 caracteres", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const url = `/admin/posts/${post.id}/reject`;
++    for (const body of [
++      {},
++      { reason: "curto" },
++      { reason: "x".repeat(501) },
++      { reason: "motivo válido", extra: 1 },
++    ]) {
++      const res = await request(app.server)
++        .post(url)
++        .set(bearer(a.token))
++        .send(body);
++      expect(res.status).toBe(400);
++    }
++  });
++
++  it("rejeita e regista no log; um segundo pedido → 409", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const url = `/admin/posts/${post.id}/reject`;
++    const res = await request(app.server)
++      .post(url)
++      .set(bearer(a.token))
++      .send({ reason: "fora da doutrina" });
++    expect(res.status).toBe(200);
++    expect(res.body.post.status).toBe("rejected");
++
++    const log = await request(app.server)
++      .get("/admin/moderation-log")
++      .set(bearer(a.token));
++    expect(log.body.entries[0]).toMatchObject({
++      action: "rejected",
++      reason: "fora da doutrina",
++      moderator: { username: a.user.username },
++    });
++
++    const again = await request(app.server)
++      .post(url)
++      .set(bearer(a.token))
++      .send({ reason: "fora da doutrina" });
++    expect(again.status).toBe(409);
++  });
++});
++
++describe("GET /admin/reports e /admin/moderation-log", () => {
++  it("lista as denúncias abertas e filtra por estado", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, { title: "Título" });
++    await makeReport(post.id, (await makeUser()).id);
++    await makeReport(post.id, (await makeUser()).id, {
++      status: "resolved_removed",
++    });
++
++    const open = await request(app.server)
++      .get("/admin/reports")
++      .set(bearer(a.token));
++    expect(open.status).toBe(200);
++    expect(open.body.reports).toHaveLength(1);
++    expect(open.body.reports[0]).toMatchObject({
++      postId: post.id,
++      postTitle: "Título",
++      status: "open",
++    });
++    const removed = await request(app.server)
++      .get("/admin/reports?status=resolved_removed")
++      .set(bearer(a.token));
++    expect(removed.body.reports).toHaveLength(1);
++    const bad = await request(app.server)
++      .get("/admin/reports?status=inventado")
++      .set(bearer(a.token));
++    expect(bad.status).toBe(400);
++  });
++
++  it("registo de auditoria: filtros e cursor inválido", async () => {
++    const a = await admin();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    await request(app.server)
++      .post(`/admin/posts/${post.id}/approve`)
++      .set(bearer(a.token))
++      .send({});
++
++    const all = await request(app.server)
++      .get("/admin/moderation-log")
++      .set(bearer(a.token));
++    expect(all.status).toBe(200);
++    expect(all.body.entries).toHaveLength(1);
++    const byAction = await request(app.server)
++      .get("/admin/moderation-log?action=rejected")
++      .set(bearer(a.token));
++    expect(byAction.body.entries).toHaveLength(0);
++    const bad = await request(app.server)
++      .get("/admin/moderation-log?cursor=YWJj")
++      .set(bearer(a.token));
++    expect(bad.status).toBe(400);
++  });
++});
++
++describe("limites", () => {
++  it("decisões acima do limite → 429 com Retry-After; leituras têm balde próprio", async () => {
++    const limited = await buildServer({
++      env: loadEnv({
++        ...baseEnv,
++        RATE_LIMIT_ADMIN_WRITE_MAX: 1,
++        RATE_LIMIT_ADMIN_READ_MAX: 2,
++      }),
++    });
++    await limited.ready();
++    try {
++      const a = await loginAs(limited, "admin");
++      const author = await makeUser();
++      const p1 = await makePost(author.id, { status: "pending_review" });
++      const p2 = await makePost(author.id, { status: "pending_review" });
++
++      const first = await request(limited.server)
++        .post(`/admin/posts/${p1.id}/approve`)
++        .set(bearer(a.token))
++        .send({});
++      expect(first.status).toBe(200);
++      const second = await request(limited.server)
++        .post(`/admin/posts/${p2.id}/approve`)
++        .set(bearer(a.token))
++        .send({});
++      expect(second.status).toBe(429);
++      expect(second.body).toEqual({ error: "rate_limited" });
++      expect(Number(second.headers["retry-after"])).toBeGreaterThan(0);
++
++      // O balde de leitura é outro: continua disponível.
++      for (let i = 0; i < 2; i++) {
++        const read = await request(limited.server)
++          .get("/admin/posts")
++          .set(bearer(a.token));
++        expect(read.status).toBe(200);
++      }
++      const blocked = await request(limited.server)
++        .get("/admin/posts")
++        .set(bearer(a.token));
++      expect(blocked.status).toBe(429);
++    } finally {
++      await limited.close();
++    }
++  });
++});
+diff --git a/apps/api/test/services/admin-roles.test.ts b/apps/api/test/services/admin-roles.test.ts
+new file mode 100644
+index 0000000..3e94ade
+--- /dev/null
++++ b/apps/api/test/services/admin-roles.test.ts
+@@ -0,0 +1,222 @@
++import { and, eq, isNull } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { moderationLog, refreshTokens, users } from "../../src/db/schema.js";
++import { accountDeletionRepo } from "../../src/repositories/account-deletion.js";
++import { refreshTokensRepo } from "../../src/repositories/users.js";
++import { demoteAdmin, promoteAdmin } from "../../src/services/admin-roles.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makeUser } from "../helpers/factories.js";
++
++beforeEach(async () => {
++  await truncateAll();
++});
++afterAll(async () => {
++  await closeTestDb();
++});
++
++async function sessionFor(userId: string) {
++  const db = await getTestDb();
++  await refreshTokensRepo(db).create({
++    userId,
++    tokenHash: `hash-${crypto.randomUUID()}`,
++    familyId: crypto.randomUUID(),
++    expiresAt: new Date(Date.now() + 3_600_000),
++  });
++}
++
++async function activeSessions(userId: string): Promise<number> {
++  const db = await getTestDb();
++  const rows = await db
++    .select()
++    .from(refreshTokens)
++    .where(
++      and(eq(refreshTokens.userId, userId), isNull(refreshTokens.revokedAt)),
++    );
++  return rows.length;
++}
++
++async function roleOf(userId: string) {
++  const db = await getTestDb();
++  const [u] = await db.select().from(users).where(eq(users.id, userId));
++  return u!.role;
++}
++
++describe("promoteAdmin", () => {
++  it("promove, revoga as sessões e regista a acção do sistema", async () => {
++    const db = await getTestDb();
++    const user = await makeUser({ username: "Maria" });
++    await sessionFor(user.id);
++    await sessionFor(user.id);
++
++    // O nome é insensível a maiúsculas (citext).
++    const r = await promoteAdmin(db, "maria");
++    expect(r).toEqual({
++      ok: true,
++      data: { outcome: "promoted", userId: user.id },
++    });
++    expect(await roleOf(user.id)).toBe("admin");
++    expect(await activeSessions(user.id)).toBe(0);
++
++    const logs = await db.select().from(moderationLog);
++    expect(logs).toHaveLength(1);
++    expect(logs[0]).toMatchObject({
++      action: "admin.promoted",
++      moderatorId: null,
++      targetUserId: user.id,
++      postId: null,
++    });
++  });
++
++  it("já é admin: nada a fazer, sem sessões revogadas nem nova entrada", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    await sessionFor(admin.id);
++    const r = await promoteAdmin(db, admin.username);
++    expect(r).toEqual({
++      ok: true,
++      data: { outcome: "already_admin", userId: admin.id },
++    });
++    expect(await activeSessions(admin.id)).toBe(1);
++    expect(await db.select().from(moderationLog)).toHaveLength(0);
++  });
++
++  it("utilizador inexistente → not_found", async () => {
++    const db = await getTestDb();
++    expect(await promoteAdmin(db, "ninguem")).toEqual({
++      ok: false,
++      error: { code: "not_found" },
++    });
++  });
++
++  it("conta apagada → not_found; conta em apagamento → inactive; nada muda", async () => {
++    const db = await getTestDb();
++    const gone = await makeUser({ username: "apagada", deletedAt: new Date() });
++    const pending = await makeUser({
++      username: "pendente",
++      deletionRequestedAt: new Date(),
++    });
++    expect(await promoteAdmin(db, "apagada")).toEqual({
++      ok: false,
++      error: { code: "not_found" },
++    });
++    expect(await promoteAdmin(db, "pendente")).toEqual({
++      ok: false,
++      error: { code: "inactive" },
++    });
++    expect(await roleOf(gone.id)).toBe("user");
++    expect(await roleOf(pending.id)).toBe("user");
++    expect(await db.select().from(moderationLog)).toHaveLength(0);
++  });
++});
++
++describe("demoteAdmin", () => {
++  it("despromove quando há outro admin activo, revoga sessões e regista", async () => {
++    const db = await getTestDb();
++    const a = await makeUser({ role: "admin" });
++    await makeUser({ role: "admin" });
++    await sessionFor(a.id);
++
++    const r = await demoteAdmin(db, a.username);
++    expect(r).toEqual({
++      ok: true,
++      data: { outcome: "demoted", userId: a.id },
++    });
++    expect(await roleOf(a.id)).toBe("user");
++    expect(await activeSessions(a.id)).toBe(0);
++    const logs = await db.select().from(moderationLog);
++    expect(logs[0]).toMatchObject({
++      action: "admin.demoted",
++      moderatorId: null,
++      targetUserId: a.id,
++    });
++  });
++
++  it("recusa despromover o último admin", async () => {
++    const db = await getTestDb();
++    const only = await makeUser({ role: "admin" });
++    expect(await demoteAdmin(db, only.username)).toEqual({
++      ok: false,
++      error: { code: "last_admin" },
++    });
++    expect(await roleOf(only.id)).toBe("admin");
++    expect(await db.select().from(moderationLog)).toHaveLength(0);
++  });
++
++  it("outro admin em apagamento ou apagado não conta como activo", async () => {
++    const db = await getTestDb();
++    const only = await makeUser({ role: "admin" });
++    await makeUser({ role: "admin", deletionRequestedAt: new Date() });
++    await makeUser({ role: "admin", deletedAt: new Date() });
++    expect(await demoteAdmin(db, only.username)).toEqual({
++      ok: false,
++      error: { code: "last_admin" },
++    });
++  });
++
++  it("um admin em apagamento pode ser despromovido (já não é activo)", async () => {
++    const db = await getTestDb();
++    await makeUser({ role: "admin" });
++    const leaving = await makeUser({
++      role: "admin",
++      deletionRequestedAt: new Date(),
++    });
++    const r = await demoteAdmin(db, leaving.username);
++    expect(r.ok && r.data.outcome).toBe("demoted");
++  });
++
++  it("não é admin → already_user, sem efeitos", async () => {
++    const db = await getTestDb();
++    const user = await makeUser();
++    await makeUser({ role: "admin" });
++    expect(await demoteAdmin(db, user.username)).toEqual({
++      ok: true,
++      data: { outcome: "already_user", userId: user.id },
++    });
++    expect(await db.select().from(moderationLog)).toHaveLength(0);
++  });
++
++  it("inexistente → not_found", async () => {
++    const db = await getTestDb();
++    expect(await demoteAdmin(db, "ninguem")).toEqual({
++      ok: false,
++      error: { code: "not_found" },
++    });
++  });
++});
++
++describe("concorrência sobre o conjunto de admins", () => {
++  it("dois admins despromovidos em simultâneo: um passa, o outro fica como último", async () => {
++    const db = await getTestDb();
++    const a = await makeUser({ role: "admin" });
++    const b = await makeUser({ role: "admin" });
++    const results = await Promise.all([
++      demoteAdmin(db, a.username),
++      demoteAdmin(db, b.username),
++    ]);
++    expect(results.filter((r) => r.ok)).toHaveLength(1);
++    expect(results.filter((r) => !r.ok)).toEqual([
++      { ok: false, error: { code: "last_admin" } },
++    ]);
++    const roles = [await roleOf(a.id), await roleOf(b.id)];
++    expect(roles.filter((r) => r === "admin")).toHaveLength(1);
++  });
++
++  it("despromoção de um admin e pedido de apagamento do outro: nunca ficam zero admins", async () => {
++    const db = await getTestDb();
++    const a = await makeUser({ role: "admin" });
++    const b = await makeUser({ role: "admin" });
++    const [demote, deletion] = await Promise.all([
++      demoteAdmin(db, a.username),
++      accountDeletionRepo(db).request({ userId: b.id, postsMode: "anonymize" }),
++    ]);
++    const demoted = demote.ok;
++    const deleted = deletion.outcome === "requested";
++    expect(demoted && deleted).toBe(false);
++
++    const rows = await db.select().from(users);
++    const active = rows.filter(
++      (u) => u.role === "admin" && !u.deletionRequestedAt && !u.deletedAt,
++    );
++    expect(active.length).toBeGreaterThanOrEqual(1);
++  });
++});
+diff --git a/apps/api/test/services/admin.test.ts b/apps/api/test/services/admin.test.ts
+new file mode 100644
+index 0000000..373ec26
+--- /dev/null
++++ b/apps/api/test/services/admin.test.ts
+@@ -0,0 +1,511 @@
++import { eq } from "drizzle-orm";
++import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import { encodeCursor } from "@comunidade/shared";
++import { outbox, posts, reports } from "../../src/db/schema.js";
++import { postsRepo } from "../../src/repositories/posts.js";
++import { moderationLogRepo } from "../../src/repositories/reports.js";
++import {
++  approvePost,
++  getAdminPostDetail,
++  listAdminModerationLog,
++  listAdminPosts,
++  listAdminReports,
++  rejectPost,
++} from "../../src/services/admin.js";
++import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
++import { makePost, makeReport, makeUser } from "../helpers/factories.js";
++
++beforeEach(async () => {
++  await truncateAll();
++});
++afterAll(async () => {
++  await closeTestDb();
++});
++
++const at = (minutes: number) => new Date(Date.UTC(2026, 0, 1, 0, minutes));
++const query = { status: "pending_review" as const, limit: 10 };
++
++describe("listAdminPosts", () => {
++  it("devolve só os pending_review, do mais antigo para o mais recente, sem apagados", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    await makePost(author.id, { status: "published", title: "Publicado" });
++    await makePost(author.id, {
++      status: "pending_review",
++      title: "Segundo",
++      createdAt: at(2),
++    });
++    await makePost(author.id, {
++      status: "pending_review",
++      title: "Primeiro",
++      createdAt: at(1),
++    });
++    await makePost(author.id, {
++      status: "pending_review",
++      title: "Apagado",
++      createdAt: at(3),
++      deletedAt: new Date(),
++    });
++
++    const r = await listAdminPosts(db, query);
++    expect(r.ok).toBe(true);
++    if (!r.ok) return;
++    expect(r.data.posts.map((p) => p.title)).toEqual(["Primeiro", "Segundo"]);
++    expect(r.data.nextCursor).toBeNull();
++  });
++
++  it("os outros estados vêm do mais recente", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    await makePost(author.id, {
++      status: "rejected",
++      title: "A",
++      createdAt: at(1),
++    });
++    await makePost(author.id, {
++      status: "rejected",
++      title: "B",
++      createdAt: at(2),
++    });
++    const r = await listAdminPosts(db, { status: "rejected", limit: 10 });
++    expect(r.ok && r.data.posts.map((p) => p.title)).toEqual(["B", "A"]);
++  });
++
++  it("pagina com cursor composto, sem repetir nem saltar (inclui empate no instante)", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const ids: string[] = [];
++    for (let i = 0; i < 5; i++) {
++      // Os dois primeiros partilham o mesmo instante: o desempate é pelo id.
++      const p = await makePost(author.id, {
++        status: "pending_review",
++        title: `P${i}`,
++        createdAt: at(i < 2 ? 1 : i),
++      });
++      ids.push(p.id);
++    }
++
++    const seen: string[] = [];
++    let cursor: string | undefined;
++    for (let page = 0; page < 5; page++) {
++      const r = await listAdminPosts(db, {
++        status: "pending_review",
++        limit: 2,
++        cursor,
++      });
++      if (!r.ok) throw new Error("falhou");
++      seen.push(...r.data.posts.map((p) => p.id));
++      if (r.data.nextCursor === null) break;
++      cursor = r.data.nextCursor;
++    }
++    expect(seen).toHaveLength(5);
++    expect(new Set(seen)).toEqual(new Set(ids));
++  });
++
++  it("denúncias abertas por categoria; as tratadas não contam", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    await makeReport(post.id, (await makeUser()).id, { category: "spam" });
++    await makeReport(post.id, (await makeUser()).id, { category: "spam" });
++    await makeReport(post.id, (await makeUser()).id, { category: "doctrine" });
++    await makeReport(post.id, (await makeUser()).id, {
++      category: "offensive",
++      status: "resolved_kept",
++    });
++
++    const r = await listAdminPosts(db, query);
++    if (!r.ok) throw new Error("falhou");
++    const item = r.data.posts[0]!;
++    expect(item.reportsCount).toBe(3);
++    expect(item.reportsByCategory).toEqual({
++      spam: 2,
++      off_topic: 0,
++      offensive: 0,
++      doctrine: 1,
++      other: 0,
++    });
++  });
++
++  it("excerto cortado sem partir emojis; autor removido → null", async () => {
++    const db = await getTestDb();
++    const author = await makeUser({ username: "autor" });
++    await makePost(author.id, {
++      status: "pending_review",
++      content: "😀".repeat(300),
++      createdAt: at(1),
++    });
++    const orphan = await makePost(author.id, {
++      status: "pending_review",
++      createdAt: at(2),
++    });
++    await db
++      .update(posts)
++      .set({ authorId: null })
++      .where(eq(posts.id, orphan.id));
++
++    const r = await listAdminPosts(db, query);
++    if (!r.ok) throw new Error("falhou");
++    const [long, anon] = r.data.posts;
++    expect(Array.from(long!.excerpt)).toHaveLength(201); // 200 + «…»
++    expect(long!.excerpt.endsWith("…")).toBe(true);
++    expect(long!.author).toEqual({ username: "autor" });
++    expect(anon!.author).toBeNull();
++  });
++
++  it("cursor de outra lista → invalid_cursor (400)", async () => {
++    const db = await getTestDb();
++    const cursor = encodeCursor({
++      k: "admin_log",
++      t: "2026-01-01T00:00:00.000000Z",
++      id: "0190a0a0-0000-7000-8000-000000000001",
++    });
++    const r = await listAdminPosts(db, { ...query, cursor });
++    expect(r).toEqual({
++      ok: false,
++      error: { code: "invalid_cursor", status: 400 },
++    });
++  });
++});
++
++describe("getAdminPostDetail", () => {
++  it("devolve conteúdo completo, denúncias com username e decisões anteriores", async () => {
++    const db = await getTestDb();
++    const author = await makeUser({ username: "autor" });
++    const reporter = await makeUser({ username: "denunciante" });
++    const admin = await makeUser({ username: "moderadora", role: "admin" });
++    const post = await makePost(author.id, {
++      status: "pending_review",
++      content: "x".repeat(900),
++      reviewFlags: ["reports_high"],
++    });
++    await makeReport(post.id, reporter.id, {
++      category: "doctrine",
++      reason: "motivo",
++    });
++    await moderationLogRepo(db).create({
++      postId: post.id,
++      moderatorId: admin.id,
++      action: "rejected",
++      reason: "decisão anterior",
++    });
++
++    const r = await getAdminPostDetail(db, post.id);
++    if (!r.ok) throw new Error("falhou");
++    expect(r.data.post.content).toHaveLength(900);
++    expect(r.data.post.reviewFlags).toEqual(["reports_high"]);
++    expect(r.data.post.author).toEqual({ username: "autor" });
++    expect(r.data.post.reportsByCategory.doctrine).toBe(1);
++    expect(r.data.reports).toHaveLength(1);
++    expect(r.data.reports[0]).toMatchObject({
++      reporter: { username: "denunciante" },
++      category: "doctrine",
++      severity: "high",
++      status: "open",
++    });
++    expect(r.data.moderation[0]).toMatchObject({
++      action: "rejected",
++      moderator: { username: "moderadora" },
++      reason: "decisão anterior",
++    });
++    // Nenhum identificador interno de utilizador sai.
++    expect(JSON.stringify(r.data)).not.toContain(author.id);
++    expect(JSON.stringify(r.data)).not.toContain(reporter.id);
++  });
++
++  it("inexistente ou apagado → not_found", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const deleted = await makePost(author.id, { deletedAt: new Date() });
++    for (const id of [crypto.randomUUID(), deleted.id]) {
++      const r = await getAdminPostDetail(db, id);
++      expect(r).toEqual({
++        ok: false,
++        error: { code: "not_found", status: 404 },
++      });
++    }
++  });
++});
++
++describe("approvePost", () => {
++  it("publica, resolve as denúncias, regista a decisão e cria o evento", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const reporter = await makeUser();
++    const report = await makeReport(post.id, reporter.id);
++
++    const r = await approvePost(db, admin.id, post.id, { note: "tudo bem" });
++    expect(r.ok).toBe(true);
++    if (!r.ok) return;
++    expect(r.data.post.status).toBe("published");
++    expect(r.data.post.publishedAt).not.toBeNull();
++
++    const after = await postsRepo(db).findById(post.id);
++    expect(after!.status).toBe("published");
++    expect(after!.reportsCount).toBe(0);
++
++    const [rep] = await db
++      .select()
++      .from(reports)
++      .where(eq(reports.id, report.id));
++    expect(rep).toMatchObject({
++      status: "resolved_kept",
++      resolvedBy: admin.id,
++    });
++
++    const logs = await moderationLogRepo(db).listByPost(post.id);
++    expect(logs).toHaveLength(1);
++    expect(logs[0]).toMatchObject({
++      action: "approved",
++      moderatorId: admin.id,
++      reason: "tudo bem",
++    });
++
++    const events = await db.select().from(outbox);
++    expect(events.map((e) => e.eventType)).toEqual(["post.approved"]);
++    expect(events[0]!.aggregateId).toBe(post.id);
++  });
++
++  it("só a partir de pending_review: published, rejected e hidden → invalid_state, sem efeitos", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const suspended = await makePost(author.id, {
++      status: "hidden",
++      suspendedStatus: "pending_review",
++    });
++    const others = await Promise.all([
++      makePost(author.id, { status: "published" }),
++      makePost(author.id, { status: "rejected" }),
++    ]);
++    for (const p of [suspended, ...others]) {
++      const r = await approvePost(db, admin.id, p.id, {});
++      expect(r).toEqual({
++        ok: false,
++        error: { code: "invalid_state", status: 409 },
++      });
++    }
++    // Um post suspenso por apagamento de conta continua suspenso.
++    expect((await postsRepo(db).findById(suspended.id))!.status).toBe("hidden");
++    expect(await moderationLogRepo(db).listRecent()).toHaveLength(0);
++    expect(await db.select().from(outbox)).toHaveLength(0);
++  });
++
++  it("inexistente ou apagado → not_found", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const deleted = await makePost(author.id, {
++      status: "pending_review",
++      deletedAt: new Date(),
++    });
++    for (const id of [crypto.randomUUID(), deleted.id]) {
++      const r = await approvePost(db, admin.id, id, {});
++      expect(r).toEqual({
++        ok: false,
++        error: { code: "not_found", status: 404 },
++      });
++    }
++  });
++
++  it("dois admins a aprovar o mesmo post: um vence, o outro recebe 409, uma só entrada de auditoria", async () => {
++    const db = await getTestDb();
++    const a1 = await makeUser({ role: "admin" });
++    const a2 = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++
++    const [r1, r2] = await Promise.all([
++      approvePost(db, a1.id, post.id, {}),
++      approvePost(db, a2.id, post.id, {}),
++    ]);
++    const results = [r1, r2];
++    expect(results.filter((r) => r.ok)).toHaveLength(1);
++    const lost = results.find((r) => !r.ok);
++    expect(lost).toEqual({
++      ok: false,
++      error: { code: "invalid_state", status: 409 },
++    });
++    expect(await moderationLogRepo(db).listByPost(post.id)).toHaveLength(1);
++    expect(await db.select().from(outbox)).toHaveLength(1);
++  });
++
++  it("aprovar e rejeitar em simultâneo: só uma decisão fica", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const results = await Promise.all([
++      approvePost(db, admin.id, post.id, {}),
++      rejectPost(db, admin.id, post.id, { reason: "fora da doutrina" }),
++    ]);
++    expect(results.filter((r) => r.ok)).toHaveLength(1);
++    expect(await moderationLogRepo(db).listByPost(post.id)).toHaveLength(1);
++  });
++});
++
++describe("rejectPost", () => {
++  it("rejeita, resolve as denúncias como removidas e guarda o motivo", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "pending_review" });
++    const report = await makeReport(post.id, (await makeUser()).id, {
++      category: "offensive",
++    });
++
++    const r = await rejectPost(db, admin.id, post.id, {
++      reason: "fora da doutrina",
++    });
++    expect(r.ok && r.data.post.status).toBe("rejected");
++
++    const [rep] = await db
++      .select()
++      .from(reports)
++      .where(eq(reports.id, report.id));
++    expect(rep!.status).toBe("resolved_removed");
++    const logs = await moderationLogRepo(db).listByPost(post.id);
++    expect(logs[0]).toMatchObject({
++      action: "rejected",
++      reason: "fora da doutrina",
++    });
++    const events = await db.select().from(outbox);
++    expect(events.map((e) => e.eventType)).toEqual(["post.rejected"]);
++  });
++
++  it("já rejeitado → invalid_state", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { status: "rejected" });
++    const r = await rejectPost(db, admin.id, post.id, {
++      reason: "x".repeat(20),
++    });
++    expect(r).toEqual({
++      ok: false,
++      error: { code: "invalid_state", status: 409 },
++    });
++  });
++});
++
++describe("listAdminReports", () => {
++  it("filtra por estado, das mais recentes, com título e username", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const reporter = await makeUser({ username: "denunciante" });
++    const post = await makePost(author.id, { title: "Título" });
++    await makeReport(post.id, reporter.id, { createdAt: at(1) });
++    await makeReport(post.id, (await makeUser()).id, { createdAt: at(2) });
++    await makeReport(post.id, (await makeUser()).id, {
++      status: "resolved_kept",
++      createdAt: at(3),
++    });
++
++    const open = await listAdminReports(db, { status: "open", limit: 10 });
++    if (!open.ok) throw new Error("falhou");
++    expect(open.data.reports).toHaveLength(2);
++    expect(open.data.reports[1]).toMatchObject({
++      postTitle: "Título",
++      reporter: { username: "denunciante" },
++    });
++    expect(
++      new Date(open.data.reports[0]!.createdAt) >
++        new Date(open.data.reports[1]!.createdAt),
++    ).toBe(true);
++
++    const kept = await listAdminReports(db, {
++      status: "resolved_kept",
++      limit: 10,
++    });
++    expect(kept.ok && kept.data.reports).toHaveLength(1);
++  });
++
++  it("pagina sem repetir", async () => {
++    const db = await getTestDb();
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    for (let i = 0; i < 5; i++) {
++      await makeReport(post.id, (await makeUser()).id, { createdAt: at(i) });
++    }
++    const p1 = await listAdminReports(db, { status: "open", limit: 3 });
++    if (!p1.ok) throw new Error("falhou");
++    expect(p1.data.nextCursor).not.toBeNull();
++    const p2 = await listAdminReports(db, {
++      status: "open",
++      limit: 3,
++      cursor: p1.data.nextCursor!,
++    });
++    if (!p2.ok) throw new Error("falhou");
++    const ids = [...p1.data.reports, ...p2.data.reports].map((r) => r.id);
++    expect(new Set(ids).size).toBe(5);
++    expect(p2.data.nextCursor).toBeNull();
++  });
++});
++
++describe("listAdminModerationLog", () => {
++  it("mostra moderador, alvo e título; filtra por acção e por post", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ username: "moderadora", role: "admin" });
++    const target = await makeUser({ username: "alvo" });
++    const author = await makeUser();
++    const post = await makePost(author.id, { title: "Título" });
++    const log = moderationLogRepo(db);
++    await log.create({
++      postId: post.id,
++      moderatorId: admin.id,
++      action: "approved",
++    });
++    await log.create({
++      moderatorId: null,
++      targetUserId: target.id,
++      action: "admin.promoted",
++    });
++
++    const all = await listAdminModerationLog(db, { limit: 10 });
++    if (!all.ok) throw new Error("falhou");
++    expect(all.data.entries).toHaveLength(2);
++    const promoted = all.data.entries.find(
++      (e) => e.action === "admin.promoted",
++    )!;
++    expect(promoted).toMatchObject({
++      moderator: null,
++      target: { username: "alvo" },
++    });
++    const approved = all.data.entries.find((e) => e.action === "approved")!;
++    expect(approved).toMatchObject({
++      moderator: { username: "moderadora" },
++      postTitle: "Título",
++    });
++
++    const onlyPromoted = await listAdminModerationLog(db, {
++      action: "admin.promoted",
++      limit: 10,
++    });
++    expect(onlyPromoted.ok && onlyPromoted.data.entries).toHaveLength(1);
++    const onlyPost = await listAdminModerationLog(db, {
++      postId: post.id,
++      limit: 10,
++    });
++    expect(onlyPost.ok && onlyPost.data.entries).toHaveLength(1);
++  });
++
++  it("a entrada sobrevive ao fim do post e do moderador (SET NULL)", async () => {
++    const db = await getTestDb();
++    const admin = await makeUser({ role: "admin" });
++    const author = await makeUser();
++    const post = await makePost(author.id);
++    await moderationLogRepo(db).create({
++      postId: post.id,
++      moderatorId: admin.id,
++      action: "approved",
++    });
++    await db.delete(posts).where(eq(posts.id, post.id));
++
++    const r = await listAdminModerationLog(db, { limit: 10 });
++    if (!r.ok) throw new Error("falhou");
++    expect(r.data.entries).toHaveLength(1);
++    expect(r.data.entries[0]).toMatchObject({ postId: null, postTitle: null });
++  });
++});
+diff --git a/apps/api/tsconfig.json b/apps/api/tsconfig.json
+index 665bbbd..c0086dc 100644
+--- a/apps/api/tsconfig.json
++++ b/apps/api/tsconfig.json
+@@ -7,5 +7,11 @@
+     "types": ["node"],
+     "noEmit": true
+   },
+-  "include": ["src/**/*", "test/**/*", "tsup.config.ts", "vitest.config.ts"]
++  "include": [
++    "src/**/*",
++    "test/**/*",
++    "scripts/**/*",
++    "tsup.config.ts",
++    "vitest.config.ts"
++  ]
+ }
+diff --git a/docs/Arquitectura/adr/ADR-015.md b/docs/Arquitectura/adr/ADR-015.md
+index 8aa0fca..f925a13 100644
+--- a/docs/Arquitectura/adr/ADR-015.md
++++ b/docs/Arquitectura/adr/ADR-015.md
+@@ -76,7 +76,7 @@ Backend sob `/admin/*`, com `requireAuth` + `requireAdmin`, ambos em `preValidat
+ Regras:
+ 
+ - **Só se decide sobre `pending_review`.** Um post `hidden` (suspenso por apagamento de conta, ADR-012) não é «aprovável»: ressuscitá-lo contornaria a suspensão. Outro estado dá `409 invalid_state`.
+-- Decidir um post é **uma transacção**: bloqueio da linha (`FOR UPDATE`), mudança de estado, resolução das denúncias abertas (`resolved_kept` ao aprovar, `resolved_removed` ao rejeitar), entrada no registo de auditoria e evento no outbox (`post.approved` / `post.rejected`). Depois do commit invalida-se a cache do feed.
++- Decidir um post é **uma transacção**: bloqueio da linha (`FOR UPDATE`), mudança de estado, resolução das denúncias abertas (`resolved_kept` ao aprovar, `resolved_removed` ao rejeitar), entrada no registo de auditoria e evento no outbox (`post.approved` / `post.rejected`). Ao **aprovar**, depois do commit, invalida-se a cache do feed (a rejeição não toca no feed público: um post em revisão nunca lá esteve).
+ - Dois admins a decidir o mesmo post em simultâneo: o segundo vê o estado já mudado e recebe `409`.
+ - As listagens usam **cursores compostos opacos**, um tipo por lista (`admin_posts`, `admin_reports`, `admin_log`); um cursor inválido ou de outra lista é `400`.
+ - Autores, denunciantes e moderadores saem pelo `username` (`null` = removido), nunca por identificador.

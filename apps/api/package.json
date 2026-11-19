@@ -17,7 +17,9 @@
     "db:migrate": "tsx src/db/run-migrations.ts",
     "db:seed": "tsx src/db/seed.ts",
     "db:studio": "drizzle-kit studio",
-    "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts"
+    "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts",
+    "admin:promote": "tsx scripts/admin-promote.ts",
+    "admin:demote": "tsx scripts/admin-demote.ts"
   },
   "dependencies": {
     "@comunidade/shared": "workspace:*",
