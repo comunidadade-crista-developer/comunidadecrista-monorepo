@@ -43,6 +43,11 @@ campo `isMine` diz se a partilha é do utilizador que pede.
 | Pedidos `/sync`              | 60 por hora (e cada operação paga o limite do seu tipo) |
 | Painel admin: leituras       | 120 por 60 s, por administrador                         |
 | Painel admin: decisões       | 30 por 60 s, por administrador                          |
+| Global (todas as rotas)      | 300 por 60 s, por IP (`RATE_LIMIT_GLOBAL_*`)            |
+
+**Pedidos**: corpo máximo 512 KiB (`BODY_LIMIT_BYTES`; acima → `413 payload_too_large`) e 30 s para
+receber o pedido completo (`REQUEST_TIMEOUT_MS`). O CORS não usa credenciais: a autenticação é por
+`Authorization: Bearer`, nunca por cookies.
 
 ## Health
 
@@ -58,7 +63,7 @@ Leve. Não toca em base de dados nem Redis. Usado por cron-job.org.
 
 ### GET /health/deep
 
-Toca em Postgres e Redis. Uso em CI e monitorização manual.
+Toca em Postgres (pelo pool da aplicação, `SELECT 1`) e Redis, cada um com limite de 2 s. Uso em CI e monitorização manual. Limite próprio: 30 pedidos por minuto por IP (`429` acima).
 
 _**200**_
 

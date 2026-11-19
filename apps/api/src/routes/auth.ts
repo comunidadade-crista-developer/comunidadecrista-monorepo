@@ -101,7 +101,8 @@ export async function authRoutes(
         if (isUniqueViolation(err)) {
           return reply.code(409).send({ error: "username_taken" });
         }
-        request.log.error({ err }, "register: unexpected insert error");
+        // O errorHandler regista só o tipo do erro: o `err` completo traz a query e os
+        // parâmetros (hashes da palavra-passe, das respostas e do código de recuperação).
         throw err;
       }
 

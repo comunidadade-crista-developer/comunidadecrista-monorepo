@@ -27,3 +27,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 | E4-c  | [Rotas, cache do feed e /sync](E4c-rotas-cache-sync.md)                 | Feito  |
 | E4-d  | [Documentação: ADRs, arquitectura, API](E4d-documentacao.md)            | Feito  |
 | E5+E6 | [`/sync`, worker e administração (ADR-015)](E5-E6-sync-worker-admin.md) | Feito  |
+| RB-a  | [Endurecimento do backend](RB-a-hardening.md)                           | Feito  |

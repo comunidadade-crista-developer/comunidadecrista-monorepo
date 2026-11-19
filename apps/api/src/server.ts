@@ -103,6 +103,8 @@ export async function buildServer({
           : {}),
     },
     trustProxy,
+    bodyLimit: env.BODY_LIMIT_BYTES,
+    requestTimeout: env.REQUEST_TIMEOUT_MS,
   }).withTypeProvider<ZodTypeProvider>();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
@@ -128,11 +130,11 @@ export async function buildServer({
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
     origin: env.CORS_ORIGIN.split(",").map((s) => s.trim()),
-    credentials: true,
+    // Sem `credentials`: a autenticação é por Authorization: Bearer, não por cookies.
   });
   await app.register(rateLimit, {
-    max: 100,
-    timeWindow: "1 minute",
+    max: env.RATE_LIMIT_GLOBAL_MAX,
+    timeWindow: env.RATE_LIMIT_GLOBAL_WINDOW_S * 1000,
     keyGenerator: (request) => request.clientIp,
     // Um Error é lançado e passa pelo errorHandler (formato único `{ error: "rate_limited" }`).
     errorResponseBuilder: (_request, context) =>
@@ -140,6 +142,18 @@ export async function buildServer({
         statusCode: context.statusCode,
       }),
   });
+
+  if (
+    env.NODE_ENV === "production" &&
+    env.EDGE_MODE === "none" &&
+    !env.TRUST_PROXY
+  ) {
+    // Atrás de um proxy sem TRUST_PROXY todos os utilizadores partilham o IP do proxy e os
+    // limites por IP (registo, login) bloqueiam toda a gente de uma vez.
+    app.log.warn(
+      "Produção com EDGE_MODE=none e TRUST_PROXY=false: se a API está atrás de um proxy, todos os clientes partilham o mesmo IP.",
+    );
+  }
 
   const redis = createRedis(env.REDIS_URL);
   if (redis) attachRedisErrorLogging(redis, app.log);
@@ -173,7 +187,11 @@ export async function buildServer({
   const jwt = await createJwtService(env);
   const limiters = createRateLimiters(redis, env, app.log);
 
-  await app.register(healthRoutes, { env, redis });
+  await app.register(healthRoutes, {
+    env,
+    redis,
+    pool: dbBundle?.pool ?? null,
+  });
 
   if (dbBundle) {
     await app.register(authRoutes, {

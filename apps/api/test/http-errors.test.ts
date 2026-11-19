@@ -129,6 +129,20 @@ describe("errorHandler", () => {
     expect(logged[0]!.obj.route).toBe("/posts/:id");
   });
 
+  it("5xx: o código do Postgres em `cause` (DrizzleQueryError) vai para o log, sem parâmetros", () => {
+    const { reply } = fakeReply();
+    const { request, logged } = fakeRequest();
+    const err = Object.assign(new Error("Failed query: params HASH-SECRETO"), {
+      params: ["HASH-SECRETO"],
+      cause: Object.assign(new Error("dup"), { code: "23505" }),
+    });
+
+    errorHandler(err, request as never, reply as never);
+
+    expect(logged[0]!.obj.errorCode).toBe("23505");
+    expect(JSON.stringify(logged[0])).not.toContain("HASH-SECRETO");
+  });
+
   it("503 → service_unavailable", () => {
     const { reply, out } = fakeReply();
     errorHandler(

@@ -106,6 +106,11 @@ nunca `request.ip` nem `X-Forwarded-For`.
 | Produção com Cloudflare à frente (recomendado) | `EDGE_MODE=cloudflare`, `CF_ORIGIN_SECRET`, `IP_HASH_SECRET`; `TRUST_PROXY` desligado |
 | Outro proxy (VPS, Fly) sem Cloudflare          | `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=<n>`                          |
 
+Em produção a API **recusa arrancar** sem `DATABASE_URL`, `REDIS_URL`, `IP_HASH_SECRET`,
+`JWT_PRIVATE_JWK` e `JWT_PUBLIC_JWK`, e com `ARGON2_MEMORY_KB` < 19456 ou `ARGON2_TIME_COST` < 2.
+Com `EDGE_MODE=none` e `TRUST_PROXY=false` em produção, a API avisa no arranque: atrás de um proxy
+todos os clientes partilhariam o IP do proxy e os limites por IP bloqueariam toda a gente.
+
 A cadeia de proxies do Render não está documentada (o número de saltos pode mudar), por isso a
 detecção automática de `RENDER=true` foi removida. Com Cloudflare, o IP vem de
 `CF-Connecting-IP`, aceite **só** se o pedido trouxer o segredo `X-Origin-Auth`.

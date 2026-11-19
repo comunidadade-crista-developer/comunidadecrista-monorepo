@@ -3,7 +3,7 @@ import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import { Writable } from "node:stream";
 import request from "supertest";
 import { afterAll, describe, expect, it } from "vitest";
-import { loadEnv } from "../../src/env.js";
+import { loadEnv, type Env } from "../../src/env.js";
 import { buildServer } from "../../src/server.js";
 import { closeTestDb } from "../helpers/db.js";
 
@@ -12,7 +12,10 @@ afterAll(async () => {
 });
 
 // O .env local também é lido: fixar o que interessa a estes testes.
-async function makeApp(logStream?: NodeJS.WritableStream) {
+async function makeApp(
+  logStream?: NodeJS.WritableStream,
+  overrides: Partial<Env> = {},
+) {
   const env = loadEnv({
     NODE_ENV: "test",
     LOG_LEVEL: "error",
@@ -21,6 +24,7 @@ async function makeApp(logStream?: NodeJS.WritableStream) {
     CF_ORIGIN_SECRET: undefined,
     CF_ORIGIN_SECRET_PREVIOUS: undefined,
     IP_HASH_SECRET: "segredo-hmac-do-rate-limit-com-32-caracteres",
+    ...overrides,
   });
   const app = await buildServer({ env, ...(logStream ? { logStream } : {}) });
   app.get("/__test__/boom", async () => {
@@ -160,10 +164,12 @@ describe("formato único de erro", () => {
   });
 
   it("rate limit global → 429 { error: rate_limited } com Retry-After", async () => {
-    const app = await makeApp();
+    // Limite fixado aqui: o teste não depende do valor por omissão (300/min).
+    const max = 20;
+    const app = await makeApp(undefined, { RATE_LIMIT_GLOBAL_MAX: max });
     try {
       let last = await request(app.server).get("/health");
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < max; i++) {
         last = await request(app.server).get("/health");
       }
       expect(last.status).toBe(429);

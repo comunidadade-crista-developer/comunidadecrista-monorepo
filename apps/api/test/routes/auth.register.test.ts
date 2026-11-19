@@ -50,6 +50,20 @@ describe("POST /auth/register", () => {
     expect(res.body.recoveryCodeWarning).toContain("Guarda");
   });
 
+  it("dois registos em simultâneo com o mesmo username → um 201 e um 409 (nunca 500)", async () => {
+    const results = await Promise.all(
+      [1, 2].map(() =>
+        request(app.server)
+          .post("/auth/register")
+          .send(validBody({ username: "corrida" })),
+      ),
+    );
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([201, 409]);
+    const conflict = results.find((r) => r.status === 409)!;
+    expect(conflict.body.error).toBe("username_taken");
+  });
+
   it("username duplicado → 409 (case-insensitive)", async () => {
     await request(app.server)
       .post("/auth/register")

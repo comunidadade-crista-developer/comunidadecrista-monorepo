@@ -1,5 +1,6 @@
 import { buildServer } from "./server.js";
 import { loadEnv } from "./env.js";
+import { safeErrorFields } from "./errors.js";
 
 const env = loadEnv();
 
@@ -23,7 +24,7 @@ const shutdown = async (signal: string, exitCode = 0) => {
     await app.close();
     process.exit(exitCode);
   } catch (err) {
-    app.log.error({ err }, "error during shutdown");
+    app.log.error(safeErrorFields(err), "error during shutdown");
     process.exit(1);
   }
 };
@@ -35,10 +36,7 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 // fecha com cuidado e sai com erro para o supervisor reiniciar.
 for (const event of ["unhandledRejection", "uncaughtException"] as const) {
   process.on(event, (reason: unknown) => {
-    app.log.fatal(
-      { errorName: reason instanceof Error ? reason.name : typeof reason },
-      event,
-    );
+    app.log.fatal(safeErrorFields(reason), event);
     void shutdown(event, 1);
   });
 }
@@ -47,6 +45,6 @@ try {
   await app.listen({ port: env.PORT, host: env.HOST });
   app.log.info({ port: env.PORT, env: env.NODE_ENV }, "server listening");
 } catch (err) {
-  app.log.error({ err }, "failed to start");
+  app.log.error(safeErrorFields(err), "failed to start");
   process.exit(1);
 }
