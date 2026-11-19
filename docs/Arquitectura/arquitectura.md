@@ -122,6 +122,7 @@ Cada decisão tem o seu ficheiro em [`adr/`](adr/README.md) (um ADR por ficheiro
 | [ADR-012](adr/ADR-012.md) | Apagamento de conta: período de graça de 30 dias            |
 | [ADR-013](adr/ADR-013.md) | Filtro anti-spam no conteúdo                                |
 | [ADR-014](adr/ADR-014.md) | Severidade de denúncias    
+| [ADR-015](adr/ADR-015.md) | Admin: criação e promoção só por CLI, mesmo login           |
 
 ## 5. Modelo de dados
 

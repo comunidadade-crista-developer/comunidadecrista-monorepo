@@ -77,6 +77,8 @@ export const reportSeverityEnum = pgEnum("report_severity", [
 export const moderationActionEnum = pgEnum("moderation_action", [
   "approved",
   "rejected",
+  "admin.promoted",
+  "admin.demoted",
 ]);
 export const outboxStatusEnum = pgEnum("outbox_status", [
   "pending",
@@ -263,6 +265,7 @@ export const reports = pgTable(
     uniqueIndex("reports_post_reporter_unique").on(t.postId, t.reporterId),
     index("reports_post_status_idx").on(t.postId, t.status),
     index("reports_reporter_status_idx").on(t.reporterId, t.status),
+    index("reports_status_created_idx").on(t.status, t.createdAt, t.id),
     index("reports_post_category_status_idx").on(
       t.postId,
       t.category,
@@ -287,9 +290,16 @@ export const moderationLog = pgTable(
     }),
     action: moderationActionEnum("action").notNull(),
     reason: text("reason"),
+    // Só nas acções sobre contas (`admin.promoted` / `admin.demoted`).
+    targetUserId: uuid("target_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
     createdAt: createdAt(),
   },
-  (t) => [index("moderation_log_post_created_idx").on(t.postId, t.createdAt)],
+  (t) => [
+    index("moderation_log_post_created_idx").on(t.postId, t.createdAt),
+    index("moderation_log_created_idx").on(t.createdAt, t.id),
+  ],
 );
 
 export const outbox = pgTable(

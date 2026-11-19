@@ -81,9 +81,13 @@ export const CursorPayload = z.discriminatedUnion("k", [
   }),
   /** `t` é o momento do like (não do post): a ordem é «curtidos mais recentemente». */
   z.object({ k: z.literal("liked"), t: CursorTimestamp, id: z.uuid() }),
-]);
-export type CursorPayload = z.infer<typeof CursorPayload>;
+  z.object({ k: z.literal("admin_posts"), t: CursorTimestamp, id: z.uuid() }),
+  z.object({ k: z.literal("admin_reports"), t: CursorTimestamp, id: z.uuid() }),
+  z.object({ k: z.literal("admin_log"), t: CursorTimestamp, id: z.uuid() }),
+ ]);
 
+export type CursorPayload = z.infer<typeof CursorPayload>;
+export type CursorKind = CursorPayload["k"];
 export const CURSOR_MAX_LENGTH = 256;
 
 const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -102,7 +106,7 @@ function toBase64Url(text: string): string {
     if (i + 1 < text.length) out += B64[(n >> 6) & 63]!;
     if (i + 2 < text.length) out += B64[n & 63]!;
   }
-  return out;
+  return out; 
  }
 
 function fromBase64Url(text: string): string | null {
@@ -131,7 +135,7 @@ export function encodeCursor(payload: CursorPayload): string {
 
 export function decodeCursor(
   cursor: string,
-  expected: FeedFilter,
+  expected: CursorKind,
 ): CursorPayload | null {
   if (cursor.length === 0 || cursor.length > CURSOR_MAX_LENGTH) return null;
   const json = fromBase64Url(cursor);
