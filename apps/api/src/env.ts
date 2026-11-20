@@ -91,6 +91,10 @@ const BaseEnvSchema = z.object({
   JWT_AUDIENCE: z.string().default("comunidade-crista-api"),
   ACCESS_TOKEN_TTL: z.string().default("15m"),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  // Tolerância ao reenvio de um refresh token acabado de rotacionar (vários separadores, retry
+  // após resposta perdida). Fora da janela, o reenvio é tratado como roubo e revoga a família.
+  // 0 desliga a tolerância.
+  REFRESH_REUSE_GRACE_S: z.coerce.number().int().min(0).max(60).default(10),
   RECOVERY_SESSION_TTL: z.string().default("5m"),
   RECOVERY_QUESTIONS_DELAY_HOURS: z.coerce
     .number()

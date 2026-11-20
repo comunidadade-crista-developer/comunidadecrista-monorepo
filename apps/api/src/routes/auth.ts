@@ -244,6 +244,7 @@ export async function authRoutes(
         oldHash,
         newHash,
         new Date(Date.now() + refreshTtlMs),
+        env.REFRESH_REUSE_GRACE_S * 1000,
       );
 
       if (result.status === "not_found") {
@@ -265,6 +266,13 @@ export async function authRoutes(
         return reply.code(401).send({ error: "invalid_refresh" });
       }
 
+      if (result.withinGrace) {
+        request.log.info(
+          { familyId: result.familyId },
+          "refresh token reenviado dentro da janela de tolerância",
+        );
+      }
+
       const accessToken = await jwt.signAccessToken({
         sub: user.id,
         role: user.role,
@@ -284,7 +292,9 @@ export async function authRoutes(
     async (request, reply) => {
       const hash = hashRefreshToken(request.body.refreshToken);
       const record = await tokens.findActiveByHash(hash);
-      if (record) await tokens.revoke(record.id);
+      // Termina a sessão inteira (a família): inclui os tokens irmãos que a tolerância possa ter
+      // criado, para um logout num separador não deixar outro token vivo.
+      if (record) await tokens.revokeFamily(record.familyId);
       return reply.code(200).send({ ok: true });
     },
   );

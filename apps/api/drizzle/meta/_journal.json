@@ -50,6 +50,13 @@
       "when": 1793900000000,
       "tag": "0006_moderation_target_user_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794000000000,
+      "tag": "0007_refresh_rotated_at",
+      "breakpoints": true
     }
   ]
 }

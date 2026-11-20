@@ -142,6 +142,14 @@ describe("loadEnv — limites do servidor", () => {
     expect(env.RATE_LIMIT_GLOBAL_MAX).toBe(300);
     expect(env.BODY_LIMIT_BYTES).toBe(524_288);
     expect(env.REQUEST_TIMEOUT_MS).toBe(30_000);
+    expect(env.REFRESH_REUSE_GRACE_S).toBe(10);
+  });
+
+  it("REFRESH_REUSE_GRACE_S: 0 desliga; acima de 60 é erro", () => {
+    expect(
+      loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 0 }).REFRESH_REUSE_GRACE_S,
+    ).toBe(0);
+    expect(() => loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 61 })).toThrow();
   });
 
   it("recusa limites fora do intervalo", () => {
