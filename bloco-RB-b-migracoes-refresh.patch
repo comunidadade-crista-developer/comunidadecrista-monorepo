@@ -1,0 +1,2030 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1166e3a..f43b109 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -78,6 +78,18 @@ jobs:
+       - name: Typecheck
+         run: pnpm typecheck
+ 
++      # As migrações têm de estar em sincronia com o schema: `check` valida a cadeia de snapshots
++      # e `generate` não pode produzir nada (se produzir, alguém alterou o schema sem migração).
++      - name: Migrações em sincronia com o schema
++        run: |
++          pnpm --filter @comunidade/api exec drizzle-kit check
++          pnpm --filter @comunidade/api exec drizzle-kit generate --name=ci_drift
++          if [ -n "$(git status --porcelain)" ]; then
++            echo "::error::O schema difere das migrações. Corre 'pnpm --filter @comunidade/api db:generate' e faz commit."
++            git status --porcelain
++            exit 1
++          fi
++
+       - name: Test
+         run: pnpm test:ci
+ 
+diff --git a/apps/api/.env.example b/apps/api/.env.example
+index 120790c..887ba82 100644
+--- a/apps/api/.env.example
++++ b/apps/api/.env.example
+@@ -66,6 +66,8 @@ RATE_LIMIT_GLOBAL_MAX=300
+ RATE_LIMIT_GLOBAL_WINDOW_S=60
+ BODY_LIMIT_BYTES=524288
+ REQUEST_TIMEOUT_MS=30000
++# Segundos em que o reenvio de um refresh token acabado de rotacionar é tolerado (0 desliga).
++REFRESH_REUSE_GRACE_S=10
+ RATE_LIMIT_CARDS_MAX=120
+ RATE_LIMIT_CARDS_WINDOW_S=60
+ # Leitura do feed (por utilizador autenticado; por IP para anónimos)
+diff --git a/apps/api/drizzle/0007_refresh_rotated_at.sql b/apps/api/drizzle/0007_refresh_rotated_at.sql
+new file mode 100644
+index 0000000..a01d79e
+--- /dev/null
++++ b/apps/api/drizzle/0007_refresh_rotated_at.sql
+@@ -0,0 +1,4 @@
++-- RB-b: momento em que um refresh token foi substituído por rotação. Distingue-o de um token
++-- revogado por logout ou por mudança de palavra-passe (`revoked_at` sozinho não distingue) e
++-- permite tolerar, durante poucos segundos, o reenvio do token antigo (vários separadores, retry).
++ALTER TABLE "refresh_tokens" ADD COLUMN "rotated_at" timestamp with time zone;
+diff --git a/apps/api/drizzle/meta/0007_snapshot.json b/apps/api/drizzle/meta/0007_snapshot.json
+new file mode 100644
+index 0000000..fc9d90d
+--- /dev/null
++++ b/apps/api/drizzle/meta/0007_snapshot.json
+@@ -0,0 +1,1497 @@
++{
++  "id": "6941536c-5708-4bcc-87af-aca89f640484",
++  "prevId": "aab025a2-5253-46ee-b91e-d5a2dcf919a1",
++  "version": "7",
++  "dialect": "postgresql",
++  "tables": {
++    "public.gospel_cards": {
++      "name": "gospel_cards",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "slug": {
++          "name": "slug",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "gospel_reference": {
++          "name": "gospel_reference",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "summary": {
++          "name": "summary",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "ot_references": {
++          "name": "ot_references",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'[]'::jsonb"
++        },
++        "nt_references": {
++          "name": "nt_references",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'[]'::jsonb"
++        },
++        "order_index": {
++          "name": "order_index",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "gospel_cards_slug_unique": {
++          "name": "gospel_cards_slug_unique",
++          "columns": [
++            {
++              "expression": "slug",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "gospel_cards_order_idx": {
++          "name": "gospel_cards_order_idx",
++          "columns": [
++            {
++              "expression": "order_index",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.idempotency_keys": {
++      "name": "idempotency_keys",
++      "schema": "",
++      "columns": {
++        "key": {
++          "name": "key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "operation": {
++          "name": "operation",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "request_hash": {
++          "name": "request_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "response": {
++          "name": "response",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "idempotency_keys_expires_idx": {
++          "name": "idempotency_keys_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "idempotency_keys_user_id_users_id_fk": {
++          "name": "idempotency_keys_user_id_users_id_fk",
++          "tableFrom": "idempotency_keys",
++          "tableTo": "users",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "idempotency_keys_user_id_key_pk": {
++          "name": "idempotency_keys_user_id_key_pk",
++          "columns": [
++            "user_id",
++            "key"
++          ]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.moderation_log": {
++      "name": "moderation_log",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "moderator_id": {
++          "name": "moderator_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "action": {
++          "name": "action",
++          "type": "moderation_action",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reason": {
++          "name": "reason",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "target_user_id": {
++          "name": "target_user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "moderation_log_post_created_idx": {
++          "name": "moderation_log_post_created_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "moderation_log_created_idx": {
++          "name": "moderation_log_created_idx",
++          "columns": [
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "moderation_log_post_id_posts_id_fk": {
++          "name": "moderation_log_post_id_posts_id_fk",
++          "tableFrom": "moderation_log",
++          "tableTo": "posts",
++          "columnsFrom": [
++            "post_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        },
++        "moderation_log_moderator_id_users_id_fk": {
++          "name": "moderation_log_moderator_id_users_id_fk",
++          "tableFrom": "moderation_log",
++          "tableTo": "users",
++          "columnsFrom": [
++            "moderator_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        },
++        "moderation_log_target_user_id_users_id_fk": {
++          "name": "moderation_log_target_user_id_users_id_fk",
++          "tableFrom": "moderation_log",
++          "tableTo": "users",
++          "columnsFrom": [
++            "target_user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.outbox": {
++      "name": "outbox",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "aggregate_type": {
++          "name": "aggregate_type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "aggregate_id": {
++          "name": "aggregate_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "event_type": {
++          "name": "event_type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "payload": {
++          "name": "payload",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "status": {
++          "name": "status",
++          "type": "outbox_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'pending'"
++        },
++        "attempts": {
++          "name": "attempts",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "next_attempt_at": {
++          "name": "next_attempt_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "processed_at": {
++          "name": "processed_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "outbox_status_next_attempt_idx": {
++          "name": "outbox_status_next_attempt_idx",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "next_attempt_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.pending_password_resets": {
++      "name": "pending_password_resets",
++      "schema": "",
++      "columns": {
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "password_hash": {
++          "name": "password_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "requested_at": {
++          "name": "requested_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "effective_at": {
++          "name": "effective_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "pending_password_resets_effective_idx": {
++          "name": "pending_password_resets_effective_idx",
++          "columns": [
++            {
++              "expression": "effective_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "pending_password_resets_user_id_users_id_fk": {
++          "name": "pending_password_resets_user_id_users_id_fk",
++          "tableFrom": "pending_password_resets",
++          "tableTo": "users",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.post_likes": {
++      "name": "post_likes",
++      "schema": "",
++      "columns": {
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "post_likes_user_id_idx": {
++          "name": "post_likes_user_id_idx",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "post_likes_post_id_posts_id_fk": {
++          "name": "post_likes_post_id_posts_id_fk",
++          "tableFrom": "post_likes",
++          "tableTo": "posts",
++          "columnsFrom": [
++            "post_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "post_likes_user_id_users_id_fk": {
++          "name": "post_likes_user_id_users_id_fk",
++          "tableFrom": "post_likes",
++          "tableTo": "users",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "post_likes_post_id_user_id_pk": {
++          "name": "post_likes_post_id_user_id_pk",
++          "columns": [
++            "post_id",
++            "user_id"
++          ]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.posts": {
++      "name": "posts",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "author_id": {
++          "name": "author_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "gospel_card_id": {
++          "name": "gospel_card_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "category": {
++          "name": "category",
++          "type": "post_category",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "content": {
++          "name": "content",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "status": {
++          "name": "status",
++          "type": "post_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'published'"
++        },
++        "likes_count": {
++          "name": "likes_count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "reports_count": {
++          "name": "reports_count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "default": 0
++        },
++        "author_hidden": {
++          "name": "author_hidden",
++          "type": "boolean",
++          "primaryKey": false,
++          "notNull": true,
++          "default": false
++        },
++        "suspended_status": {
++          "name": "suspended_status",
++          "type": "post_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "review_flags": {
++          "name": "review_flags",
++          "type": "text[]",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deleted_at": {
++          "name": "deleted_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "published_at": {
++          "name": "published_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "posts_status_created_idx": {
++          "name": "posts_status_created_idx",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_card_status_idx": {
++          "name": "posts_card_status_idx",
++          "columns": [
++            {
++              "expression": "gospel_card_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_author_created_idx": {
++          "name": "posts_author_created_idx",
++          "columns": [
++            {
++              "expression": "author_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "posts_category_status_idx": {
++          "name": "posts_category_status_idx",
++          "columns": [
++            {
++              "expression": "category",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "posts_author_id_users_id_fk": {
++          "name": "posts_author_id_users_id_fk",
++          "tableFrom": "posts",
++          "tableTo": "users",
++          "columnsFrom": [
++            "author_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        },
++        "posts_gospel_card_id_gospel_cards_id_fk": {
++          "name": "posts_gospel_card_id_gospel_cards_id_fk",
++          "tableFrom": "posts",
++          "tableTo": "gospel_cards",
++          "columnsFrom": [
++            "gospel_card_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.refresh_tokens": {
++      "name": "refresh_tokens",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "token_hash": {
++          "name": "token_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "family_id": {
++          "name": "family_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "revoked_at": {
++          "name": "revoked_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "rotated_at": {
++          "name": "rotated_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "refresh_tokens_token_hash_unique": {
++          "name": "refresh_tokens_token_hash_unique",
++          "columns": [
++            {
++              "expression": "token_hash",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_user_id_idx": {
++          "name": "refresh_tokens_user_id_idx",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_family_idx": {
++          "name": "refresh_tokens_family_idx",
++          "columns": [
++            {
++              "expression": "family_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "refresh_tokens_expires_idx": {
++          "name": "refresh_tokens_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "refresh_tokens_user_id_users_id_fk": {
++          "name": "refresh_tokens_user_id_users_id_fk",
++          "tableFrom": "refresh_tokens",
++          "tableTo": "users",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.reports": {
++      "name": "reports",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "post_id": {
++          "name": "post_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reporter_id": {
++          "name": "reporter_id",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "reason": {
++          "name": "reason",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "category": {
++          "name": "category",
++          "type": "report_category",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "severity": {
++          "name": "severity",
++          "type": "report_severity",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "generated": {
++            "as": "CASE \"category\" WHEN 'offensive' THEN 'medium'::\"report_severity\" WHEN 'doctrine' THEN 'high'::\"report_severity\" ELSE 'basic'::\"report_severity\" END",
++            "type": "stored"
++          }
++        },
++        "status": {
++          "name": "status",
++          "type": "report_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'open'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "resolved_at": {
++          "name": "resolved_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "withdrawn_at": {
++          "name": "withdrawn_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "resolved_by": {
++          "name": "resolved_by",
++          "type": "uuid",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "reports_post_reporter_unique": {
++          "name": "reports_post_reporter_unique",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "reporter_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_post_status_idx": {
++          "name": "reports_post_status_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_reporter_status_idx": {
++          "name": "reports_reporter_status_idx",
++          "columns": [
++            {
++              "expression": "reporter_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_post_category_status_idx": {
++          "name": "reports_post_category_status_idx",
++          "columns": [
++            {
++              "expression": "post_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "category",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "reports_status_created_idx": {
++          "name": "reports_status_created_idx",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "reports_post_id_posts_id_fk": {
++          "name": "reports_post_id_posts_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "posts",
++          "columnsFrom": [
++            "post_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "reports_reporter_id_users_id_fk": {
++          "name": "reports_reporter_id_users_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "users",
++          "columnsFrom": [
++            "reporter_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "reports_resolved_by_users_id_fk": {
++          "name": "reports_resolved_by_users_id_fk",
++          "tableFrom": "reports",
++          "tableTo": "users",
++          "columnsFrom": [
++            "resolved_by"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "set null",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {
++        "reports_other_requires_reason": {
++          "name": "reports_other_requires_reason",
++          "value": "\"reports\".\"category\" <> 'other' OR (\"reports\".\"reason\" IS NOT NULL AND btrim(\"reports\".\"reason\") <> '')"
++        }
++      },
++      "isRLSEnabled": false
++    },
++    "public.used_recovery_sessions": {
++      "name": "used_recovery_sessions",
++      "schema": "",
++      "columns": {
++        "jti": {
++          "name": "jti",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {
++        "used_recovery_sessions_expires_idx": {
++          "name": "used_recovery_sessions_expires_idx",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.users": {
++      "name": "users",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "uuid",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "username": {
++          "name": "username",
++          "type": "citext",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "password_hash": {
++          "name": "password_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "recovery_code_hash": {
++          "name": "recovery_code_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "security_q1_hash": {
++          "name": "security_q1_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "security_q2_hash": {
++          "name": "security_q2_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "security_q3_hash": {
++          "name": "security_q3_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "avatar_seed": {
++          "name": "avatar_seed",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "role": {
++          "name": "role",
++          "type": "role",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'user'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "last_login_at": {
++          "name": "last_login_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deleted_at": {
++          "name": "deleted_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deletion_requested_at": {
++          "name": "deletion_requested_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "deletion_posts_mode": {
++          "name": "deletion_posts_mode",
++          "type": "deletion_posts_mode",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "users_username_unique": {
++          "name": "users_username_unique",
++          "columns": [
++            {
++              "expression": "username",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "users_role_idx": {
++          "name": "users_role_idx",
++          "columns": [
++            {
++              "expression": "role",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "users_deletion_requested_idx": {
++          "name": "users_deletion_requested_idx",
++          "columns": [
++            {
++              "expression": "deletion_requested_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    }
++  },
++  "enums": {
++    "public.deletion_posts_mode": {
++      "name": "deletion_posts_mode",
++      "schema": "public",
++      "values": [
++        "anonymize",
++        "delete"
++      ]
++    },
++    "public.moderation_action": {
++      "name": "moderation_action",
++      "schema": "public",
++      "values": [
++        "approved",
++        "rejected",
++        "admin.promoted",
++        "admin.demoted"
++      ]
++    },
++    "public.outbox_status": {
++      "name": "outbox_status",
++      "schema": "public",
++      "values": [
++        "pending",
++        "processing",
++        "done",
++        "failed"
++      ]
++    },
++    "public.post_category": {
++      "name": "post_category",
++      "schema": "public",
++      "values": [
++        "entendimento",
++        "ensinamento",
++        "letra_cancao"
++      ]
++    },
++    "public.post_status": {
++      "name": "post_status",
++      "schema": "public",
++      "values": [
++        "published",
++        "pending_review",
++        "hidden",
++        "rejected"
++      ]
++    },
++    "public.report_category": {
++      "name": "report_category",
++      "schema": "public",
++      "values": [
++        "spam",
++        "off_topic",
++        "offensive",
++        "doctrine",
++        "other"
++      ]
++    },
++    "public.report_severity": {
++      "name": "report_severity",
++      "schema": "public",
++      "values": [
++        "basic",
++        "medium",
++        "high"
++      ]
++    },
++    "public.report_status": {
++      "name": "report_status",
++      "schema": "public",
++      "values": [
++        "open",
++        "resolved_kept",
++        "resolved_removed",
++        "withdrawn"
++      ]
++    },
++    "public.role": {
++      "name": "role",
++      "schema": "public",
++      "values": [
++        "user",
++        "admin"
++      ]
++    }
++  },
++  "schemas": {},
++  "sequences": {},
++  "roles": {},
++  "policies": {},
++  "views": {},
++  "_meta": {
++    "columns": {},
++    "schemas": {},
++    "tables": {}
++  }
++}
+diff --git a/apps/api/drizzle/meta/_journal.json b/apps/api/drizzle/meta/_journal.json
+index fe4fe00..5e155e4 100644
+--- a/apps/api/drizzle/meta/_journal.json
++++ b/apps/api/drizzle/meta/_journal.json
+@@ -50,6 +50,13 @@
+       "when": 1793900000000,
+       "tag": "0006_moderation_target_user_indexes",
+       "breakpoints": true
++    },
++    {
++      "idx": 7,
++      "version": "7",
++      "when": 1794000000000,
++      "tag": "0007_refresh_rotated_at",
++      "breakpoints": true
+     }
+   ]
+ }
+diff --git a/apps/api/src/db/schema.ts b/apps/api/src/db/schema.ts
+index 7eb1b32..2bec0af 100644
+--- a/apps/api/src/db/schema.ts
++++ b/apps/api/src/db/schema.ts
+@@ -131,6 +131,9 @@ export const refreshTokens = pgTable(
+     familyId: uuid("family_id").notNull(),
+     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+     revokedAt: timestamp("revoked_at", { withTimezone: true }),
++    // Preenchido só quando o token foi substituído por rotação (não em logout nem em revogação
++    // em massa): é o que permite tolerar o reenvio do token antigo durante poucos segundos.
++    rotatedAt: timestamp("rotated_at", { withTimezone: true }),
+     createdAt: createdAt(),
+   },
+   (t) => [
+diff --git a/apps/api/src/env.ts b/apps/api/src/env.ts
+index c8d9eda..f6bfca2 100644
+--- a/apps/api/src/env.ts
++++ b/apps/api/src/env.ts
+@@ -91,6 +91,10 @@ const BaseEnvSchema = z.object({
+   JWT_AUDIENCE: z.string().default("comunidade-crista-api"),
+   ACCESS_TOKEN_TTL: z.string().default("15m"),
+   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
++  // Tolerância ao reenvio de um refresh token acabado de rotacionar (vários separadores, retry
++  // após resposta perdida). Fora da janela, o reenvio é tratado como roubo e revoga a família.
++  // 0 desliga a tolerância.
++  REFRESH_REUSE_GRACE_S: z.coerce.number().int().min(0).max(60).default(10),
+   RECOVERY_SESSION_TTL: z.string().default("5m"),
+   RECOVERY_QUESTIONS_DELAY_HOURS: z.coerce
+     .number()
+diff --git a/apps/api/src/repositories/users.ts b/apps/api/src/repositories/users.ts
+index 8fa2e33..89c7276 100644
+--- a/apps/api/src/repositories/users.ts
++++ b/apps/api/src/repositories/users.ts
+@@ -1,4 +1,4 @@
+-import { and, eq, inArray, isNull, lt } from "drizzle-orm";
++import { and, eq, gt, inArray, isNull, lt } from "drizzle-orm";
+ import type { Database, Executor } from "../db/client.js";
+ import { refreshTokens, users } from "../db/schema.js";
+ import type {
+@@ -9,7 +9,14 @@ import type {
+ } from "../db/schema.js";
+ 
+ export type RotateResult =
+-  | { status: "ok"; newTokenId: string; userId: string; familyId: string }
++  | {
++      status: "ok";
++      newTokenId: string;
++      userId: string;
++      familyId: string;
++      /** O token apresentado já tinha sido rotacionado, mas dentro da janela de tolerância. */
++      withinGrace: boolean;
++    }
+   | { status: "not_found" }
+   | { status: "reuse_detected"; familyId: string }
+   | { status: "expired" };
+@@ -115,6 +122,11 @@ export function refreshTokensRepo(db: Database) {
+       oldHash: string,
+       newHash: string,
+       newExpiresAt: Date,
++      /**
++       * Janela (ms) em que o reenvio de um token JÁ rotacionado é aceite em vez de ser tratado
++       * como roubo (vários separadores, retry após resposta perdida). 0 desliga a tolerância.
++       */
++      graceMs = 0,
+     ): Promise<RotateResult> {
+       return db.transaction(async (tx) => {
+         const [row] = await tx
+@@ -126,10 +138,53 @@ export function refreshTokensRepo(db: Database) {
+ 
+         if (!row) return { status: "not_found" as const };
+ 
++        const now = new Date();
++
+         if (row.revokedAt) {
++          // Tolerância: só para tokens revogados POR ROTAÇÃO (`rotatedAt`), há pouco tempo, ainda
++          // válidos, e numa família que continua viva (um logout ou uma revogação em massa
++          // revogou também o token filho, e nesse caso não há tolerância). Emite-se um novo
++          // token na mesma família, sem revogar nada.
++          if (
++            graceMs > 0 &&
++            row.rotatedAt &&
++            now.getTime() - row.rotatedAt.getTime() <= graceMs &&
++            row.expiresAt > now
++          ) {
++            const [alive] = await tx
++              .select({ id: refreshTokens.id })
++              .from(refreshTokens)
++              .where(
++                and(
++                  eq(refreshTokens.familyId, row.familyId),
++                  isNull(refreshTokens.revokedAt),
++                  gt(refreshTokens.expiresAt, now),
++                ),
++              )
++              .limit(1);
++            if (alive) {
++              const [created] = await tx
++                .insert(refreshTokens)
++                .values({
++                  userId: row.userId,
++                  tokenHash: newHash,
++                  familyId: row.familyId,
++                  expiresAt: newExpiresAt,
++                })
++                .returning();
++              return {
++                status: "ok" as const,
++                newTokenId: created!.id,
++                userId: row.userId,
++                familyId: row.familyId,
++                withinGrace: true,
++              };
++            }
++          }
++
+           await tx
+             .update(refreshTokens)
+-            .set({ revokedAt: new Date() })
++            .set({ revokedAt: now })
+             .where(
+               and(
+                 eq(refreshTokens.familyId, row.familyId),
+@@ -139,13 +194,13 @@ export function refreshTokensRepo(db: Database) {
+           return { status: "reuse_detected" as const, familyId: row.familyId };
+         }
+ 
+-        if (row.expiresAt < new Date()) {
++        if (row.expiresAt < now) {
+           return { status: "expired" as const };
+         }
+ 
+         await tx
+           .update(refreshTokens)
+-          .set({ revokedAt: new Date() })
++          .set({ revokedAt: now, rotatedAt: now })
+           .where(eq(refreshTokens.id, row.id));
+ 
+         const [created] = await tx
+@@ -163,6 +218,7 @@ export function refreshTokensRepo(db: Database) {
+           newTokenId: created!.id,
+           userId: row.userId,
+           familyId: row.familyId,
++          withinGrace: false,
+         };
+       });
+     },
+diff --git a/apps/api/src/routes/auth.ts b/apps/api/src/routes/auth.ts
+index 952fe09..053a510 100644
+--- a/apps/api/src/routes/auth.ts
++++ b/apps/api/src/routes/auth.ts
+@@ -244,6 +244,7 @@ export async function authRoutes(
+         oldHash,
+         newHash,
+         new Date(Date.now() + refreshTtlMs),
++        env.REFRESH_REUSE_GRACE_S * 1000,
+       );
+ 
+       if (result.status === "not_found") {
+@@ -265,6 +266,13 @@ export async function authRoutes(
+         return reply.code(401).send({ error: "invalid_refresh" });
+       }
+ 
++      if (result.withinGrace) {
++        request.log.info(
++          { familyId: result.familyId },
++          "refresh token reenviado dentro da janela de tolerância",
++        );
++      }
++
+       const accessToken = await jwt.signAccessToken({
+         sub: user.id,
+         role: user.role,
+@@ -284,7 +292,9 @@ export async function authRoutes(
+     async (request, reply) => {
+       const hash = hashRefreshToken(request.body.refreshToken);
+       const record = await tokens.findActiveByHash(hash);
+-      if (record) await tokens.revoke(record.id);
++      // Termina a sessão inteira (a família): inclui os tokens irmãos que a tolerância possa ter
++      // criado, para um logout num separador não deixar outro token vivo.
++      if (record) await tokens.revokeFamily(record.familyId);
+       return reply.code(200).send({ ok: true });
+     },
+   );
+diff --git a/apps/api/test/env.test.ts b/apps/api/test/env.test.ts
+index f4e2752..976427a 100644
+--- a/apps/api/test/env.test.ts
++++ b/apps/api/test/env.test.ts
+@@ -142,6 +142,14 @@ describe("loadEnv — limites do servidor", () => {
+     expect(env.RATE_LIMIT_GLOBAL_MAX).toBe(300);
+     expect(env.BODY_LIMIT_BYTES).toBe(524_288);
+     expect(env.REQUEST_TIMEOUT_MS).toBe(30_000);
++    expect(env.REFRESH_REUSE_GRACE_S).toBe(10);
++  });
++
++  it("REFRESH_REUSE_GRACE_S: 0 desliga; acima de 60 é erro", () => {
++    expect(
++      loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 0 }).REFRESH_REUSE_GRACE_S,
++    ).toBe(0);
++    expect(() => loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 61 })).toThrow();
+   });
+ 
+   it("recusa limites fora do intervalo", () => {
+diff --git a/apps/api/test/routes/auth.refresh.test.ts b/apps/api/test/routes/auth.refresh.test.ts
+index 8de34a3..6a031ee 100644
+--- a/apps/api/test/routes/auth.refresh.test.ts
++++ b/apps/api/test/routes/auth.refresh.test.ts
+@@ -1,7 +1,10 @@
++import { eq } from "drizzle-orm";
+ import request from "supertest";
+ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ import { loadEnv } from "../../src/env.js";
+ import { buildServer } from "../../src/server.js";
++import { refreshTokens } from "../../src/db/schema.js";
++import { hashRefreshToken } from "../../src/auth/refresh.js";
+ import { closeTestDb, getTestDb, truncateAll } from "../helpers/db.js";
+ import { makeUserWithPassword } from "../helpers/factories.js";
+ 
+@@ -9,6 +12,8 @@ const env = loadEnv({
+   NODE_ENV: "test",
+   LOG_LEVEL: "fatal",
+   APP_VERSION: "test",
++  // Sem tolerância: estes testes verificam a detecção estrita de reutilização.
++  REFRESH_REUSE_GRACE_S: 0,
+ });
+ 
+ async function login(
+@@ -80,3 +85,114 @@ describe("POST /auth/refresh", () => {
+     expect(res.body.error).toBe("invalid_refresh");
+   });
+ });
++
++describe("POST /auth/refresh — tolerância ao reenvio (REFRESH_REUSE_GRACE_S)", () => {
++  const graceEnv = loadEnv({
++    NODE_ENV: "test",
++    LOG_LEVEL: "fatal",
++    APP_VERSION: "test",
++    REFRESH_REUSE_GRACE_S: 10,
++  });
++  let app: Awaited<ReturnType<typeof buildServer>>;
++  let db: Awaited<ReturnType<typeof getTestDb>>;
++  beforeAll(async () => {
++    db = await getTestDb();
++    app = await buildServer({ env: graceEnv });
++    await app.ready();
++  });
++  afterAll(async () => {
++    await app.close();
++    await closeTestDb();
++  });
++  beforeEach(async () => {
++    await truncateAll();
++  });
++
++  const refresh = (token: string) =>
++    request(app.server).post("/auth/refresh").send({ refreshToken: token });
++
++  it("reenvio do token antigo dentro da janela → 200 e a família continua viva", async () => {
++    const { plainPassword } = await makeUserWithPassword({ username: "tab" });
++    const t0 = await login(app, "tab", plainPassword);
++    const first = await refresh(t0);
++    expect(first.status).toBe(200);
++
++    const second = await refresh(t0);
++    expect(second.status).toBe(200);
++    expect(second.body.refreshToken).not.toBe(first.body.refreshToken);
++
++    // Os dois tokens filhos continuam válidos.
++    expect((await refresh(first.body.refreshToken)).status).toBe(200);
++    expect((await refresh(second.body.refreshToken)).status).toBe(200);
++  });
++
++  it("dois pedidos simultâneos com o mesmo token → ambos 200", async () => {
++    const { plainPassword } = await makeUserWithPassword({ username: "par" });
++    const t0 = await login(app, "par", plainPassword);
++    const [a, b] = await Promise.all([refresh(t0), refresh(t0)]);
++    expect([a.status, b.status]).toEqual([200, 200]);
++    expect(a.body.refreshToken).not.toBe(b.body.refreshToken);
++  });
++
++  it("fora da janela → token_reuse e revoga a família", async () => {
++    const { plainPassword } = await makeUserWithPassword({ username: "tarde" });
++    const t0 = await login(app, "tarde", plainPassword);
++    const first = await refresh(t0);
++    expect(first.status).toBe(200);
++
++    // Recua o momento da rotação para além da janela.
++    await db
++      .update(refreshTokens)
++      .set({ rotatedAt: new Date(Date.now() - 60_000) })
++      .where(eq(refreshTokens.tokenHash, hashRefreshToken(t0)));
++
++    const late = await refresh(t0);
++    expect(late.status).toBe(401);
++    expect(late.body.error).toBe("token_reuse");
++    expect((await refresh(first.body.refreshToken)).status).toBe(401);
++  });
++
++  it("depois de logout do token filho, o antigo não tem tolerância", async () => {
++    const { plainPassword } = await makeUserWithPassword({ username: "sai" });
++    const t0 = await login(app, "sai", plainPassword);
++    const first = await refresh(t0);
++    expect(first.status).toBe(200);
++    await request(app.server)
++      .post("/auth/logout")
++      .send({ refreshToken: first.body.refreshToken });
++
++    const again = await refresh(t0);
++    expect(again.status).toBe(401);
++    expect(again.body.error).toBe("token_reuse");
++  });
++
++  it("token revogado por logout (sem rotação) → token_reuse, mesmo dentro da janela", async () => {
++    const { plainPassword } = await makeUserWithPassword({
++      username: "logout",
++    });
++    const t0 = await login(app, "logout", plainPassword);
++    await request(app.server).post("/auth/logout").send({ refreshToken: t0 });
++
++    const res = await refresh(t0);
++    expect(res.status).toBe(401);
++    expect(res.body.error).toBe("token_reuse");
++  });
++
++  it("a rotação regista rotated_at; tokens novos ficam sem ele", async () => {
++    const { plainPassword } = await makeUserWithPassword({ username: "col" });
++    const t0 = await login(app, "col", plainPassword);
++    const first = await refresh(t0);
++    const [old] = await db
++      .select()
++      .from(refreshTokens)
++      .where(eq(refreshTokens.tokenHash, hashRefreshToken(t0)));
++    const [fresh] = await db
++      .select()
++      .from(refreshTokens)
++      .where(
++        eq(refreshTokens.tokenHash, hashRefreshToken(first.body.refreshToken)),
++      );
++    expect(old!.rotatedAt).toBeInstanceOf(Date);
++    expect(fresh!.rotatedAt).toBeNull();
++  });
++});
+diff --git a/docs/Arquitectura/adr/ADR-006.md b/docs/Arquitectura/adr/ADR-006.md
+index fb6ddd4..1f75e7c 100644
+--- a/docs/Arquitectura/adr/ADR-006.md
++++ b/docs/Arquitectura/adr/ADR-006.md
+@@ -14,3 +14,5 @@ públicas não têm `d`, que o par corresponde e que a anterior difere da actual
+ dependem da chave): numa rotação os utilizadores renovam a sessão sem voltar a autenticar-se.
+ **Consequências**: chaves Ed25519 geradas no deploy (env vars); procedimento de rotação (normal e por
+ compromisso) no runbook. Em caso de compromisso, omitir `JWT_PUBLIC_JWK_PREVIOUS` invalida de imediato os access tokens antigos.
++
++**Actualização (RB-b)**: o reenvio de um refresh token acabado de rotacionar é tolerado durante `REFRESH_REUSE_GRACE_S` (10 s): emite-se um token novo na mesma família em vez de a revogar. Só se aplica a tokens substituídos por rotação (`refresh_tokens.rotated_at`) cuja família continua viva; fora da janela, após logout ou revogação em massa, mantém-se a detecção de reuso. Custo aceite: durante esses segundos um token roubado também obtém um token novo; o ganho é não terminar a sessão de quem usa vários separadores ou repete um pedido depois de uma resposta perdida. O logout passa a revogar a família inteira.
+diff --git a/docs/api/api.md b/docs/api/api.md
+index dff9e01..3db7fb5 100644
+--- a/docs/api/api.md
++++ b/docs/api/api.md
+@@ -49,6 +49,25 @@ campo `isMine` diz se a partilha é do utilizador que pede.
+ receber o pedido completo (`REQUEST_TIMEOUT_MS`). O CORS não usa credenciais: a autenticação é por
+ `Authorization: Bearer`, nunca por cookies.
+ 
++### Refresh: tolerância e contrato para o cliente
++
++O refresh token é de uso único: cada `/auth/refresh` devolve um par novo e o token enviado fica
++substituído. Reenviar um token **já substituído** é tratado como roubo (`401 token_reuse` e a
++família inteira é revogada), **excepto** durante `REFRESH_REUSE_GRACE_S` segundos (10 por omissão,
++0 desliga): nesse prazo o servidor aceita o reenvio e emite um token novo na mesma família, sem
++revogar nada. Cobre vários separadores a renovar ao mesmo tempo e o _retry_ depois de uma resposta
++perdida. A tolerância só vale para tokens substituídos por rotação: um token revogado por logout,
++ou cuja sessão já terminou, é sempre `token_reuse`.
++
++O cliente (`apps/web`) tem de **renovar numa só chamada de cada vez** (_single-flight_):
++
++1. Dentro do separador, uma só renovação em curso; os pedidos que falham com `401` esperam por ela.
++2. Entre separadores, serializar com `navigator.locks.request("cc-refresh", …)`. Dentro do bloqueio,
++   **reler** o token guardado: se outro separador já o renovou, usar esse e não chamar a API.
++3. Guardar o par novo **antes** de largar o bloqueio.
++4. Em `401 token_reuse` ou `invalid_refresh`, terminar a sessão local e pedir novo login. Nunca
++   repetir o refresh em ciclo.
++
+ ## Health
+ 
+ ### GET /health
+@@ -127,8 +146,8 @@ ADR-006/011/012.
+ | ------ | ---------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+ | POST   | `/auth/register`       | 201     | Devolve tokens e o `recoveryCode` (mostrado uma só vez). `409 username_taken`.                                    |
+ | POST   | `/auth/login`          | 200     | `401 invalid_credentials`, `401 recovery_pending`. Reactiva uma conta em apagamento.                              |
+-| POST   | `/auth/refresh`        | 200     | Rotativo. `401 invalid_refresh` / `refresh_expired` / `token_reuse` (revoga a família).                           |
+-| POST   | `/auth/logout`         | 200     | Revoga o refresh token.                                                                                           |
++| POST   | `/auth/refresh`        | 200     | Rotativo. `401 invalid_refresh` / `refresh_expired` / `token_reuse` (revoga a família). Ver «Refresh».            |
++| POST   | `/auth/logout`         | 200     | Termina a sessão: revoga a família do refresh token.                                                              |
+ | GET    | `/auth/me`             | 200     | Dados do utilizador autenticado.                                                                                  |
+ | POST   | `/auth/recover/verify` | 200     | Código **ou** 3 perguntas → `recoverySession` (5 min).                                                            |
+ | POST   | `/auth/recover/reset`  | 200     | Nova palavra-passe; `completed` (código) ou `pending` (perguntas, com atraso).                                    |
+diff --git a/docs/registos/RB-b-migracoes-refresh.md b/docs/registos/RB-b-migracoes-refresh.md
+new file mode 100644
+index 0000000..dfe2c9b
+--- /dev/null
++++ b/docs/registos/RB-b-migracoes-refresh.md
+@@ -0,0 +1,15 @@
++# RB-b — Migrações em produção e tolerância no refresh
++
++Segundo bloco da revisão do backend (achados 5 e 6).
++
++| Achado | Alteração                                                                                                                                                                                                                          |
++| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| 5      | Migração `0007_refresh_rotated_at` (`refresh_tokens.rotated_at`). `rotate` tolera o reenvio de um token rotacionado há menos de `REFRESH_REUSE_GRACE_S` (10 s) emitindo um token novo na mesma família. O logout revoga a família. |
++| 5      | Contrato do cliente (_single-flight_ com Web Locks) em `api.md`, «Refresh». A implementação fica para o `apps/web`.                                                                                                                |
++| 6      | Runbook: secção «Migrações da base de dados» (ordem, _expand/contract_, ponto de retorno, regras). CI: `drizzle-kit check` e `generate` sem alterações.                                                                            |
++
++Testes novos em `test/routes/auth.refresh.test.ts`: reenvio dentro da janela, pedidos simultâneos,
++fora da janela, após logout do token filho, token revogado por logout, coluna `rotated_at`.
++
++Limitação: o passo novo da CI e o snapshot `0007` (escrito à mão) não puderam ser executados com o
++`drizzle-kit` no ambiente de desenvolvimento; a primeira execução da CI confirma-os.
+diff --git a/docs/runbooks/runbook.md b/docs/runbooks/runbook.md
+index d9818b9..f2fe0a5 100644
+--- a/docs/runbooks/runbook.md
++++ b/docs/runbooks/runbook.md
+@@ -15,10 +15,36 @@
+ 4. Start command: `node apps/api/dist/index.js`
+ 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
+    Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
+-   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
++   Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50), `REFRESH_REUSE_GRACE_S` (10; tolerância ao reenvio do refresh token, 0 desliga) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
+    Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
+ 6. Plano: Free.
+ 
++### Migrações da base de dados
++
++A API **não** migra no arranque: as migrações aplicam-se à mão, **antes** de lançar o código que
++as usa.
++
++1. Guardar um ponto de retorno: na Neon, criar um _branch_ (ou anotar o instante para _restore_) antes
++   de qualquer migração que apague ou reescreva dados.
++2. Numa máquina com o repositório na versão a lançar e `DATABASE_URL` de produção (ligação directa da
++   Neon, **não** a do _pooler_): `pnpm --filter @comunidade/api db:migrate`.
++3. Só depois lançar a API (merge → deploy do Render).
++4. Confirmar: `GET /health/deep` e o `SELECT` à tabela `drizzle.__drizzle_migrations` (a última linha
++   é a migração nova).
++
++Regras:
++
++- **Compatíveis com o código anterior** (_expand/contract_): durante o passo 2–3 ainda corre a versão
++  antiga. Acrescentar colunas anuláveis ou com valor por omissão, tabelas e índices; **remover ou
++  renomear** só numa migração posterior, quando nenhuma versão em produção usa o que se remove.
++- Uma migração já aplicada em produção nunca se edita: corrige-se com outra.
++- Nada de `drizzle-kit push` em produção. As migrações escrevem-se com `db:generate` (ou à mão, com
++  o respectivo `meta/NNNN_snapshot.json` e a entrada em `meta/_journal.json`).
++- A CI falha se o schema difere das migrações (`drizzle-kit check` + `generate` sem alterações).
++- Um só operador de cada vez a migrar.
++- Falhou a meio: cada migração corre numa transacção; ver o erro, corrigir com uma migração nova e
++  voltar a correr. Em último caso, _restore_ para o ponto do passo 1.
++
+ ### Frontend (Cloudflare Pages)
+ 
+ 1. Pages → **Create project** → conectar repositório.
+@@ -88,6 +114,7 @@ pnpm --filter @comunidade/api admin:demote  <username>
+ - **Tabela `outbox` a crescer**: o worker corre no processo da API. Sem consumidores, os eventos passam a `done` e são purgados pela manutenção. Eventos em `failed` indicam um _handler_ a falhar; ver logs `outbox: handler failed` (só tipo e nome do erro).
+ - **`/sync` devolve muitos `deferred`**: limite por operação (`rate_limited`, com `retryAfter`) ou prazo do lote; o cliente repete sozinho. Confirmar `SYNC_BATCH_TIMEOUT_MS` e a latência da base de dados.
+ - **Fila de moderação parada**: `GET /admin/posts` mostra os `pending_review` do mais antigo. Um post que não se consegue aprovar com `409 invalid_state` já foi decidido ou está `hidden` (conta em apagamento). `429` no painel: limites `RATE_LIMIT_ADMIN_*`.
++- **Muitos `token_reuse` nos logs** (`refresh token reuse detected — family revoked`): um cliente que renova sem _single-flight_ (ver `api.md`, «Refresh»), ou roubo real. Reenvios dentro de `REFRESH_REUSE_GRACE_S` aparecem como `info` («reenviado dentro da janela de tolerância») e são normais em pequeno número.
+ - **Rate limit a disparar em produção**: confirmar o Redis (Upstash) acessível; sem Redis o limite aplica-se em memória, por instância.
+ 
+ ## IP do cliente, proxy e Cloudflare

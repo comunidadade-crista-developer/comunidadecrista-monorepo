@@ -12,6 +12,19 @@ const CLEAN = {
   IP_HASH_SECRET: undefined,
 } as const;
 
+// Mínimo para NODE_ENV=production (testes fixam tudo para não dependerem do .env local).
+const PROD = {
+  ...CLEAN,
+  NODE_ENV: "production",
+  IP_HASH_SECRET: LONG,
+  DATABASE_URL: "postgres://u:p@localhost:5432/db",
+  REDIS_URL: "redis://localhost:6379",
+  JWT_PRIVATE_JWK: "{}",
+  JWT_PUBLIC_JWK: "{}",
+  ARGON2_MEMORY_KB: 19456,
+  ARGON2_TIME_COST: 2,
+} as const;
+
 describe("loadEnv — TRUST_PROXY", () => {
   it("boolean true (overrides em testes) → true", () => {
     expect(loadEnv({ ...CLEAN, TRUST_PROXY: true }).TRUST_PROXY).toBe(true);
@@ -84,13 +97,63 @@ describe("loadEnv — modo Cloudflare e produção", () => {
     expect(env.CF_ORIGIN_SECRET).toBeUndefined();
   });
 
-  it("produção sem IP_HASH_SECRET → erro; com segredo → ok", () => {
-    expect(() => loadEnv({ ...CLEAN, NODE_ENV: "production" })).toThrow();
+  it("produção completa → ok", () => {
+    expect(loadEnv({ ...PROD }).NODE_ENV).toBe("production");
+  });
+
+  it.each([
+    "IP_HASH_SECRET",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "JWT_PRIVATE_JWK",
+    "JWT_PUBLIC_JWK",
+  ] as const)("produção sem %s → erro", (key) => {
+    expect(() => loadEnv({ ...PROD, [key]: undefined })).toThrow(
+      "Invalid environment variables",
+    );
+  });
+
+  it("produção com argon2 abaixo do mínimo → erro", () => {
+    expect(() => loadEnv({ ...PROD, ARGON2_MEMORY_KB: 4096 })).toThrow();
+    expect(() => loadEnv({ ...PROD, ARGON2_TIME_COST: 1 })).toThrow();
+  });
+
+  it("fora de produção os mínimos de argon2 não se aplicam", () => {
     const env = loadEnv({
       ...CLEAN,
-      NODE_ENV: "production",
-      IP_HASH_SECRET: LONG,
+      NODE_ENV: "test",
+      ARGON2_MEMORY_KB: 1024,
+      ARGON2_TIME_COST: 1,
     });
-    expect(env.NODE_ENV).toBe("production");
+    expect(env.ARGON2_MEMORY_KB).toBe(1024);
+  });
+});
+
+describe("loadEnv — limites do servidor", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("valores por omissão", () => {
+    const env = loadEnv({ ...CLEAN });
+    expect(env.RATE_LIMIT_GLOBAL_MAX).toBe(300);
+    expect(env.BODY_LIMIT_BYTES).toBe(524_288);
+    expect(env.REQUEST_TIMEOUT_MS).toBe(30_000);
+    expect(env.REFRESH_REUSE_GRACE_S).toBe(10);
+  });
+
+  it("REFRESH_REUSE_GRACE_S: 0 desliga; acima de 60 é erro", () => {
+    expect(
+      loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 0 }).REFRESH_REUSE_GRACE_S,
+    ).toBe(0);
+    expect(() => loadEnv({ ...CLEAN, REFRESH_REUSE_GRACE_S: 61 })).toThrow();
+  });
+
+  it("recusa limites fora do intervalo", () => {
+    expect(() => loadEnv({ ...CLEAN, BODY_LIMIT_BYTES: 10 })).toThrow();
+    expect(() => loadEnv({ ...CLEAN, REQUEST_TIMEOUT_MS: 10 })).toThrow();
   });
 });

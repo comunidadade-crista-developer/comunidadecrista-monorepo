@@ -43,6 +43,30 @@ campo `isMine` diz se a partilha é do utilizador que pede.
 | Pedidos `/sync`              | 60 por hora (e cada operação paga o limite do seu tipo) |
 | Painel admin: leituras       | 120 por 60 s, por administrador                         |
 | Painel admin: decisões       | 30 por 60 s, por administrador                          |
+| Global (todas as rotas)      | 300 por 60 s, por IP (`RATE_LIMIT_GLOBAL_*`)            |
+
+**Pedidos**: corpo máximo 512 KiB (`BODY_LIMIT_BYTES`; acima → `413 payload_too_large`) e 30 s para
+receber o pedido completo (`REQUEST_TIMEOUT_MS`). O CORS não usa credenciais: a autenticação é por
+`Authorization: Bearer`, nunca por cookies.
+
+### Refresh: tolerância e contrato para o cliente
+
+O refresh token é de uso único: cada `/auth/refresh` devolve um par novo e o token enviado fica
+substituído. Reenviar um token **já substituído** é tratado como roubo (`401 token_reuse` e a
+família inteira é revogada), **excepto** durante `REFRESH_REUSE_GRACE_S` segundos (10 por omissão,
+0 desliga): nesse prazo o servidor aceita o reenvio e emite um token novo na mesma família, sem
+revogar nada. Cobre vários separadores a renovar ao mesmo tempo e o _retry_ depois de uma resposta
+perdida. A tolerância só vale para tokens substituídos por rotação: um token revogado por logout,
+ou cuja sessão já terminou, é sempre `token_reuse`.
+
+O cliente (`apps/web`) tem de **renovar numa só chamada de cada vez** (_single-flight_):
+
+1. Dentro do separador, uma só renovação em curso; os pedidos que falham com `401` esperam por ela.
+2. Entre separadores, serializar com `navigator.locks.request("cc-refresh", …)`. Dentro do bloqueio,
+   **reler** o token guardado: se outro separador já o renovou, usar esse e não chamar a API.
+3. Guardar o par novo **antes** de largar o bloqueio.
+4. Em `401 token_reuse` ou `invalid_refresh`, terminar a sessão local e pedir novo login. Nunca
+   repetir o refresh em ciclo.
 
 ## Health
 
@@ -58,7 +82,7 @@ Leve. Não toca em base de dados nem Redis. Usado por cron-job.org.
 
 ### GET /health/deep
 
-Toca em Postgres e Redis. Uso em CI e monitorização manual.
+Toca em Postgres (pelo pool da aplicação, `SELECT 1`) e Redis, cada um com limite de 2 s. Uso em CI e monitorização manual. Limite próprio: 30 pedidos por minuto por IP (`429` acima).
 
 _**200**_
 
@@ -122,8 +146,8 @@ ADR-006/011/012.
 | ------ | ---------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
 | POST   | `/auth/register`       | 201     | Devolve tokens e o `recoveryCode` (mostrado uma só vez). `409 username_taken`.                                    |
 | POST   | `/auth/login`          | 200     | `401 invalid_credentials`, `401 recovery_pending`. Reactiva uma conta em apagamento.                              |
-| POST   | `/auth/refresh`        | 200     | Rotativo. `401 invalid_refresh` / `refresh_expired` / `token_reuse` (revoga a família).                           |
-| POST   | `/auth/logout`         | 200     | Revoga o refresh token.                                                                                           |
+| POST   | `/auth/refresh`        | 200     | Rotativo. `401 invalid_refresh` / `refresh_expired` / `token_reuse` (revoga a família). Ver «Refresh».            |
+| POST   | `/auth/logout`         | 200     | Termina a sessão: revoga a família do refresh token.                                                              |
 | GET    | `/auth/me`             | 200     | Dados do utilizador autenticado.                                                                                  |
 | POST   | `/auth/recover/verify` | 200     | Código **ou** 3 perguntas → `recoverySession` (5 min).                                                            |
 | POST   | `/auth/recover/reset`  | 200     | Nova palavra-passe; `completed` (código) ou `pending` (perguntas, com atraso).                                    |

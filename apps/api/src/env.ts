@@ -57,6 +57,27 @@ const BaseEnvSchema = z.object({
     .max(365)
     .default(30),
 
+  // Limite global por IP (rede de segurança contra abuso; cada rota tem os seus limites).
+  // Folgado: muitos utilizadores partilham o mesmo IP (CGNAT) e as rotas de leitura têm
+  // baldes próprios de 120/min.
+  RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().default(300),
+  RATE_LIMIT_GLOBAL_WINDOW_S: z.coerce.number().int().positive().default(60),
+  // Corpo máximo de um pedido. O pior caso legítimo é um /sync com 20 operações de 5000
+  // caracteres (UTF-8 até 4 bytes por carácter no JSON) — 512 KiB cobre-o com folga.
+  BODY_LIMIT_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .max(10_485_760)
+    .default(524_288),
+  // Tempo máximo para receber o pedido completo (protege contra clientes lentos).
+  REQUEST_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .max(120_000)
+    .default(30_000),
+
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   DB_QUERY_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
 
@@ -70,6 +91,10 @@ const BaseEnvSchema = z.object({
   JWT_AUDIENCE: z.string().default("comunidade-crista-api"),
   ACCESS_TOKEN_TTL: z.string().default("15m"),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  // Tolerância ao reenvio de um refresh token acabado de rotacionar (vários separadores, retry
+  // após resposta perdida). Fora da janela, o reenvio é tratado como roubo e revoga a família.
+  // 0 desliga a tolerância.
+  REFRESH_REUSE_GRACE_S: z.coerce.number().int().min(0).max(60).default(10),
   RECOVERY_SESSION_TTL: z.string().default("5m"),
   RECOVERY_QUESTIONS_DELAY_HOURS: z.coerce
     .number()
@@ -186,6 +211,9 @@ const BaseEnvSchema = z.object({
   OUTBOX_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(50),
 });
 
+const ARGON2_MIN_MEMORY_KB = 19_456;
+const ARGON2_MIN_TIME_COST = 2;
+
 const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
   if (env.EDGE_MODE === "cloudflare" && !env.CF_ORIGIN_SECRET) {
     ctx.addIssue({
@@ -201,12 +229,39 @@ const EnvSchema = BaseEnvSchema.superRefine((env, ctx) => {
       message: "não combinar TRUST_PROXY com EDGE_MODE=cloudflare",
     });
   }
-  if (env.NODE_ENV === "production" && !env.IP_HASH_SECRET) {
-    ctx.addIssue({
-      code: "custom",
-      path: ["IP_HASH_SECRET"],
-      message: "obrigatório em produção",
-    });
+  if (env.NODE_ENV === "production") {
+    // Sem estes, a API arrancaria «a meio»: sem base de dados as rotas de auth não existem e
+    // sem Redis o rate limit fica só em memória (por instância).
+    for (const key of [
+      "IP_HASH_SECRET",
+      "DATABASE_URL",
+      "REDIS_URL",
+      "JWT_PRIVATE_JWK",
+      "JWT_PUBLIC_JWK",
+    ] as const) {
+      if (!env[key]) {
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message: "obrigatório em produção",
+        });
+      }
+    }
+    // Mínimos OWASP para argon2id (19 MiB, 2 iterações): impede um .env fraco em produção.
+    if (env.ARGON2_MEMORY_KB < ARGON2_MIN_MEMORY_KB) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ARGON2_MEMORY_KB"],
+        message: `em produção tem de ser pelo menos ${ARGON2_MIN_MEMORY_KB}`,
+      });
+    }
+    if (env.ARGON2_TIME_COST < ARGON2_MIN_TIME_COST) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ARGON2_TIME_COST"],
+        message: `em produção tem de ser pelo menos ${ARGON2_MIN_TIME_COST}`,
+      });
+    }
   }
 });
 

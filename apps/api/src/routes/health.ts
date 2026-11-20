@@ -2,17 +2,23 @@ import { DeepHealthResponse, HealthResponse } from "@comunidade/shared";
 import type { FastifyInstance } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import type { Redis } from "ioredis";
-import { Client as PgClient } from "pg";
+import type { Pool } from "pg";
 import type { Env } from "../env.js";
 
 export interface HealthRoutesOptions {
   env: Env;
   redis: Redis | null;
+  /** Pool da aplicação: o `/health/deep` reutiliza-o em vez de abrir uma ligação por pedido. */
+  pool: Pool | null;
 }
+
+/** Limite próprio do `/health/deep` (público, toca na BD e no Redis), por IP. */
+const DEEP_RATE_LIMIT = { max: 30, timeWindow: "1 minute" } as const;
+const CHECK_TIMEOUT_MS = 2000;
 
 export async function healthRoutes(
   app: FastifyInstance,
-  { env, redis }: HealthRoutesOptions,
+  { env, redis, pool }: HealthRoutesOptions,
 ): Promise<void> {
   const f = app.withTypeProvider<ZodTypeProvider>();
 
@@ -28,10 +34,12 @@ export async function healthRoutes(
 
   f.get(
     "/health/deep",
-    { schema: { response: { 200: DeepHealthResponse } } },
+    {
+      config: { rateLimit: DEEP_RATE_LIMIT },
+      schema: { response: { 200: DeepHealthResponse } },
+    },
     async (_req, reply) => {
-      const db = await checkDb(env.DATABASE_URL);
-      const rd = await checkRedis(redis);
+      const [db, rd] = await Promise.all([checkDb(pool), checkRedis(redis)]);
       const allOk =
         (db === "ok" || db === "not_configured") &&
         (rd === "ok" || rd === "not_configured");
@@ -47,27 +55,30 @@ export async function healthRoutes(
 
 type Check = "ok" | "fail" | "not_configured";
 
-async function checkDb(url: string | undefined): Promise<Check> {
-  if (!url) return "not_configured";
-  const client = new PgClient({
-    connectionString: url,
-    connectionTimeoutMillis: 2000,
+/** Rejeita se a operação não terminar a tempo (o timer não mantém o processo vivo). */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("timeout")), ms);
+    timer.unref();
   });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function checkDb(pool: Pool | null): Promise<Check> {
+  if (!pool) return "not_configured";
   try {
-    await client.connect();
-    await client.query("SELECT 1");
+    await withTimeout(pool.query("SELECT 1"), CHECK_TIMEOUT_MS);
     return "ok";
   } catch {
     return "fail";
-  } finally {
-    await client.end().catch(() => {});
   }
 }
 
 async function checkRedis(redis: Redis | null): Promise<Check> {
   if (!redis) return "not_configured";
   try {
-    const pong = await redis.ping();
+    const pong = await withTimeout(redis.ping(), CHECK_TIMEOUT_MS);
     return pong === "PONG" ? "ok" : "fail";
   } catch {
     return "fail";

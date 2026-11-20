@@ -126,6 +126,9 @@ export const refreshTokens = pgTable(
     familyId: uuid("family_id").notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    // Preenchido só quando o token foi substituído por rotação (não em logout nem em revogação
+    // em massa): é o que permite tolerar o reenvio do token antigo durante poucos segundos.
+    rotatedAt: timestamp("rotated_at", { withTimezone: true }),
     createdAt: createdAt(),
   },
   (t) => [

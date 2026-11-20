@@ -77,6 +77,16 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Migrações em sincronia com o schema
+        run: |
+          pnpm --filter @comunidade/api exec drizzle-kit check
+          pnpm --filter @comunidade/api exec drizzle-kit generate --name=ci_drift
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::O schema difere das migrações. Corre 'pnpm --filter @comunidade/api db:generate' e faz commit."
+            git status --porcelain
+            exit 1
+          fi
+
       - name: Test
         run: pnpm test:ci
 

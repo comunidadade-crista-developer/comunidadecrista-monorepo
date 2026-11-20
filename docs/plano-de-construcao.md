@@ -4,6 +4,34 @@
 **Estratégia**: backend-first, com _test gate_ obrigatório entre etapas
 **Princípio**: nenhuma etapa avança sem a suite de testes verde e o deploy de preview a funcionar
 
+## Estado actual (2026-11-20)
+
+| Etapa  | Estado                                       | Registo                                                                                                                                                             |
+| ------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E0–E2  | Feitas                                       | —                                                                                                                                                                   |
+| E3     | Feita                                        | [E3](registos/E3-gospel-cards-cache.md)                                                                                                                             |
+| E4     | Feita                                        | [E4a](registos/E4a-base-posts-denuncias.md) · [E4b](registos/E4b-servicos-posts.md) · [E4c](registos/E4c-rotas-cache-sync.md) · [E4d](registos/E4d-documentacao.md) |
+| E5     | Feita                                        | [E5+E6](registos/E5-E6-sync-worker-admin.md)                                                                                                                        |
+| E6     | Feita (backend do admin; ADR-015)            | [E5+E6](registos/E5-E6-sync-worker-admin.md)                                                                                                                        |
+| RB     | Revisão do backend: RB-a, RB-b, RB-c         | [RB](registos/RB-revisao-backend.md)                                                                                                                                |
+| E7–E12 | **Por fazer** (frontend); contrato congelado | —                                                                                                                                                                   |
+
+**Backend fechado e revisto.** Em falta no backend, fora do caminho crítico: `/users/me/*`
+(alterar username e palavra-passe, listas de posts e denúncias), necessário para o T11.1–T11.3.
+
+**Desvios face ao plano** (decisões tomadas ao implementar; o texto das etapas abaixo mantém-se
+como foi planeado):
+
+| Plano                                        | Realidade                                                                                     |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Palavra-passe mínima de 6 (T2.3)             | 8 a 128 caracteres (`password-policy.ts`)                                                     |
+| Login: 5 por 15 min por IP+utilizador (T2.4) | Três baldes: IP+utilizador (5), IP (30) e conta (20) por 15 min                               |
+| Testcontainers no CI (§2)                    | Postgres e Redis como _service containers_ do GitHub Actions                                  |
+| Refresh de uso único estrito (T2.5)          | Tolerância de 10 s ao reenvio, só após rotação ([ADR-006](Arquitectura/adr/ADR-006.md), RB-b) |
+| Promoção a admin por «CLI/DB» (T6.6)         | `admin:promote` / `admin:demote` ([ADR-015](Arquitectura/adr/ADR-015.md))                     |
+| `docs/api.md` e `docs/runbook.md`            | `docs/api/api.md` e `docs/runbooks/runbook.md`                                                |
+| Cache do feed de 60 s (T4.9)                 | `FEED_CACHE_TTL_S` (30 s), versionada                                                         |
+
 ---
 
 ## 1. Princípios de execução
@@ -168,9 +196,9 @@ Escala de esforço relativo: **XS** (< ½ dia) · **S** (½–1 dia) · **M** (1
 | ---- | ---------------------------------------------------------------------------------- | ------- |
 | T3.1 | `GET /gospel-cards` (lista ordenada; sem paginação, máx. 200 validado no seed)     | S       |
 | T3.2 | `GET /gospel-cards/:slug`                                                          | S       |
-| T3.3 | Camada de cache L1 (memória) + L2 (Redis versionado) com fallback se o Redis falha | S       |
+ | T3.3 | Camada de cache L1 (memória) + L2 (Redis versionado) com fallback se o Redis falha | S       |
 | T3.4 | Cache de `cards:list` (TTL 1h) e `card:{slug}` (TTL 1h)                            | XS      |
-| T3.5 | Invalidação em seed                                                                | XS      |
+| T3.5 | Invalidação em seed                                                              | XS      |
 
 **Testes obrigatórios**
 

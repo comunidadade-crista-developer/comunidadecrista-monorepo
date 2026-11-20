@@ -1,6 +1,36 @@
 # Comunidade Cristã — Revisão de segurança: resumo e backlog
 
-Data: 2026-10-28 · Âmbito: monorepo (API Fastify, shared, CI) · Estado: `pnpm audit` sem vulnerabilidades, testes verdes.
+Data: 2026-10-28 · Actualizado em 2026-11-20 (revisão do backend RB) · Âmbito: monorepo (API Fastify, shared, CI) · Estado: `pnpm audit` sem vulnerabilidades, testes verdes.
+
+---
+
+## 0. Estado actual (2026-11-20)
+
+O backlog da secção 2 foi escrito a 28-10 e está em grande parte **feito**. Estado de cada item
+(a revisão completa e as decisões estão em [RB](registos/RB-revisao-backend.md)):
+
+| #   | Item                                     | Estado                                                                                     |
+| --- | ---------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 1   | Denúncias                                | Feito (E4)                                                                                 |
+| 2   | Handler de erros, formato único          | Feito; 5xx genérico; `safeErrorFields` nos logs (RB-a)                                     |
+| 3   | `pg.Pool` com handler de `error`         | Feito                                                                                      |
+| 4   | Política de palavras-passe               | Feito: 8 a 128 caracteres (`packages/shared/src/password-policy.ts`)                       |
+| 5   | Eliminação de conta                      | Feito: apagamento com período de graça e purga na manutenção (ADR-012)                     |
+| 6   | Rotação de chaves JWT                    | Feito: `kid` e chave pública anterior (runbook)                                            |
+| 7   | Utilizadores reservados                  | Feito                                                                                      |
+| 8   | Posts: cursor e autoria                  | Feito (E4)                                                                                 |
+| 9   | Alterar palavra-passe                    | **Pendente** (`/users/me/*`); tem de chamar `cancelPending` e revogar sessões              |
+| 10  | Estilo/format                            | Não revisto nesta ronda                                                                    |
+| 11  | Testes em falta                          | Registo e refresh concorrentes: feito (RB-a/b). Limitador com Redis em baixo: **pendente** |
+| 12  | Cloudflare em produção                   | Pendente (deploy)                                                                          |
+| 13  | GitHub (scanning, protecção de branches) | Pendente                                                                                   |
+| 14  | Segredos e rotação                       | Pendente (deploy)                                                                          |
+
+Novo desde a secção 1: admin sem HTTP para elevar privilégio (ADR-015), limites de pedido
+(`BODY_LIMIT_BYTES`, `REQUEST_TIMEOUT_MS`), limite global configurável, `/health/deep` com pool e
+limite próprio, obrigatoriedade de variáveis em produção, tolerância do refresh token
+([ADR-006](Arquitectura/adr/ADR-006.md)) e procedimento de migrações no runbook. Versões e avisos
+para o deploy: [versoes-e-seguranca](runbooks/versoes-e-seguranca.md).
 
 ---
 
@@ -58,7 +88,7 @@ Data: 2026-10-28 · Âmbito: monorepo (API Fastify, shared, CI) · Estado: `pnpm
 
 ---
 
-## 2. Backlog priorizado
+## 2. Backlog priorizado (histórico, 2026-10-28; ver o estado na secção 0)
 
 ### Alta prioridade
 
@@ -90,4 +120,4 @@ Data: 2026-10-28 · Âmbito: monorepo (API Fastify, shared, CI) · Estado: `pnpm
 ### Notas
 
 - O `apps/web` é, por agora, apenas scaffold; a revisão de segurança do frontend (armazenamento de tokens, CSP, XSS) fica para quando tiver funcionalidades.
-- O `/health/deep` já exige o segredo em modo Cloudflare; em modo `none` continua aberto — proteger se a API for exposta sem Cloudflare.
+- O `/health/deep` já exige o segredo em modo Cloudflare; em modo `none` continua aberto, mas com limite próprio (30/min por IP) e a usar o pool da aplicação (RB-a).

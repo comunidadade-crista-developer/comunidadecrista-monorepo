@@ -1,16 +1,6 @@
 import type { ErrorResponse } from "@comunidade/shared";
 import type { FastifyReply, FastifyRequest } from "fastify";
-
-/**
- * Formato único de erro da API: `{ error: <código estável>, message?, fields? }`.
- *
- * - 5xx: o cliente só recebe `internal_error` (ou `service_unavailable`). Mensagens, SQL,
- *   valores e stack ficam fora da resposta E fora dos logs: os erros do Postgres trazem
- *   dados do utilizador na mensagem (ex.: «Key (username)=(x) already exists»).
- * - 4xx gerados pelo Fastify ou pelos plugins: código fixo por estado HTTP, sem repetir
- *   a mensagem original.
- * - Validação: `validation_error` + `fields` (campo → mensagem do schema).
- */
+import { safeErrorFields } from "./errors.js";
 
 const CODE_BY_STATUS: Readonly<Record<number, string>> = {
   400: "bad_request",
@@ -125,13 +115,7 @@ export function errorHandler(
     // Sem mensagem nem valores: só o suficiente para diagnosticar.
     request.log.error(
       {
-        errorName: isRecord(error)
-          ? String(error.name ?? "Error")
-          : typeof error,
-        errorCode:
-          isRecord(error) && typeof error.code === "string"
-            ? error.code
-            : undefined,
+        ...safeErrorFields(error),
         statusCode: status,
         method: request.method,
         route: request.routeOptions?.url,
