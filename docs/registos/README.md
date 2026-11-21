@@ -30,3 +30,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 | RB-a  | [Endurecimento do backend](RB-a-hardening.md)                                                             | Feito  |
 | RB-b  | [Migrações em produção e tolerância no refresh](RB-b-migracoes-refresh.md)                                | Feito  |
 | RB-c  | [Revisão do backend](RB-revisao-backend.md) e [versões para o deploy](../runbooks/versoes-e-seguranca.md) | Feito  |
+| RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
