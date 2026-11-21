@@ -26,8 +26,7 @@ export type AdminServiceError =
   | { code: "invalid_cursor"; status: 400 };
 
 export type AdminResult<T> =
-  | { ok: true; data: T }
-  | { ok: false; error: AdminServiceError };
+  { ok: true; data: T } | { ok: false; error: AdminServiceError };
 
 const ok = <T>(data: T): AdminResult<T> => ({ ok: true, data });
 const fail = (error: AdminServiceError): AdminResult<never> => ({

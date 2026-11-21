@@ -18,7 +18,7 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
-  await closeTestDb(); 
+  await closeTestDb();
 });
 
 /** Conta com a idade mínima e uma partilha publicada: a denúncia conta para o limiar. */

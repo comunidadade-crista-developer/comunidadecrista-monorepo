@@ -196,9 +196,9 @@ Escala de esforço relativo: **XS** (< ½ dia) · **S** (½–1 dia) · **M** (1
 | ---- | ---------------------------------------------------------------------------------- | ------- |
 | T3.1 | `GET /gospel-cards` (lista ordenada; sem paginação, máx. 200 validado no seed)     | S       |
 | T3.2 | `GET /gospel-cards/:slug`                                                          | S       |
- | T3.3 | Camada de cache L1 (memória) + L2 (Redis versionado) com fallback se o Redis falha | S       |
+| T3.3 | Camada de cache L1 (memória) + L2 (Redis versionado) com fallback se o Redis falha | S       |
 | T3.4 | Cache de `cards:list` (TTL 1h) e `card:{slug}` (TTL 1h)                            | XS      |
-| T3.5 | Invalidação em seed                                                              | XS      |
+| T3.5 | Invalidação em seed                                                                | XS      |
 
 **Testes obrigatórios**
 

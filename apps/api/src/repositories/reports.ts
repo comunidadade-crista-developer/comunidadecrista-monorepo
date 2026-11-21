@@ -1,6 +1,6 @@
 import { and, count, desc, eq, lte, sql } from "drizzle-orm";
 import type { ReportCategory, ReportSeverity } from "@comunidade/shared";
-import type { DbTransaction, Executor } from "../db/client.js";   
+import type { DbTransaction, Executor } from "../db/client.js";
 import { moderationLog, posts, reports, users } from "../db/schema.js";
 import type { ModerationLogEntry, NewReport, Report } from "../db/schema.js";
 
@@ -18,7 +18,7 @@ const SEVERITIES_BY_GRAVITY: readonly ReportSeverity[] = [
   "basic",
 ];
 
-type Tx = DbTransaction;   
+type Tx = DbTransaction;
 
 export interface ReportRules {
   /** Limiares por gravidade (os que faltarem usam `REPORT_THRESHOLDS`). */
@@ -89,7 +89,7 @@ async function countValidOpenBySeverity(
   return bySeverity;
 }
 
-export function reportsRepo(db: Executor) {   
+export function reportsRepo(db: Executor) {
   return {
     async create(data: NewReport): Promise<Report | null> {
       const result = await db
@@ -301,7 +301,7 @@ export function reportsRepo(db: Executor) {
   };
 }
 
-export function moderationLogRepo(db: Executor) {   
+export function moderationLogRepo(db: Executor) {
   return {
     async create(
       data: typeof moderationLog.$inferInsert,

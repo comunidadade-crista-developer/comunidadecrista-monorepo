@@ -23,7 +23,7 @@ describe("reportsRepo", () => {
     const repo = reportsRepo(db);
     const first = await repo.create({
       postId: p.id,
-      reporterId: reporter.id, 
+      reporterId: reporter.id,
       category: "other",
       reason: "conteúdo impróprio",
     });
