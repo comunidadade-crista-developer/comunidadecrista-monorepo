@@ -8,7 +8,7 @@ import {
   REASON_REQUIRED_FOR_OTHER,
   ReportCategory,
   ReportReason,
-  ReportResponse, 
+  ReportResponse,
 } from "./posts.js";
 
 export const MAX_SYNC_BATCH_OPS = 20;

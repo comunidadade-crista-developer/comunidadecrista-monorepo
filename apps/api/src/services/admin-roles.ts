@@ -11,10 +11,7 @@ import { moderationLogRepo } from "../repositories/reports.js";
  */
 
 export type RoleChangeOutcome =
-  | "promoted"
-  | "already_admin"
-  | "demoted"
-  | "already_user";
+  "promoted" | "already_admin" | "demoted" | "already_user";
 
 export type RoleChangeError =
   /** O utilizador não existe. */

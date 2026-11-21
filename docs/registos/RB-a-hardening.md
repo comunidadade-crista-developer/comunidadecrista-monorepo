@@ -12,4 +12,4 @@ Primeiro bloco da revisão do backend (achados 1, 2, 3, 4, 7, 8 e 9).
 | 8      | CORS sem `credentials`.                                                                                                                                                         |
 | 9      | Mínimos de argon2 em produção; `index.ts` regista só `errorName`/`errorCode`.                                                                                                   |
 
-Testes novos: `errors`, `http-errors`, `env`, registo concorrente, `server.limits`.                          | Feito  |
+Testes novos: `errors`, `http-errors`, `env`, registo concorrente, `server.limits`. | Feito |

@@ -121,7 +121,7 @@ Cada decisão tem o seu ficheiro em [`adr/`](adr/README.md) (um ADR por ficheiro
 | [ADR-011](adr/ADR-011.md) | Recuperação de conta: código imediato, perguntas com atraso |
 | [ADR-012](adr/ADR-012.md) | Apagamento de conta: período de graça de 30 dias            |
 | [ADR-013](adr/ADR-013.md) | Filtro anti-spam no conteúdo                                |
-| [ADR-014](adr/ADR-014.md) | Severidade de denúncias    
+| [ADR-014](adr/ADR-014.md) | Severidade de denúncias                                     |
 | [ADR-015](adr/ADR-015.md) | Admin: criação e promoção só por CLI, mesmo login           |
 
 ## 5. Modelo de dados
@@ -262,7 +262,7 @@ erDiagram
 - Denúncias (ADR-014): `reports.severity` é uma coluna **gerada** a partir da categoria. Retirar uma denúncia passa-a a `withdrawn` (a linha fica; deixa de contar). `reports_other_requires_reason` garante o motivo em `other`.
 - `posts.review_flags` guarda os códigos que levaram a `pending_review` (sinais do filtro, ADR-013, ou `reports_<gravidade>`, ADR-014).
 - Idempotência (`post.create`): a chave é reservada **antes** de criar o post (`INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now()`), com `request_hash`; repetir a chave devolve a resposta guardada, e o mesmo valor com outro corpo é `idempotency_key_conflict`.
- - `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
+- `pending_password_resets` (1 por utilizador) e `used_recovery_sessions` (jti, purgado ao expirar) suportam a recuperação (ADR-011).
 
 ## 6. Contratos de API (resumo)
 
@@ -418,7 +418,6 @@ sequenceDiagram
 - Resultado por operação: `applied` (aplicada agora), `duplicate` (já estava aplicada: repetição da chave, like já dado, post já apagado…), `rejected` (recusa definitiva, com código: `not_found`, `forbidden`, `own_post`, `idempotency_key_conflict`, `gospel_card_not_found`, `contains_link`, `contains_contact`) e `deferred` (não foi tentada — limite, prazo do lote ou falha inesperada — e o cliente repete mais tarde; `retryAfter` quando é limite).
 - Cada operação paga os **mesmos limites por operação que o REST** (os baldes são partilhados) além do limite do lote; o `/sync` não é uma porta lateral. Prazo do lote: `SYNC_BATCH_TIMEOUT_MS` (8 s): o que não chega a correr volta `deferred`.
 - As operações correm em série, pela ordem do cliente, cada uma na sua transacção.
- 
 
 ## 9. Estratégia de caching
 
@@ -426,7 +425,6 @@ sequenceDiagram
 | ------------------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `cc:v1:feed:v<N>:<filtro>:<categoria>:<card>:<limite>` | 30 s (`FEED_CACHE_TTL_S`) | Só a 1.ª página de `recent`/`top`. `INCR` de `cc:v1:feed:version` ao publicar, apagar ou escalar um post; **likes não invalidam** |
 | `cc:v1:cards:v<N>:list` / `:item:<slug>`               | 1h (L2) / 5 min (L1)      | Só em seed: `INCR` da versão `cc:v1:cards:version`                                                                                |
- 
 
 **Regras**
 
