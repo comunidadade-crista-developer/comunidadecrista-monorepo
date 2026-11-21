@@ -10,14 +10,16 @@
 ### Backend (Render)
 
 1. Render → **New → Web Service** → conectar repositório GitHub.
-2. Runtime: Node 24.
+2. Runtime: Node 24, fixado com `NODE_VERSION=24.22.3` (ver [servico-render](servico-render.md)).
 3. Build command: `pnpm install --frozen-lockfile && pnpm --filter @comunidade/api build`
 4. Start command: `node apps/api/dist/index.js`
 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
    Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
    Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50), `REFRESH_REUSE_GRACE_S` (10; tolerância ao reenvio do refresh token, 0 desliga) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
    Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
-6. Plano: Free.
+6. Plano: Free (o Render desaconselha-o em produção; ver [servico-render](servico-render.md) §1 e os gatilhos de subida em [gestao-e-controlo](gestao-e-controlo.md) §5).
+
+O plano completo de deploy, os runbooks por serviço e o plano de gestão estão em [deploy-backend](deploy-backend.md).
 
 ### Migrações da base de dados
 
@@ -93,7 +95,7 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
 
 ## Administradores (ADR-015)
 
-O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (shell do Render, ou localmente com `DATABASE_URL` de produção), nunca por HTTP:
+O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (a partir da máquina do operador com `DATABASE_URL` de produção; o plano gratuito do Render não tem shell), nunca por HTTP:
 
 ```
 pnpm --filter @comunidade/api admin:promote <username>   # a conta já tem de existir

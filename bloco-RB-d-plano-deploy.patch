@@ -1,0 +1,722 @@
+diff --git a/docs/registos/RB-d-plano-deploy.md b/docs/registos/RB-d-plano-deploy.md
+new file mode 100644
+index 0000000..d90ef2c
+--- /dev/null
++++ b/docs/registos/RB-d-plano-deploy.md
+@@ -0,0 +1,38 @@
++# RB-d — Plano de deploy do backend
++
++Plano completo em etapas, runbooks por serviço e plano de gestão e controlo, antes de interligar os serviços.
++
++## Decisões (2026-11-20)
++
++Sem domínio no arranque (`EDGE_MODE=none` com proxy de confiança), Node 24.22.3, Postgres 17, uma só região
++(Frankfurt), um operador. Multi-região rejeitada para o MVP: há um único Postgres de escrita e o plano gratuito do
++Render só tem uma instância.
++
++## Documentos
++
++- [deploy-backend](../runbooks/deploy-backend.md): decisões, riscos R1 a R7 e as Etapas 0 a 9 com critérios de saída.
++- [servico-github](../runbooks/servico-github.md), [servico-neon](../runbooks/servico-neon.md),
++  [servico-upstash](../runbooks/servico-upstash.md), [servico-render](../runbooks/servico-render.md),
++  [servico-monitorizacao](../runbooks/servico-monitorizacao.md).
++- [gestao-e-controlo](../runbooks/gestao-e-controlo.md): papéis, acessos, segredos, mudanças, quotas, incidentes, backups e revisões.
++
++## Riscos encontrados na pesquisa
++
++O Render desaconselha o plano gratuito em produção; o worker do outbox pode esgotar as 100 CU-horas da Neon (estimativa:
++~127 com a API acordada 17 h/dia); a Upstash gratuita tem 500 mil comandos/mês; a Neon gratuita só guarda 6 h de histórico.
++Cada um tem mitigação e gatilho de subida definidos.
++
++## Validado
++
++O role `comunidade_app` (só DML) foi testado num Postgres 16 local: lê, escreve, usa `FOR UPDATE` e advisory locks, e não
++consegue criar nem apagar tabelas.
++
++## Por confirmar na consola (não verificado)
++
++Frankfurt no plano gratuito da Upstash e do Render; comportamento da Upstash ao esgotar a quota; nomes exactos das opções
++de Auto-Deploy e Rollback no Render; termos do UptimeRobot; limite de ligações do _pooler_ da Neon.
++
++## Fora deste bloco (precisa de autorização)
++
++Alinhar `docker-compose.yml` e CI a Postgres 17; _script_ de smoke; _script_ de benchmark do argon2; _workflow_ de backup;
++worker do outbox com recuo quando não há eventos (se o risco R2 se confirmar).
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index d294475..4b347be 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -30,3 +30,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-a  | [Endurecimento do backend](RB-a-hardening.md)                                                             | Feito  |
+ | RB-b  | [Migrações em produção e tolerância no refresh](RB-b-migracoes-refresh.md)                                | Feito  |
+ | RB-c  | [Revisão do backend](RB-revisao-backend.md) e [versões para o deploy](../runbooks/versoes-e-seguranca.md) | Feito  |
++| RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+new file mode 100644
+index 0000000..c58731a
+--- /dev/null
++++ b/docs/runbooks/deploy-backend.md
+@@ -0,0 +1,131 @@
++# Plano de deploy do backend
++
++**Estado**: plano aprovado nas decisões (2026-11-20); execução por etapas. Cada etapa tem critério de
++saída: só se avança com ele cumprido. Os runbooks por serviço estão ligados em cada etapa; o controlo
++contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
++
++## 1. Decisões tomadas
++
++| Tema     | Decisão                                                                                                                                                                           |
++| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Domínio  | **Sem domínio** no arranque. API em `*.onrender.com`; `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS` a validar (Etapa 6). Cloudflare à frente só quando houver domínio. |
++| Node     | **24.22.3** fixado com `NODE_VERSION` no Render (o Render usa 24.22.1 por omissão em serviços novos, anterior ao aviso de 11-11-2026).                                            |
++| Postgres | **17** na Neon; `docker-compose.yml` e CI alinhados (bloco próprio, Etapa 1).                                                                                                     |
++| Região   | **Frankfurt** para Render, Neon e Upstash (uma só região; multi-região fica para quando houver adesão).                                                                           |
++| Operação | **Um operador** no MVP; o plano de gestão prevê o risco e o crescimento.                                                                                                          |
++| Branches | `master` = produção; `dev` = integração.                                                                                                                                          |
++| Frontend | Fora deste plano (Cloudflare Pages, depois).                                                                                                                                      |
++
++## 2. Riscos identificados na pesquisa (2026-11-20)
++
++| #   | Risco                                                                                                                                                                                                                                                                                                            | Mitigação / decisão                                                                                                                                                                                                                                      |
++| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| R1  | A documentação do Render diz para **não usar o plano gratuito em produção**: a API adormece após 15 min sem tráfego (~1 min a acordar), pode reiniciar a qualquer momento, não há shell nem _jobs_ pontuais e há 750 horas de instância por mês. O worker do outbox e a manutenção só correm com a API acordada. | Arrancar no gratuito (decisão do MVP) com **gatilhos de subida** definidos em [gestao-e-controlo](gestao-e-controlo.md) §5. A ausência de shell é contornada com os comandos a partir da máquina do operador.                                            |
++| R2  | **Neon gratuita: 100 CU-horas/mês**. O worker do outbox consulta a base de dados de 5 em 5 s enquanto a API está acordada, e a Neon só suspende após 5 min sem actividade: com a API acordada 17 h/dia, o compute fica ligado ~510 h/mês, o que a 0,25 CU dá ~127 CU-h (**estimativa**, acima das 100).          | Medir o consumo real na primeira semana (Etapa 9). Opções por ordem: encurtar a janela do cron; alargar `OUTBOX_WORKER_INTERVAL_MS`; **mudar o worker para recuar quando não há eventos** (alteração de código, precisa de autorização); subir de plano. |
++| R3  | **Upstash gratuita: 500 mil comandos/mês e 250 MB**. O rate limit e a cache gastam comandos em quase todos os pedidos; poucos milhares de pedidos por dia podem esgotá-los. Se o Redis falhar, o limitador cai para memória (por instância) e a cache do feed fica só em L1.                                     | Medir comandos por fluxo (Etapa 7), alertar a 70 % (Etapa 8) e subir para o plano por consumo antes de esgotar.                                                                                                                                          |
++| R4  | **Sem Cloudflare à frente**: sem WAF nem protecção de DDoS na borda; o IP vem de `X-Forwarded-For` do proxy do Render.                                                                                                                                                                                           | Limites da API (global, por rota, por conta), corpo e tempo máximos; validar o IP real (Etapa 6); Cloudflare quando houver domínio (runbook «IP do cliente, proxy e Cloudflare»).                                                                        |
++| R5  | **Backups da Neon gratuita: 6 h de histórico e 1 _snapshot_ manual.** Um erro descoberto no dia seguinte não se recupera pela Neon.                                                                                                                                                                              | `pg_dump` diário para fora da Neon (Etapa 8), com restauro testado.                                                                                                                                                                                      |
++| R6  | **Monitorização 24/7 contra a janela de adormecer**: um monitor que bata em `/health` a toda a hora mantém a API acordada 24/7 e, por R2, a base de dados também.                                                                                                                                                | Monitores só na janela activa, ou aceitar o custo (ver [servico-monitorizacao](servico-monitorizacao.md)).                                                                                                                                               |
++| R7  | **Operador único**: perda de acesso às contas ou aos segredos pára tudo.                                                                                                                                                                                                                                         | Cofre de recuperação e 2FA com códigos de recurso ([gestao-e-controlo](gestao-e-controlo.md) §2).                                                                                                                                                        |
++
++## 3. Etapas
++
++### Etapa 0 — Decisões e pré-requisitos ✅ (decisões tomadas)
++
++- [x] Domínio, Node, Postgres, região, operação (secção 1).
++- [x] Contas criadas (Neon, Upstash, Render, Cloudflare), ainda **não interligadas**.
++- [ ] Email de suporte e de segurança definido (para o `SECURITY.md`).
++- [ ] Gestor de palavras-passe escolhido (cofre dos segredos).
++
++**Saída**: tudo marcado.
++
++### Etapa 1 — Repositório pronto ([servico-github](servico-github.md))
++
++- [ ] Branch `master` protegida; checks obrigatórios: _Lint, Typecheck, Test, Build_, _Dependency audit_ e _CodeQL_.
++- [ ] _Secret scanning_, _push protection_, _Dependabot alerts_ e _private vulnerability reporting_ activos.
++- [ ] `SECURITY.md` com o contacto real.
++- [ ] **Bloco de alinhamento a Postgres 17** (`docker-compose.yml` e CI): _precisa de autorização_; obriga a recriar o volume local (`docker compose down -v`).
++- [ ] CI verde em `dev` e `master`; `pnpm audit` sem resultados.
++- [ ] Teste local do build de produção: `pnpm build` e `node apps/api/dist/index.js` com `NODE_ENV=production` e variáveis de teste.
++
++**Saída**: o build de produção arranca localmente e a CI está verde.
++
++### Etapa 2 — Dados ([servico-neon](servico-neon.md), [servico-upstash](servico-upstash.md))
++
++- [ ] Neon: projecto em Frankfurt, Postgres 17, _autosuspend_ de 5 min (não se desliga no plano gratuito).
++- [ ] Neon: roles separados — dono (migrações) e `comunidade_app` (só DML), com os _timeouts_ no role da aplicação.
++- [ ] Upstash: base de dados em Frankfurt (confirmar disponibilidade na consola), TLS, `rediss://`.
++- [ ] Guardar as duas _strings_ de ligação da Neon (directa e _pooler_) e a do Redis no cofre.
++
++**Saída**: `psql` e `redis-cli` ligam com as credenciais finais; o role da aplicação não consegue criar tabelas.
++
++### Etapa 3 — Segredos ([gestao-e-controlo](gestao-e-controlo.md) §2)
++
++- [ ] Par de chaves JWT: `pnpm --filter @comunidade/api generate-jwt-keys`.
++- [ ] `IP_HASH_SECRET`: `openssl rand -base64 48`.
++- [ ] Tabela de variáveis de produção preenchida ([servico-render](servico-render.md) §3), com cópia no cofre.
++
++**Saída**: nenhuma variável obrigatória em falta (a API recusa arrancar sem elas).
++
++### Etapa 4 — Migrar e semear
++
++- [ ] `db:migrate` contra a Neon pela ligação **directa**, como dono (runbook «Migrações da base de dados»).
++- [ ] Verificar as 8 migrações em `drizzle.__drizzle_migrations` e as tabelas.
++- [ ] Atribuir os privilégios ao `comunidade_app` ([servico-neon](servico-neon.md) §4).
++- [ ] `db:seed` com o conteúdo dos _gospel cards_ (conteúdo a fornecer).
++
++**Saída**: esquema e _seed_ verificados por queries; o role da aplicação lê e escreve.
++
++### Etapa 5 — API no Render ([servico-render](servico-render.md))
++
++- [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3`, _health check_ em `/health` e **Auto-Deploy desligado**.
++- [ ] Variáveis de produção introduzidas (secção 3 do runbook do Render).
++- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (um _script_ de medição é opcional, _precisa de autorização_).
++- [ ] Primeiro deploy manual; logs de arranque sem avisos inesperados.
++
++**Saída**: `GET /health` e `GET /health/deep` respondem `200`; nos logs não há erros.
++
++### Etapa 6 — Borda e IP real (sem domínio)
++
++- [ ] `TRUST_PROXY=true` e `EDGE_MODE=none`. Descobrir o número de saltos: ver [servico-render](servico-render.md) §6.
++- [ ] Teste de duas redes: esgotar um limite (registo) numa rede e confirmar que **outra rede** (dados móveis) não fica bloqueada; confirmar que um `X-Forwarded-For` forjado não contorna o limite.
++- [ ] `CORS_ORIGIN` com a origem do frontend (ou `http://localhost:5173` só enquanto não há frontend).
++- [ ] Aviso de arranque de proxy (RB-a) ausente nos logs.
++
++**Saída**: o limite por IP é por cliente, não global, e não é contornável com cabeçalhos forjados.
++
++### Etapa 7 — Smoke test funcional
++
++- [ ] Registo, login, `GET /auth/me`, refresh, logout, recuperação (código e perguntas).
++- [ ] Feed, criar partilha, gostar, denunciar, `/sync`.
++- [ ] Primeiro admin: `admin:promote` a partir da máquina do operador com o `DATABASE_URL` de produção; aprovar e rejeitar uma partilha.
++- [ ] Limites: provocar um `429` num fluxo seguro.
++- [ ] Medir comandos Redis por fluxo na consola da Upstash (R3).
++- [ ] Opcional: _script_ de smoke repetível (_precisa de autorização_).
++
++**Saída**: todos os fluxos verdes em produção e o consumo por fluxo anotado.
++
++### Etapa 8 — Operação ([servico-monitorizacao](servico-monitorizacao.md))
++
++- [ ] Cron de `/health` (14 min, janela decidida) e monitor de disponibilidade.
++- [ ] Alertas por email: falha de `/health`, 5xx, quotas (Neon CU-horas, Upstash comandos, Render horas).
++- [ ] Backup diário com `pg_dump` (_workflow_ do GitHub: precisa de autorização) e **restauro testado** num _branch_ da Neon.
++- [ ] Procedimento de _rollback_ ensaiado ([servico-render](servico-render.md) §7).
++
++**Saída**: um restauro de backup e um _rollback_ ensaiados.
++
++### Etapa 9 — Go/no-go e observação (48 h)
++
++- [ ] Lista de [versoes-e-seguranca](versoes-e-seguranca.md) §5 cumprida e pesquisa de versões repetida.
++- [ ] Revisão ao fim de 48 h e de 7 dias: `token_reuse`, 5xx, `rate_limited`, _cold starts_, consumo das quotas (R1 a R3).
++- [ ] Decisão registada: manter o plano gratuito ou activar um gatilho de subida.
++
++**Saída**: registo `docs/registos/` da primeira semana em produção.
++
++## 4. Ordem de um deploy normal (depois da Etapa 5)
++
++1. CI verde em `master`.
++2. Se há migrações: backup/ponto de retorno e `db:migrate` (compatível com a versão anterior).
++3. Deploy manual no Render do _commit_ de `master`.
++4. Verificar `/health`, `/health/deep` e os logs; correr o _smoke_.
++5. Se falhar: _rollback_ para o deploy anterior (as migrações compatíveis permitem-no).
+diff --git a/docs/runbooks/gestao-e-controlo.md b/docs/runbooks/gestao-e-controlo.md
+new file mode 100644
+index 0000000..a628deb
+--- /dev/null
++++ b/docs/runbooks/gestao-e-controlo.md
+@@ -0,0 +1,127 @@
++# Plano de gestão e controlo (produção)
++
++Define quem faz o quê, como se controlam os acessos, os segredos, as mudanças, os custos e os incidentes, e
++quando se revê tudo. Escrito para **um operador** (MVP) e pronto para crescer (§9).
++Complementa [deploy-backend](deploy-backend.md) e os runbooks por serviço.
++
++## 1. Papéis
++
++| Papel                 | Quem (MVP)                                          | Responsabilidades                                                                |
++| --------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------- |
++| Operador              | o próprio                                           | Deploys, migrações, segredos, alertas, backups, incidentes, revisões periódicas. |
++| Revisor de código     | o próprio, com os checks da CI como segunda opinião | PR com CI verde e revisão do diff antes de fundir.                               |
++| Moderador (admin app) | o próprio                                           | Fila de revisão no painel admin (ADR-015).                                       |
++
++**Risco do operador único**: se perder o acesso às contas ou ao cofre, tudo pára (R7). Mitigação em §2.
++
++## 2. Controlo de acessos
++
++| Conta / sistema          | Dono     | 2FA                                              | Notas                                                     |
++| ------------------------ | -------- | ------------------------------------------------ | --------------------------------------------------------- |
++| GitHub                   | operador | chave de segurança ou _app_ + códigos de recurso | Ver [servico-github](servico-github.md).                  |
++| Render                   | operador | idem                                             | Quem altera variáveis lê todos os segredos da API.        |
++| Neon                     | operador | idem                                             | Dono do projecto = dono da base de dados.                 |
++| Upstash                  | operador | idem                                             |                                                           |
++| Cloudflare               | operador | idem                                             | Só o Pages (frontend); a API fica fora até haver domínio. |
++| Gestor de palavras-passe | operador | chave de segurança                               | Cofre de todos os segredos e códigos de recurso.          |
++
++Regras:
++
++1. **2FA em todas as contas**, com códigos de recurso guardados **fora** do cofre principal (papel em local seguro) —
++   é o plano de recuperação do operador único.
++2. Palavras-passe únicas e longas, só no cofre; nunca em chat, email, tickets ou no repositório.
++3. Um **contacto de emergência** (pessoa de confiança) com instruções seladas para recuperar o cofre, a definir antes
++   de haver utilizadores reais (decisão do operador).
++4. Ligar a base de dados de produção só a partir da máquina do operador, por ligação directa, com o role mínimo (§3).
++5. Revisão de acessos trimestral (§8): quem tem acesso a quê; _tokens_ de API e chaves de implementação não usados são removidos.
++
++## 3. Segredos: inventário e rotação
++
++| Segredo                                 | Onde vive                   | Quem o usa           | Rotação proposta                                   | Procedimento                                      |
++| --------------------------------------- | --------------------------- | -------------------- | -------------------------------------------------- | ------------------------------------------------- |
++| `JWT_PRIVATE_JWK` / `JWT_PUBLIC_JWK`    | Render + cofre              | API                  | Anual, ou de imediato se houver suspeita           | Runbook «Rotação de chaves JWT» (sem _downtime_)  |
++| `IP_HASH_SECRET`                        | Render + cofre              | API                  | Só em incidente (reinicia os contadores de limite) | Trocar e redeploy; os baldes zeram                |
++| Palavra-passe `comunidade_app` (Neon)   | Render + cofre              | API, CLI do operador | Semestral, ou em incidente                         | `ALTER ROLE`, actualizar `DATABASE_URL`, redeploy |
++| Palavra-passe do dono (Neon)            | cofre                       | operador (migrações) | Semestral, ou em incidente                         | Console da Neon                                   |
++| `REDIS_URL` (Upstash)                   | Render + cofre              | API                  | Semestral, ou em incidente                         | Regenerar na consola, actualizar, redeploy        |
++| Token/segredo de backup (leitura da BD) | GitHub Secrets + cofre      | _workflow_ de backup | Semestral                                          | Novo role de leitura, actualizar o segredo        |
++| `CF_ORIGIN_SECRET` (futuro)             | Render + Cloudflare + cofre | API, Cloudflare      | Semestral                                          | Runbook «Rotação do segredo de origem»            |
++
++Regras: um segredo só existe nos locais da tabela; ao rodar, **apagar o antigo** de todos; registar a data da
++última rotação no cofre (campo de nota). Qualquer segredo visto num log, PR, chat ou _screenshot_ é tratado como
++comprometido (§6).
++
++## 4. Controlo de mudanças
++
++1. Toda a mudança entra por PR com a CI verde (lint, tipos, testes, build, drift de migrações, auditoria, CodeQL).
++2. **Mudanças de esquema**: migração compatível com a versão anterior (_expand/contract_), ponto de retorno antes de
++   aplicar, `db:migrate` **antes** do deploy, e os `GRANT` do `comunidade_app` verificados depois.
++3. **Mudanças de variáveis no Render**: registadas na tabela do [servico-render](servico-render.md) §3 e no cofre; alteram o
++   comportamento e reiniciam o serviço — fazer fora da janela de pico.
++4. **Deploys manuais** de um _commit_ de `master` com a CI verde (nunca de `dev`).
++5. **Janela de mudança**: preferir a hora de menor tráfego observada; não fazer deploy à sexta ao fim do dia.
++6. Cada deploy fica anotado com `APP_VERSION` (o _commit_), data e resultado do _smoke_.
++
++## 5. Quotas, custos e gatilhos de subida
++
++Vigiar **semanalmente** (e ao fim de 48 h do deploy):
++
++| Recurso                          | Limite gratuito             | Alerta (70 %) | Gatilho de subida (90 % ou sintoma)    | Opções                                                                     |
++| -------------------------------- | --------------------------- | ------------- | -------------------------------------- | -------------------------------------------------------------------------- |
++| Render: horas de instância       | 750 h/mês                   | 525 h         | Horas > 675 ou queixas de _cold start_ | Encurtar a janela do cron; plano pago sem adormecer                        |
++| Neon: CU-horas                   | 100 CU-h/mês                | 70 CU-h       | > 90 CU-h antes do dia 25 do mês       | Alargar `OUTBOX_WORKER_INTERVAL_MS`; worker com recuo (código); plano pago |
++| Neon: armazenamento              | 1 GB                        | 700 MB        | > 900 MB                               | Purgas e retenção (`moderation_log`, `outbox`); plano pago                 |
++| Upstash: comandos                | 500 mil/mês                 | 350 mil       | > 450 mil ou limite esgotado           | Plano por consumo; reduzir o consumo por pedido                            |
++| Upstash: dados                   | 250 MB                      | 175 MB        | > 225 MB                               | Rever TTL das chaves                                                       |
++| Render: largura de banda/_build_ | quota do espaço de trabalho | consola       | Aviso de suspensão                     | Ligar um método de pagamento com limite de gasto                           |
++
++**Gatilhos de negócio para o plano pago do Render**: utilizadores activos regulares, queixas de lentidão da primeira
++abertura, ou necessidade de a API estar acordada 24/7. Decidir com os números da §5 e registar em `docs/registos/`.
++
++## 6. Incidentes
++
++| Gravidade | Exemplos                                                                                       | Resposta           |
++| --------- | ---------------------------------------------------------------------------------------------- | ------------------ |
++| SEV1      | API fora > 15 min na janela activa; suspeita de fuga de dados ou de segredo; dados corrompidos | Agir de imediato   |
++| SEV2      | Degradação (latência, 5xx pontuais, quota esgotada com fallback); falha do backup              | No próprio dia     |
++| SEV3      | Aviso do Dependabot, comportamento menor, pedido de utilizador                                 | Na revisão semanal |
++
++Passos: **1.** Conter (suspender o serviço, revogar o segredo, `INCR cc:v1:feed:version`, _rollback_). **2.** Diagnosticar
++nos logs (sem IPs nem dados pessoais). **3.** Corrigir à frente ou restaurar. **4.** Rodar os segredos envolvidos.
++**5.** Registar em `docs/registos/` (o quê, quando, causa, correcção, o que muda). Em suspeita de fuga de dados pessoais,
++avaliar as obrigações legais de notificação (por exemplo o RGPD, 72 horas à autoridade quando aplicável; não é parecer jurídico).
++
++Segredo comprometido: revogar na origem → rodar → redeploy → procurar uso indevido → registar.
++
++## 7. Backups e continuidade
++
++| Objectivo                        | Valor proposto                                                             |
++| -------------------------------- | -------------------------------------------------------------------------- |
++| RPO (perda máxima de dados)      | 24 h (um `pg_dump` diário); 6 h para erros recentes pelo histórico da Neon |
++| RTO (tempo para repor o serviço) | 4 h, com o restauro ensaiado                                               |
++| Retenção                         | 7 diários e 4 semanais, cifrados, fora da Neon                             |
++
++**Registo de restauros testados** (preencher):
++
++| Data | Origem do backup | Destino | Resultado | Duração |
++| ---- | ---------------- | ------- | --------- | ------- |
++|      |                  |         |           |         |
++
++Um backup sem restauro testado não conta como backup.
++
++## 8. Calendário de revisões
++
++| Frequência | O quê                                                                                                                                                     |
++| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Semanal    | Quotas (§5); PR do Dependabot; alertas; 5xx, `token_reuse` e `rate_limited` nos logs; fila de moderação.                                                  |
++| Mensal     | `pnpm audit` e pesquisa de versões ([versoes-e-seguranca](versoes-e-seguranca.md)); Node/Postgres _patch_; teste do _rollback_ se houve mudanças grandes. |
++| Trimestral | Revisão de acessos (§2); restauro de backup testado (§7); revisão deste plano; revisão de `SECURITY.md`.                                                  |
++| Semestral  | Rotação de palavras-passe e segredos (§3).                                                                                                                |
++| Anual      | Rotação das chaves JWT; revisão do modelo de ameaças ([resumo-seguranca](../resumo-seguranca.md)).                                                        |
++
++## 9. Crescer: de um operador para uma equipa
++
++Quando houver uma segunda pessoa: contas nominais (nunca partilhar logins), papéis separados (quem faz deploy ≠ quem
++guarda os segredos de rotação), revisão de PR por outra pessoa (activar a revisão obrigatória), cofre partilhado com
++permissões, registo de quem acedeu à base de dados, _on-call_ simples e este plano revisto. O TOTP para
++administradores da aplicação (ADR-015) e o plano pago do Render e da Neon entram aqui.
+diff --git a/docs/runbooks/runbook.md b/docs/runbooks/runbook.md
+index f2fe0a5..c46c471 100644
+--- a/docs/runbooks/runbook.md
++++ b/docs/runbooks/runbook.md
+@@ -10,14 +10,16 @@
+ ### Backend (Render)
+ 
+ 1. Render → **New → Web Service** → conectar repositório GitHub.
+-2. Runtime: Node 24.
++2. Runtime: Node 24, fixado com `NODE_VERSION=24.22.3` (ver [servico-render](servico-render.md)).
+ 3. Build command: `pnpm install --frozen-lockfile && pnpm --filter @comunidade/api build`
+ 4. Start command: `node apps/api/dist/index.js`
+ 5. Env vars obrigatórias: `NODE_ENV=production`, `APP_VERSION`, `LOG_LEVEL=info`, `CORS_ORIGIN`, `DATABASE_URL`, `REDIS_URL`, `JWT_PRIVATE_JWK`, `JWT_PUBLIC_JWK`, `IP_HASH_SECRET`; com Cloudflare, também `EDGE_MODE=cloudflare` e `CF_ORIGIN_SECRET` (ver "IP do cliente, proxy e Cloudflare").
+    Opcionais: `JWT_PUBLIC_JWK_PREVIOUS` (só durante uma rotação), `ACCOUNT_DELETION_GRACE_DAYS` (30), `MAINTENANCE_INTERVAL_MINUTES` (60), `DB_POOL_MAX` e `DB_QUERY_TIMEOUT_MS`.
+    Partilhas e `/sync` (E4): `POSTS_DELETED_RETENTION_DAYS` (30; dias até purgar as partilhas apagadas pelo autor), `FEED_CACHE_TTL_S` (30), `SYNC_BATCH_TIMEOUT_MS` (8000; manter abaixo do timeout do proxy), `OUTBOX_WORKER_INTERVAL_MS` (5000), `OUTBOX_WORKER_BATCH_SIZE` (50), `REFRESH_REUSE_GRACE_S` (10; tolerância ao reenvio do refresh token, 0 desliga) e os limites `RATE_LIMIT_FEED_*`, `RATE_LIMIT_POSTS_CREATE_*`, `RATE_LIMIT_POSTS_DELETE_*`, `RATE_LIMIT_LIKES_*`, `RATE_LIMIT_REPORTS_*`, `RATE_LIMIT_SYNC_*`, `RATE_LIMIT_ADMIN_READ_*` e `RATE_LIMIT_ADMIN_WRITE_*` (valores por omissão em `.env.example`).
+    Neon: definir os timeouts ao nível do role (`ALTER ROLE <role> SET statement_timeout='10s'; ALTER ROLE <role> SET idle_in_transaction_session_timeout='15s';`), não por parâmetros de ligação (o pooler não os aceita).
+-6. Plano: Free.
++6. Plano: Free (o Render desaconselha-o em produção; ver [servico-render](servico-render.md) §1 e os gatilhos de subida em [gestao-e-controlo](gestao-e-controlo.md) §5).
++
++O plano completo de deploy, os runbooks por serviço e o plano de gestão estão em [deploy-backend](deploy-backend.md).
+ 
+ ### Migrações da base de dados
+ 
+@@ -93,7 +95,7 @@ Rodar também `IP_HASH_SECRET`/`CF_ORIGIN_SECRET` se a plataforma esteve comprom
+ 
+ ## Administradores (ADR-015)
+ 
+-O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (shell do Render, ou localmente com `DATABASE_URL` de produção), nunca por HTTP:
++O primeiro admin e qualquer promoção só se fazem com acesso ao servidor (a partir da máquina do operador com `DATABASE_URL` de produção; o plano gratuito do Render não tem shell), nunca por HTTP:
+ 
+ ```
+ pnpm --filter @comunidade/api admin:promote <username>   # a conta já tem de existir
+diff --git a/docs/runbooks/servico-github.md b/docs/runbooks/servico-github.md
+new file mode 100644
+index 0000000..ed9ecf4
+--- /dev/null
++++ b/docs/runbooks/servico-github.md
+@@ -0,0 +1,44 @@
++# Serviço: GitHub (repositório, CI e segurança)
++
++**Função**: código, CI, análise de segurança e actualizações de dependências. O Render não deploya
++sozinho a partir daqui (ver [servico-render](servico-render.md)): o deploy é manual.
++**Responsável**: operador. **Contas com acesso**: só o operador (MVP).
++
++## 1. Configuração obrigatória (Etapa 1)
++
++| Onde (Settings)                                 | Valor                                                                                                                                                                                                                                                                                                                                  |
++| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Branches → regra para `master`                  | Exigir _pull request_; exigir os checks **Lint, Typecheck, Test, Build**, **Dependency audit** e **Analyze (javascript-typescript)** (CodeQL); exigir ramo actualizado; bloquear _force push_ e apagar. Com um só operador, a revisão obrigatória por outra pessoa não é possível: exigir PR e checks, e rever o diff antes de fundir. |
++| Branches → regra para `dev`                     | Exigir os mesmos checks; permitir _force push_ só se necessário.                                                                                                                                                                                                                                                                       |
++| Code security → Secret scanning                 | Activo, com **push protection**.                                                                                                                                                                                                                                                                                                       |
++| Code security → Dependabot                      | _Alerts_ e _security updates_ activos (o `dependabot.yml` já agenda as versões, com _cooldown_ de 3 dias).                                                                                                                                                                                                                             |
++| Code security → Code scanning                   | CodeQL já corre por `.github/workflows/codeql.yml` (semanal e em PR).                                                                                                                                                                                                                                                                  |
++| Code security → Private vulnerability reporting | Activo (canal para reportar falhas sem as tornar públicas).                                                                                                                                                                                                                                                                            |
++| Actions → General                               | Permissões por omissão de leitura; permitir só _actions_ fixadas por SHA (já é a prática do repositório).                                                                                                                                                                                                                              |
++| Conta do operador                               | 2FA com chave de segurança ou _app_; códigos de recurso no cofre.                                                                                                                                                                                                                                                                      |
++
++## 2. Ficheiros a preencher
++
++- `SECURITY.md`: substituir «security@<domínio> (a configurar)» por um email real (o Proton Mail de
++  suporte decidido no plano) e referir o _private vulnerability reporting_.
++- Gitleaks na CI: opcional, além do _secret scanning_ (avaliar depois do deploy).
++
++## 3. Fluxo de trabalho
++
++1. Trabalho em ramo a partir de `dev`; PR para `dev` com a CI verde.
++2. Para lançar: PR de `dev` para `master` (CI verde); fundir.
++3. Deploy manual no Render do _commit_ de `master` (ver [deploy-backend](deploy-backend.md) §4).
++4. Marcar versões com _tag_ (`vX.Y.Z`) quando houver _release_.
++
++## 4. Operação
++
++- **PR do Dependabot**: rever, correr a CI, fundir um de cada vez; _patches_ de segurança têm prioridade.
++- **Alerta de _secret scanning_**: tratar como incidente (ver [gestao-e-controlo](gestao-e-controlo.md) §6): revogar o
++  segredo no serviço de origem, rodar e só depois fechar o alerta.
++- **CI vermelha em `master`**: não fazer deploy; corrigir à frente.
++
++## 5. Verificação
++
++- [ ] Tentar _push_ directo para `master` é recusado.
++- [ ] Um PR com a CI vermelha não se funde.
++- [ ] Um segredo de teste no código é bloqueado pela _push protection_.
+diff --git a/docs/runbooks/servico-monitorizacao.md b/docs/runbooks/servico-monitorizacao.md
+new file mode 100644
+index 0000000..607b46f
+--- /dev/null
++++ b/docs/runbooks/servico-monitorizacao.md
+@@ -0,0 +1,53 @@
++# Serviço: monitorização, cron e backups
++
++**Função**: manter a API acordada na janela activa, avisar quando falha e guardar cópias da base de dados.
++Cobre cron-job.org, o monitor de disponibilidade, os logs do Render e os backups externos.
++
++## 1. cron-job.org (manter acordada)
++
++| Campo     | Valor                                                                                        |
++| --------- | -------------------------------------------------------------------------------------------- |
++| URL       | `https://<servico>.onrender.com/health` (nunca `/health/deep`: acordaria a Neon e a Upstash) |
++| Intervalo | 14 minutos (< 15 min de adormecer)                                                           |
++| Janela    | A decidir (ver §2)                                                                           |
++| Alertas   | Notificação por falha: confirmar a opção na consola e activar por email                      |
++
++## 2. Janela activa — decisão pendente
++
++O runbook original fixou **06:00–23:00 Europe/Lisbon**. Há público em vários fusos (Moçambique UTC+2, Portugal,
++Brasil UTC−3): essa janela deixa o Brasil sem API acordada de madrugada, mas **cada hora acordada custa CU-horas na
++Neon (risco R2)**. Escolher com dados: ver as horas de pico reais na primeira semana (Etapa 9) e ajustar. Até lá,
++manter a janela do runbook.
++
++## 3. Monitor de disponibilidade
++
++- **UptimeRobot (gratuito)**: intervalo fixo de 5 min; alertas por email. A pesquisa encontrou indicações
++  contraditórias sobre o uso comercial do plano gratuito: **confirmar os termos actuais** antes de o usar.
++- **Conflito (R6)**: um monitor 24/7 em `/health` mantém a API acordada 24/7 (e a Neon, por causa do worker).
++  Configurar o monitor **só na janela activa** (se o serviço o permitir) ou usar apenas os alertas do cron-job.org.
++- Monitor a `/health`; um segundo, de baixa frequência, a `/health/deep` (limite de 30 pedidos/min por IP).
++
++## 4. Backups externos (Etapa 8)
++
++A Neon gratuita só dá 6 horas de histórico e 1 _snapshot_ manual: **não chega**.
++
++1. **Diário**: `pg_dump` em formato personalizado, com a ligação directa e um role só de leitura, para um destino
++   fora da Neon (um _workflow_ agendado do GitHub com o artefacto cifrado, ou um bucket). O _workflow_ precisa de
++   autorização e de um segredo no GitHub com o `DATABASE_URL` de leitura.
++2. **Cifrar** os dumps antes de os guardar (contêm hashes e dados de utilizadores).
++3. **Retenção**: 7 diários e 4 semanais; apagar o resto.
++4. **Restauro testado** (obrigatório antes de dar o backup por válido): restaurar num _branch_ novo da Neon e correr
++   `SELECT count(*)` por tabela mais um `/health/deep` apontado a esse _branch_.
++5. Documentar o resultado e a data do último restauro testado em [gestao-e-controlo](gestao-e-controlo.md) §7.
++
++## 5. Logs
++
++- Render → Logs: o Render guarda pouco histórico no plano gratuito; para investigar um incidente, exportar logo.
++- Eventos a pesquisar: `token_reuse`, `rate_limited`, `5xx`, `Redis indisponível`, `refresh token reenviado`, falhas do outbox.
++- Os logs **não contêm IPs, tokens, parâmetros SQL nem mensagens do driver** (só nomes de erro e códigos).
++
++## 6. Verificação
++
++- [ ] O cron mantém a API acordada na janela (primeiro pedido da manhã < 1 s).
++- [ ] Um falhanço simulado (pausar o serviço) gera um alerta por email.
++- [ ] Um backup diário foi gerado e um restauro foi testado e registado.
+diff --git a/docs/runbooks/servico-neon.md b/docs/runbooks/servico-neon.md
+new file mode 100644
+index 0000000..2d75781
+--- /dev/null
++++ b/docs/runbooks/servico-neon.md
+@@ -0,0 +1,80 @@
++# Serviço: Neon (PostgreSQL 17)
++
++**Função**: base de dados de produção. **Região**: Frankfurt. **Plano**: gratuito (MVP).
++**Responsável**: operador. Variáveis relacionadas: `DATABASE_URL`, `DB_POOL_MAX`, `DB_QUERY_TIMEOUT_MS`.
++
++## 1. Limites do plano gratuito (pesquisa de 2026-11-20; confirmar na consola)
++
++| Limite               | Valor                                                   | Efeito para nós                                                                                           |
++| -------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
++| Armazenamento        | 1 GB por projecto                                       | Vigiar o crescimento (`posts`, `moderation_log`, `outbox`).                                               |
++| Compute              | 100 CU-horas por projecto por mês; auto-escala até 2 CU | **Risco R2**: o worker do outbox mantém o compute ligado enquanto a API está acordada.                    |
++| Suspensão automática | 5 min sem actividade; não se desliga no plano gratuito  | Primeira ligação depois de suspensa tem uma pequena demora.                                               |
++| Histórico/restauro   | 6 horas, até 1 GB de alterações; 1 _snapshot_ manual    | **Risco R5**: não substitui um backup externo (ver [servico-monitorizacao](servico-monitorizacao.md) §4). |
++| _Branches_           | 10 por projecto                                         | Úteis para testar migrações e restauros.                                                                  |
++
++## 2. Criação (Etapa 2)
++
++1. Neon → **New project**: região **AWS Europe (Frankfurt)**, **Postgres 17**, nome `comunidade-crista`.
++2. Anotar as duas _strings_ de ligação: **directa** (para migrações e CLI) e **com _pooler_** (host com
++   `-pooler`, para a API). Ambas com `sslmode=require`.
++3. Guardar as _strings_ no cofre; nunca no repositório.
++
++## 3. Roles e privilégios (mínimo necessário)
++
++A API não precisa de criar nem alterar tabelas: usa um role só de leitura e escrita de dados. O dono do
++projecto serve apenas as migrações e a administração.
++
++Num _branch_ de teste da Neon (ou localmente), validar primeiro; depois em produção, como dono:
++
++```sql
++CREATE ROLE comunidade_app LOGIN PASSWORD '<palavra-passe forte, só no cofre>';
++REVOKE ALL ON SCHEMA public FROM comunidade_app;
++GRANT USAGE ON SCHEMA public TO comunidade_app;
++```
++
++**Depois das migrações** (e depois de cada migração que acrescente tabelas):
++
++```sql
++GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO comunidade_app;
++GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO comunidade_app;
++ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO comunidade_app;
++ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO comunidade_app;
++```
++
++Limites no role (o _pooler_ recusa-os como parâmetros de ligação; ver runbook principal):
++
++```sql
++ALTER ROLE comunidade_app SET statement_timeout = '10s';
++ALTER ROLE comunidade_app SET idle_in_transaction_session_timeout = '15s';
++```
++
++Validado em Postgres 16 local: com este role, `INSERT`, `UPDATE`, `DELETE`, `SELECT … FOR UPDATE` e
++`pg_advisory_xact_lock` funcionam; `CREATE TABLE` e `DROP TABLE` são recusados.
++
++| Uso                              | Role e ligação                         |
++| -------------------------------- | -------------------------------------- |
++| API no Render                    | `comunidade_app`, ligação com _pooler_ |
++| `db:migrate`                     | dono, ligação **directa**              |
++| `admin:promote` / `admin:demote` | `comunidade_app` (só faz DML), directa |
++
++## 4. Migrações e atribuição de privilégios
++
++Seguir «Migrações da base de dados» no [runbook principal](runbook.md) e, **logo a seguir a cada
++migração**, voltar a correr os `GRANT … ON ALL TABLES` acima (as _default privileges_ cobrem as tabelas novas
++criadas pelo mesmo dono, mas confirmar).
++
++## 5. Operação
++
++- **Consumo**: Neon → Monitoring: CU-horas e armazenamento. Alerta interno a 70 % (ver [gestao-e-controlo](gestao-e-controlo.md) §5).
++- **Ligações**: `DB_POOL_MAX` (por omissão 10) × instâncias da API ≤ limite de ligações do _pooler_ (confirmar na consola).
++- **Ponto de retorno antes de migrar**: criar um _branch_ da Neon a partir do ramo principal.
++- **Restauro**: ver [servico-monitorizacao](servico-monitorizacao.md) §4.
++- **Rodar a palavra-passe do `comunidade_app`**: `ALTER ROLE … PASSWORD …`, actualizar `DATABASE_URL` no Render e redeploy.
++
++## 6. Verificação
++
++- [ ] `psql` com o role da aplicação lê e escreve; `CREATE TABLE` é recusado.
++- [ ] `SHOW statement_timeout;` devolve `10s` com o role da aplicação.
++- [ ] `SELECT version();` mostra 17.x.
++- [ ] `/health/deep` devolve `db: ok` a partir da API.
+diff --git a/docs/runbooks/servico-render.md b/docs/runbooks/servico-render.md
+new file mode 100644
+index 0000000..37ce37b
+--- /dev/null
++++ b/docs/runbooks/servico-render.md
+@@ -0,0 +1,112 @@
++# Serviço: Render (API)
++
++**Função**: corre a API Fastify, o worker do outbox e a manutenção (todos no mesmo processo).
++**Região**: Frankfurt. **Plano**: gratuito (MVP). **Responsável**: operador.
++
++## 1. Limites do plano gratuito (documentação do Render, 2026-11-20)
++
++| Limite                             | Valor                                                                                                                                      | Efeito                                                                                  |
++| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
++| Uso em produção                    | A documentação do Render diz «não usar em aplicações de produção»                                                                          | Aceitamos no MVP com gatilhos de subida ([gestao-e-controlo](gestao-e-controlo.md) §5). |
++| Adormece                           | Após **15 min** sem tráfego; demora **~1 min** a acordar                                                                                   | O cron mantém-na acordada na janela activa; fora dela, o primeiro pedido espera.        |
++| Horas                              | **750 horas de instância por mês** (instâncias adormecidas não contam); sem horas, os serviços gratuitos são suspensos até ao mês seguinte | Janela de 17 h/dia ≈ 510 h; 24/7 ≈ 744 h (cabe, mas sem folga para um segundo serviço). |
++| Instâncias                         | Uma só; sem _scaling_                                                                                                                      | Sem alta disponibilidade.                                                               |
++| Shell/SSH, _jobs_ pontuais, discos | Indisponíveis                                                                                                                              | Os comandos de administração correm **a partir da máquina do operador** (secção 5).     |
++| Sistema de ficheiros               | Perde-se a cada _redeploy_, reinício ou adormecer                                                                                          | Nada se guarda em disco (a API já não guarda).                                          |
++| Reinícios                          | O Render pode reiniciar o serviço a qualquer momento                                                                                       | O arranque tem de ser seguro (é: migrações são manuais, o worker é idempotente).        |
++| Portas de saída                    | 25, 465 e 587 bloqueadas                                                                                                                   | Sem SMTP directo (não usamos; email futuro só por API HTTPS).                           |
++| Largura de banda e _build_         | Contam para a quota mensal do espaço de trabalho; sem método de pagamento, esgotar suspende os serviços                                    | Vigiar no painel de utilização.                                                         |
++
++## 2. Criação (Etapa 5)
++
++1. Render → **New → Web Service** → ligar o repositório GitHub, ramo `master`.
++2. **Region**: Frankfurt. **Instance type**: Free.
++3. **Root directory**: raiz do repositório.
++4. **Build command**: `pnpm install --frozen-lockfile && pnpm --filter @comunidade/api build`
++5. **Start command**: `node apps/api/dist/index.js`
++6. **Health check path**: `/health`.
++7. **Auto-Deploy**: **desligado** (deploy manual): as migrações têm de correr **antes** do código novo
++   (ver «Migrações da base de dados» no [runbook principal](runbook.md)). Confirmar o nome exacto da opção na consola.
++8. **Node**: variável `NODE_VERSION=24.22.3`. A ordem de precedência do Render é `NODE_VERSION` > `.node-version` >
++   `.nvmrc` > `engines`; um `.nvmrc` com `24` não indica o _patch_ e serviços novos arrancam com 24.22.1 (anterior ao aviso de
++   segurança de 11-11-2026). Confirmar no log de build: `node -v`. Subir de versão é uma decisão explícita.
++
++## 3. Variáveis de ambiente de produção
++
++Introduzir em Render → Environment; guardar uma cópia **no cofre**. A API recusa arrancar se faltar uma obrigatória.
++
++| Variável                             | Valor                                                                    | Notas                                                  |
++| ------------------------------------ | ------------------------------------------------------------------------ | ------------------------------------------------------ |
++| `NODE_ENV`                           | `production`                                                             | Obrigatória.                                           |
++| `NODE_VERSION`                       | `24.22.3`                                                                | Lida pelo Render, não pela API.                        |
++| `APP_VERSION`                        | _commit_ ou _tag_ lançada                                                | Atualizar em cada deploy.                              |
++| `LOG_LEVEL`                          | `info`                                                                   |                                                        |
++| `CORS_ORIGIN`                        | origem(ns) do frontend, separadas por vírgula                            | Sem `*`.                                               |
++| `DATABASE_URL`                       | Neon, **role `comunidade_app`**, ligação com _pooler_, `sslmode=require` | Obrigatória.                                           |
++| `REDIS_URL`                          | Upstash `rediss://…`                                                     | Obrigatória.                                           |
++| `JWT_PRIVATE_JWK` / `JWT_PUBLIC_JWK` | par gerado por `generate-jwt-keys`                                       | Obrigatórias.                                          |
++| `IP_HASH_SECRET`                     | `openssl rand -base64 48`                                                | Obrigatória (≥ 32 caracteres).                         |
++| `EDGE_MODE`                          | `none`                                                                   | Sem domínio não há Cloudflare à frente.                |
++| `TRUST_PROXY`                        | `true`                                                                   | Sem isto todos os clientes partilham o IP do proxy.    |
++| `TRUST_PROXY_HOPS`                   | `1` ou `2` (ver secção 6)                                                | Por omissão 1.                                         |
++| `DB_POOL_MAX`                        | `5` a `10`                                                               | Uma instância; confirmar o limite de ligações da Neon. |
++| `ARGON2_*`                           | por omissão (19456 KiB, 2 iterações, 1)                                  | Mínimos de produção; medir o tempo por hash (Etapa 5). |
++| `OUTBOX_WORKER_INTERVAL_MS`          | `5000` (ver risco R2)                                                    | Alargar se a Neon gastar as CU-horas.                  |
++| restantes                            | valores por omissão do `.env.example`                                    |                                                        |
++
++`PORT` e `HOST`: o Render fornece a porta; a API escuta em `0.0.0.0`.
++
++## 4. Primeiro deploy e verificação
++
++1. Neon migrada e privilégios atribuídos ([servico-neon](servico-neon.md)).
++2. **Manual Deploy** → _Deploy latest commit_.
++3. Nos logs: `node -v` = 24.22.3; arranque sem avisos de Redis, base de dados ou proxy.
++4. `curl -i https://<servico>.onrender.com/health` → `200`; `/health/deep` → `200` com `db: ok` e `redis: ok`.
++
++## 5. Comandos de administração (sem shell no Render)
++
++Correm **na máquina do operador**, com o repositório na versão em produção:
++
++```
++DATABASE_URL='<ligação directa da Neon, role comunidade_app>' \
++  pnpm --filter @comunidade/api admin:promote <username>
++```
++
++Cuidados: não deixar o `DATABASE_URL` no histórico da _shell_ (usar o cofre ou `read -s`); ligação directa,
++não a do _pooler_; fechar a sessão no fim.
++
++## 6. IP real do cliente sem Cloudflare (Etapa 6)
++
++A API resolve o IP com `TRUST_PROXY_HOPS` proxies de confiança. O Render documenta mal a cadeia, por isso **valida-se
++na prática**:
++
++1. Arrancar com `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=1`.
++2. **Duas redes**: da rede A (por exemplo Wi-Fi) fazer 6 logins falhados seguidos com um utilizador que não existe
++   (`POST /auth/login`, o balde IP+utilizador é de 5 por 15 min): o 6.º tem de dar `429`. Da rede B (dados móveis)
++   fazer **um** login falhado com o mesmo utilizador: tem de dar `401`. Se der `429`, o IP é partilhado (vê-se o IP do
++   proxy): subir `TRUST_PROXY_HOPS` para `2` e repetir.
++3. **Cabeçalho forjado**: com o balde da rede A esgotado, repetir o login a partir de A mudando
++   `X-Forwarded-For: 1.2.3.4`, depois `5.6.7.8`. O `429` tem de manter-se. Se deixar de actuar, há saltos a mais
++   (`TRUST_PROXY_HOPS` demasiado alto): baixar.
++4. Registar o valor final neste documento e o resultado do teste.
++
++## 7. Rollback
++
++1. Render → **Events/Deploys** → escolher o deploy anterior → **Rollback** (confirmar o nome da opção na consola).
++2. Como as migrações são compatíveis com a versão anterior (_expand/contract_), a versão antiga volta a funcionar com a
++   base de dados nova. Se a migração for incompatível, **não** fazer _rollback_ de código: corrigir em frente com
++   outra migração, ou restaurar a base (ver [servico-monitorizacao](servico-monitorizacao.md) §4).
++3. Registar o incidente ([gestao-e-controlo](gestao-e-controlo.md) §6).
++
++## 8. Rotação de segredos no Render
++
++Ver «Rotação de chaves JWT» no [runbook principal](runbook.md) e [gestao-e-controlo](gestao-e-controlo.md) §3. Alterar
++variáveis no Render reinicia o serviço.
++
++## 9. Verificação
++
++- [ ] `NODE_VERSION` 24.22.3 confirmado no log de build.
++- [ ] Auto-Deploy desligado.
++- [ ] Health check `/health` verde.
++- [ ] Teste das duas redes cumprido e o valor de `TRUST_PROXY_HOPS` registado.
++- [ ] Rollback ensaiado uma vez com um deploy trivial.
+diff --git a/docs/runbooks/servico-upstash.md b/docs/runbooks/servico-upstash.md
+new file mode 100644
+index 0000000..edbeaf5
+--- /dev/null
++++ b/docs/runbooks/servico-upstash.md
+@@ -0,0 +1,48 @@
++# Serviço: Upstash (Redis)
++
++**Função**: contadores do rate limit (partilhados entre instâncias), cache do feed e dos _gospel cards_
++(L2). **Plano**: gratuito (MVP). **Região**: Frankfurt (confirmar disponibilidade na consola).
++Variável: `REDIS_URL`.
++
++## 1. Limites do plano gratuito (pesquisa de 2026-11-20; confirmar na consola)
++
++| Limite         | Valor                                      | Efeito para nós                                                               |
++| -------------- | ------------------------------------------ | ----------------------------------------------------------------------------- |
++| Dados          | 250 MB                                     | Folgado: chaves de limite e cache têm TTL.                                    |
++| Comandos       | **500 mil por mês**                        | **Risco R3**: o limite e a cache gastam comandos em quase todos os pedidos.   |
++| Pedido         | 10 MB; 10 000 comandos/s; 10 GB de tráfego | Sem impacto.                                                                  |
++| Bases de dados | 1                                          | Uma por ambiente: produção usa a gratuita; dev usa o Redis do docker-compose. |
++| TLS            | sim                                        | Usar `rediss://`.                                                             |
++
++A documentação consultada não indica o que acontece ao esgotar os comandos: **confirmar na consola e
++registar aqui** antes do deploy.
++
++## 2. Criação (Etapa 2)
++
++1. Upstash → **Create database**: tipo Redis, região Frankfurt (`eu-central-1`) se existir, TLS activo.
++2. Copiar a _connection string_ `rediss://…` para o cofre (nunca no repositório) e usá-la em `REDIS_URL`.
++3. Não activar _eviction_ por omissão sem confirmar: as chaves do rate limit têm TTL próprio.
++
++## 3. O que a API faz com o Redis
++
++- Rate limit por IP, por IP+utilizador e por conta (rate-limiter-flexible), com **fallback em memória** se o Redis falhar
++  (a contagem passa a ser por instância).
++- Cache do feed e dos cards, versionada (`cc:v1:feed:version`); sem Redis a leitura vai à base de dados.
++- O cliente (`ioredis`) tem `maxRetriesPerRequest: 3`, ligação com _timeout_ de 3 s e fila offline desligada: com o Redis em baixo o
++  pedido falha depressa em vez de ficar à espera.
++
++## 4. Operação
++
++- **Consumo**: consola da Upstash (comandos e dados). Alerta interno a 70 % (ver [gestao-e-controlo](gestao-e-controlo.md) §5).
++- **Medir por fluxo** (Etapa 7): anotar a variação de comandos antes e depois de um login, de uma leitura do feed e de uma
++  partilha; extrapolar para o tráfego esperado.
++- **Se esgotar**: a API continua (limitador em memória, cache em L1), mas com limites por instância; subir de plano ou
++  baixar o consumo é a decisão do operador.
++- **Rodar a palavra-passe**: gerar novo _token_/password na consola, actualizar `REDIS_URL` no Render e redeploy.
++- **Forçar a invalidação do feed**: `INCR cc:v1:feed:version` (ver incidentes no runbook principal).
++
++## 5. Verificação
++
++- [ ] `redis-cli --tls -u <REDIS_URL> PING` devolve `PONG`.
++- [ ] `/health/deep` devolve `redis: ok`.
++- [ ] Após um login falhado, aparecem chaves com prefixo do limitador e TTL definido (sem IP legível: são HMAC).
