@@ -35,8 +35,7 @@ export type ServiceError =
   | { code: "reason_required"; status: 400 };
 
 export type ServiceResult<T, E extends ServiceError = ServiceError> =
-  | { ok: true; data: T }
-  | { ok: false; error: E };
+  { ok: true; data: T } | { ok: false; error: E };
 
 type ErrorOf<C extends ServiceError["code"]> = Extract<
   ServiceError,

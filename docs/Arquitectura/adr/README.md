@@ -2,8 +2,8 @@
 
 Um ficheiro por decisão. Estado: **Aceite** salvo indicação em contrário. Uma decisão que mude não se apaga: acrescenta-se uma nota de revisão no próprio ADR (ou um ADR novo que o substitui e é referido no antigo).
 
-| ADR                       | Decisão                                                     |
-| ------------------------- | ----------------------------------------------------------- |
+| ADR                   | Decisão                                                     |
+| --------------------- | ----------------------------------------------------------- |
 | [ADR-001](ADR-001.md) | PWA em vez de app nativa                                    |
 | [ADR-002](ADR-002.md) | Monorepo com pnpm workspaces                                |
 | [ADR-003](ADR-003.md) | Neon em vez de Supabase                                     |

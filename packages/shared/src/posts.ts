@@ -84,7 +84,7 @@ export const CursorPayload = z.discriminatedUnion("k", [
   z.object({ k: z.literal("admin_posts"), t: CursorTimestamp, id: z.uuid() }),
   z.object({ k: z.literal("admin_reports"), t: CursorTimestamp, id: z.uuid() }),
   z.object({ k: z.literal("admin_log"), t: CursorTimestamp, id: z.uuid() }),
- ]);
+]);
 
 export type CursorPayload = z.infer<typeof CursorPayload>;
 export type CursorKind = CursorPayload["k"];
@@ -106,8 +106,8 @@ function toBase64Url(text: string): string {
     if (i + 1 < text.length) out += B64[(n >> 6) & 63]!;
     if (i + 2 < text.length) out += B64[n & 63]!;
   }
-  return out; 
- }
+  return out;
+}
 
 function fromBase64Url(text: string): string | null {
   if (text.length % 4 === 1) return null;
@@ -125,7 +125,7 @@ function fromBase64Url(text: string): string | null {
       if (byte > 127) return null;
       out += String.fromCharCode(byte);
     }
-   }
+  }
   return out;
 }
 

@@ -175,12 +175,8 @@
           "name": "idempotency_keys_user_id_users_id_fk",
           "tableFrom": "idempotency_keys",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -188,10 +184,7 @@
       "compositePrimaryKeys": {
         "idempotency_keys_user_id_key_pk": {
           "name": "idempotency_keys_user_id_key_pk",
-          "columns": [
-            "user_id",
-            "key"
-          ]
+          "columns": ["user_id", "key"]
         }
       },
       "uniqueConstraints": {},
@@ -297,12 +290,8 @@
           "name": "moderation_log_post_id_posts_id_fk",
           "tableFrom": "moderation_log",
           "tableTo": "posts",
-          "columnsFrom": [
-            "post_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["post_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         },
@@ -310,12 +299,8 @@
           "name": "moderation_log_moderator_id_users_id_fk",
           "tableFrom": "moderation_log",
           "tableTo": "users",
-          "columnsFrom": [
-            "moderator_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["moderator_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         },
@@ -323,12 +308,8 @@
           "name": "moderation_log_target_user_id_users_id_fk",
           "tableFrom": "moderation_log",
           "tableTo": "users",
-          "columnsFrom": [
-            "target_user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["target_user_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -491,12 +472,8 @@
           "name": "pending_password_resets_user_id_users_id_fk",
           "tableFrom": "pending_password_resets",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -553,12 +530,8 @@
           "name": "post_likes_post_id_posts_id_fk",
           "tableFrom": "post_likes",
           "tableTo": "posts",
-          "columnsFrom": [
-            "post_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["post_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -566,12 +539,8 @@
           "name": "post_likes_user_id_users_id_fk",
           "tableFrom": "post_likes",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -579,10 +548,7 @@
       "compositePrimaryKeys": {
         "post_likes_post_id_user_id_pk": {
           "name": "post_likes_post_id_user_id_pk",
-          "columns": [
-            "post_id",
-            "user_id"
-          ]
+          "columns": ["post_id", "user_id"]
         }
       },
       "uniqueConstraints": {},
@@ -784,12 +750,8 @@
           "name": "posts_author_id_users_id_fk",
           "tableFrom": "posts",
           "tableTo": "users",
-          "columnsFrom": [
-            "author_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["author_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         },
@@ -797,12 +759,8 @@
           "name": "posts_gospel_card_id_gospel_cards_id_fk",
           "tableFrom": "posts",
           "tableTo": "gospel_cards",
-          "columnsFrom": [
-            "gospel_card_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["gospel_card_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -934,12 +892,8 @@
           "name": "refresh_tokens_user_id_users_id_fk",
           "tableFrom": "refresh_tokens",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -1154,12 +1108,8 @@
           "name": "reports_post_id_posts_id_fk",
           "tableFrom": "reports",
           "tableTo": "posts",
-          "columnsFrom": [
-            "post_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["post_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1167,12 +1117,8 @@
           "name": "reports_reporter_id_users_id_fk",
           "tableFrom": "reports",
           "tableTo": "users",
-          "columnsFrom": [
-            "reporter_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["reporter_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1180,12 +1126,8 @@
           "name": "reports_resolved_by_users_id_fk",
           "tableFrom": "reports",
           "tableTo": "users",
-          "columnsFrom": [
-            "resolved_by"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["resolved_by"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -1401,87 +1343,47 @@
     "public.deletion_posts_mode": {
       "name": "deletion_posts_mode",
       "schema": "public",
-      "values": [
-        "anonymize",
-        "delete"
-      ]
+      "values": ["anonymize", "delete"]
     },
     "public.moderation_action": {
       "name": "moderation_action",
       "schema": "public",
-      "values": [
-        "approved",
-        "rejected",
-        "admin.promoted",
-        "admin.demoted"
-      ]
+      "values": ["approved", "rejected", "admin.promoted", "admin.demoted"]
     },
     "public.outbox_status": {
       "name": "outbox_status",
       "schema": "public",
-      "values": [
-        "pending",
-        "processing",
-        "done",
-        "failed"
-      ]
+      "values": ["pending", "processing", "done", "failed"]
     },
     "public.post_category": {
       "name": "post_category",
       "schema": "public",
-      "values": [
-        "entendimento",
-        "ensinamento",
-        "letra_cancao"
-      ]
+      "values": ["entendimento", "ensinamento", "letra_cancao"]
     },
     "public.post_status": {
       "name": "post_status",
       "schema": "public",
-      "values": [
-        "published",
-        "pending_review",
-        "hidden",
-        "rejected"
-      ]
+      "values": ["published", "pending_review", "hidden", "rejected"]
     },
     "public.report_category": {
       "name": "report_category",
       "schema": "public",
-      "values": [
-        "spam",
-        "off_topic",
-        "offensive",
-        "doctrine",
-        "other"
-      ]
+      "values": ["spam", "off_topic", "offensive", "doctrine", "other"]
     },
     "public.report_severity": {
       "name": "report_severity",
       "schema": "public",
-      "values": [
-        "basic",
-        "medium",
-        "high"
-      ]
+      "values": ["basic", "medium", "high"]
     },
     "public.report_status": {
       "name": "report_status",
       "schema": "public",
-      "values": [
-        "open",
-        "resolved_kept",
-        "resolved_removed",
-        "withdrawn"
-      ]
+      "values": ["open", "resolved_kept", "resolved_removed", "withdrawn"]
     },
     "public.role": {
       "name": "role",
       "schema": "public",
-      "values": [
-        "user",
-        "admin"
-      ]
+      "values": ["user", "admin"]
     }
   },
   "schemas": {},

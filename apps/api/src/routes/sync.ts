@@ -214,7 +214,7 @@ export async function syncRoutes(
   async function processOne(
     userId: string,
     op: SyncOperation,
-    keysInBatch: Map<string, SyncOperation["type"]>,  // ← NOVO parâmetro
+    keysInBatch: Map<string, SyncOperation["type"]>, // ← NOVO parâmetro
   ): Promise<OpOutcome> {
     const rl = await checkOpLimit(userId, op);
     if (!rl.allowed) {
@@ -224,11 +224,12 @@ export async function syncRoutes(
       });
     }
     try {
-      if (await hasKeyConflict(userId, op, keysInBatch)) {  // ← NOVO guard
+      if (await hasKeyConflict(userId, op, keysInBatch)) {
+        // ← NOVO guard
         return rejected(op.op_id, "idempotency_key_conflict");
       }
       return await run(userId, op);
-    } catch (err) {   
+    } catch (err) {
       app.log.error(
         {
           errorName: err instanceof Error ? err.name : typeof err,
@@ -279,17 +280,17 @@ export async function syncRoutes(
         return sendError(reply, 429, "rate_limited", rl.retryAfter ?? 60);
       }
 
-            const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
+      const deadline = Date.now() + env.SYNC_BATCH_TIMEOUT_MS;
       const results: SyncResult[] = [];
       let invalidateFeed = false;
-      const keysInBatch = new Map<string, SyncOperation["type"]>(); 
+      const keysInBatch = new Map<string, SyncOperation["type"]>();
 
       for (const op of request.body.operations) {
         if (Date.now() >= deadline) {
           results.push(deferred(op.op_id).result);
           continue;
         }
-        const outcome = await processOne(userId, op, keysInBatch); 
+        const outcome = await processOne(userId, op, keysInBatch);
         results.push(outcome.result);
         if (outcome.invalidateFeed) invalidateFeed = true;
       }

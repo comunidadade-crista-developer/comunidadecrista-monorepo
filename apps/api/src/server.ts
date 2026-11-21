@@ -17,7 +17,7 @@ import { createPasswordService } from "./auth/password.js";
 import { createRateLimiters } from "./auth/rate-limit.js";
 import { createRecoveryService } from "./auth/recovery.js";
 import { createCardsCache } from "./cache/cards-cache.js";
-import { createFeedCache } from "./cache/feed-cache.js";   
+import { createFeedCache } from "./cache/feed-cache.js";
 import { createDb } from "./db/client.js";
 import type { Env } from "./env.js";
 import { errorHandler, notFoundHandler } from "./http-errors.js";
@@ -36,7 +36,7 @@ import { cardsRoutes } from "./routes/cards.js";
 import { healthRoutes } from "./routes/health.js";
 import { postsRoutes } from "./routes/posts.js";
 import { syncRoutes } from "./routes/sync.js";
-import { startOutboxWorker } from "./workers/outbox-worker.js";   
+import { startOutboxWorker } from "./workers/outbox-worker.js";
 
 export type AppInstance = FastifyInstance<
   RawServerDefault,
@@ -75,7 +75,7 @@ export async function buildServer({
   disableWorker,
 }: BuildServerOptions) {
   const workersDisabled = disableWorker ?? env.NODE_ENV === "test";
-  const trustProxy =   
+  const trustProxy =
     env.EDGE_MODE === "none" && env.TRUST_PROXY
       ? (_addr: string, hop: number) => hop < env.TRUST_PROXY_HOPS
       : false;
@@ -262,7 +262,7 @@ export async function buildServer({
   } else {
     app.log.warn(
       "DATABASE_URL não configurado — rotas de auth, conta, cards, posts e sync desactivadas.",
-    );   
+    );
   }
 
   return app;

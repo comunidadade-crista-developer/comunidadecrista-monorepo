@@ -543,12 +543,10 @@ describe("denúncias", () => {
         .set({ createdAt: new Date(Date.now() - 30 * 24 * 3600 * 1000) })
         .where(eq(users.id, reporter.user.id));
       await makePost(reporter.user.id);
-      const login = await request(app.server)
-        .post("/auth/login")
-        .send({
-          username: reporter.user.username,
-          password: reporter.plainPassword,
-        });
+      const login = await request(app.server).post("/auth/login").send({
+        username: reporter.user.username,
+        password: reporter.plainPassword,
+      });
       const res = await request(app.server)
         .post(`/posts/${post.id}/report`)
         .set(bearer(login.body.accessToken))
