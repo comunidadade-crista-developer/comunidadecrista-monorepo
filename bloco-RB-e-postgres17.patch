@@ -1,0 +1,211 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f43b109..1da289d 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -22,7 +22,7 @@ jobs:
+ 
+     services:
+       postgres:
+-        image: postgres:16-alpine
++        image: postgres:17-alpine
+         env:
+           POSTGRES_USER: comunidade
+           POSTGRES_PASSWORD: comunidade_test
+diff --git a/SECURITY.md b/SECURITY.md
+index 89c39ec..70219a6 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -2,7 +2,7 @@
+ 
+ ## Reportar vulnerabilidades
+ 
+-Envia para **security@<domínio>** (a configurar) ou abre issue privada no GitHub.
++Envia para **seguranca.comunidadecrista@protonmail.com** ou usa o [reporte privado de vulnerabilidades](../../security/advisories/new) do GitHub.
+ 
+ Não divulgues publicamente antes de haver correção.
+ 
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a670b5c..296bd3a 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,6 +1,6 @@
+ services:
+   postgres:
+-    image: postgres:16-alpine
++    image: postgres:17-alpine
+     container_name: comunidade-postgres
+     restart: unless-stopped
+     environment:
+diff --git a/docs/plano-de-construcao.md b/docs/plano-de-construcao.md
+index beaf95e..65bbc71 100644
+--- a/docs/plano-de-construcao.md
++++ b/docs/plano-de-construcao.md
+@@ -28,6 +28,7 @@ como foi planeado):
+ | -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+ | Palavra-passe mínima de 6 (T2.3)             | 8 a 128 caracteres (`password-policy.ts`)                                                     |
+ | Login: 5 por 15 min por IP+utilizador (T2.4) | Três baldes: IP+utilizador (5), IP (30) e conta (20) por 15 min                               |
++| Postgres 16 local e no CI (T0.4)             | Postgres 17, alinhado com a Neon (RB-e)                                                       |
+ | Testcontainers no CI (§2)                    | Postgres e Redis como _service containers_ do GitHub Actions                                  |
+ | Refresh de uso único estrito (T2.5)          | Tolerância de 10 s ao reenvio, só após rotação ([ADR-006](Arquitectura/adr/ADR-006.md), RB-b) |
+ | Promoção a admin por «CLI/DB» (T6.6)         | `admin:promote` / `admin:demote` ([ADR-015](Arquitectura/adr/ADR-015.md))                     |
+diff --git a/docs/registos/RB-e-postgres17.md b/docs/registos/RB-e-postgres17.md
+new file mode 100644
+index 0000000..5b06b0b
+--- /dev/null
++++ b/docs/registos/RB-e-postgres17.md
+@@ -0,0 +1,15 @@
++# RB-e — Alinhamento a Postgres 17 e contacto de segurança
++
++Primeira etapa do [plano de deploy](../runbooks/deploy-backend.md) (Etapa 1).
++
++- `docker-compose.yml` e o serviço de Postgres da CI passam de `postgres:16-alpine` para `postgres:17-alpine`, igual à versão
++  escolhida na Neon.
++- O volume local de Postgres 16 não abre em 17: procedimento em «Actualizar o Postgres local» no
++  [runbook](../runbooks/runbook.md) (`docker compose down -v`; apaga os dados de desenvolvimento).
++- `SECURITY.md` com `seguranca.comunidadecrista@protonmail.com` e ligação ao reporte privado do GitHub.
++- Cofre de segredos: Proton Pass (registado no plano de gestão).
++
++**Não validado aqui**: o ambiente de desenvolvimento só tem Postgres 16. As migrações usam SQL standard e `citext`; a
++primeira CI em 17 é a confirmação.
++
++**Pendente**: contacto do `CODE_OF_CONDUCT.md` («conduct@<domínio>», ainda por decidir).
+diff --git a/docs/registos/RB-revisao-backend.md b/docs/registos/RB-revisao-backend.md
+index fb4c709..1fab371 100644
+--- a/docs/registos/RB-revisao-backend.md
++++ b/docs/registos/RB-revisao-backend.md
+@@ -26,7 +26,7 @@ entre a documentação e o código.
+ | 9   | Baixa     | Sem mínimos de argon2 em produção; `index.ts` registava `err`                                                                                                 | Corrigido (RB-a)                                                         |
+ | 10  | Info      | Access token de 15 min continua válido depois do logout                                                                                                       | Aceite (ADR-006); `requireAdmin` revalida na BD                          |
+ | 11  | Info      | Bloqueio por conta no login permite negar o acesso a uma conta alvo (compromisso conhecido do rate limit por conta)                                           | Aceite; mitigado pelos baldes por IP e pelo balde por conta mais folgado |
+-| 12  | Info      | `SECURITY.md` com contacto «a configurar»; sem _secret scanning_ activo                                                                                       | Pendente (antes do deploy)                                               |
++| 12  | Info      | `SECURITY.md` com contacto «a configurar» (resolvido na RB-e); sem _secret scanning_ activo                                                                   | Pendente (antes do deploy)                                               |
+ | 13  | Info      | Faltavam testes: registo e refresh concorrentes, `/health/deep`, limites                                                                                      | Cobertos em RB-a/RB-b; limitador com Redis em baixo continua por cobrir  |
+ 
+ ## 3. Decisões
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index 4b347be..1d306dd 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -31,3 +31,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-b  | [Migrações em produção e tolerância no refresh](RB-b-migracoes-refresh.md)                                | Feito  |
+ | RB-c  | [Revisão do backend](RB-revisao-backend.md) e [versões para o deploy](../runbooks/versoes-e-seguranca.md) | Feito  |
+ | RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
++| RB-e  | [Postgres 17 e contacto de segurança](RB-e-postgres17.md)                                                 | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index c58731a..8f180bf 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -34,8 +34,9 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ - [x] Domínio, Node, Postgres, região, operação (secção 1).
+ - [x] Contas criadas (Neon, Upstash, Render, Cloudflare), ainda **não interligadas**.
+-- [ ] Email de suporte e de segurança definido (para o `SECURITY.md`).
+-- [ ] Gestor de palavras-passe escolhido (cofre dos segredos).
++- [x] Email de segurança: `seguranca.comunidadecrista@protonmail.com` (no `SECURITY.md`).
++- [x] Gestor de palavras-passe: **Proton Pass** (cofre dos segredos).
++- [ ] Contacto do `CODE_OF_CONDUCT.md` por decidir.
+ 
+ **Saída**: tudo marcado.
+ 
+@@ -43,8 +44,8 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ - [ ] Branch `master` protegida; checks obrigatórios: _Lint, Typecheck, Test, Build_, _Dependency audit_ e _CodeQL_.
+ - [ ] _Secret scanning_, _push protection_, _Dependabot alerts_ e _private vulnerability reporting_ activos.
+-- [ ] `SECURITY.md` com o contacto real.
+-- [ ] **Bloco de alinhamento a Postgres 17** (`docker-compose.yml` e CI): _precisa de autorização_; obriga a recriar o volume local (`docker compose down -v`).
++- [x] **Alinhamento a Postgres 17** (`docker-compose.yml` e CI): obriga a recriar o volume local (runbook «Actualizar o Postgres local»); a CI confirma as migrações em 17.
++- [x] `SECURITY.md` com o contacto real.
+ - [ ] CI verde em `dev` e `master`; `pnpm audit` sem resultados.
+ - [ ] Teste local do build de produção: `pnpm build` e `node apps/api/dist/index.js` com `NODE_ENV=production` e variáveis de teste.
+ 
+diff --git a/docs/runbooks/gestao-e-controlo.md b/docs/runbooks/gestao-e-controlo.md
+index a628deb..8289e3f 100644
+--- a/docs/runbooks/gestao-e-controlo.md
++++ b/docs/runbooks/gestao-e-controlo.md
+@@ -16,14 +16,14 @@ Complementa [deploy-backend](deploy-backend.md) e os runbooks por serviço.
+ 
+ ## 2. Controlo de acessos
+ 
+-| Conta / sistema          | Dono     | 2FA                                              | Notas                                                     |
+-| ------------------------ | -------- | ------------------------------------------------ | --------------------------------------------------------- |
+-| GitHub                   | operador | chave de segurança ou _app_ + códigos de recurso | Ver [servico-github](servico-github.md).                  |
+-| Render                   | operador | idem                                             | Quem altera variáveis lê todos os segredos da API.        |
+-| Neon                     | operador | idem                                             | Dono do projecto = dono da base de dados.                 |
+-| Upstash                  | operador | idem                                             |                                                           |
+-| Cloudflare               | operador | idem                                             | Só o Pages (frontend); a API fica fora até haver domínio. |
+-| Gestor de palavras-passe | operador | chave de segurança                               | Cofre de todos os segredos e códigos de recurso.          |
++| Conta / sistema     | Dono     | 2FA                                              | Notas                                                     |
++| ------------------- | -------- | ------------------------------------------------ | --------------------------------------------------------- |
++| GitHub              | operador | chave de segurança ou _app_ + códigos de recurso | Ver [servico-github](servico-github.md).                  |
++| Render              | operador | idem                                             | Quem altera variáveis lê todos os segredos da API.        |
++| Neon                | operador | idem                                             | Dono do projecto = dono da base de dados.                 |
++| Upstash             | operador | idem                                             |                                                           |
++| Cloudflare          | operador | idem                                             | Só o Pages (frontend); a API fica fora até haver domínio. |
++| Proton Pass (cofre) | operador | chave de segurança ou _app_                      | Cofre de todos os segredos e códigos de recurso.          |
+ 
+ Regras:
+ 
+diff --git a/docs/runbooks/runbook.md b/docs/runbooks/runbook.md
+index c46c471..7860c42 100644
+--- a/docs/runbooks/runbook.md
++++ b/docs/runbooks/runbook.md
+@@ -2,9 +2,21 @@
+ 
+ ## Ambientes
+ 
+-- **Local**: docker-compose (Postgres 16 + Redis 7) + `pnpm dev`
++- **Local**: docker-compose (Postgres 17 + Redis 7) + `pnpm dev`
+ - **Produção**: Cloudflare Pages (web) + Render free (API) + Neon (Postgres) + Upstash (Redis)
+ 
++### Actualizar o Postgres local (16 → 17)
++
++O volume de dados de uma versão **não abre** noutra versão maior: com a imagem nova o contentor não arranca. Em desenvolvimento
++recria-se o volume (apaga os dados locais):
++
++```
++docker compose down -v
++docker compose up -d
++pnpm --filter @comunidade/api db:migrate
++pnpm --filter @comunidade/api db:seed
++```
++
+ ## Deploy
+ 
+ ### Backend (Render)
+diff --git a/docs/runbooks/servico-github.md b/docs/runbooks/servico-github.md
+index ed9ecf4..97f105e 100644
+--- a/docs/runbooks/servico-github.md
++++ b/docs/runbooks/servico-github.md
+@@ -19,8 +19,7 @@ sozinho a partir daqui (ver [servico-render](servico-render.md)): o deploy é ma
+ 
+ ## 2. Ficheiros a preencher
+ 
+-- `SECURITY.md`: substituir «security@<domínio> (a configurar)» por um email real (o Proton Mail de
+-  suporte decidido no plano) e referir o _private vulnerability reporting_.
++- `SECURITY.md`: **feito**, com `seguranca.comunidadecrista@protonmail.com` (Proton Mail). Falta o `CODE_OF_CONDUCT.md`, que ainda tem «conduct@<domínio> (a configurar)»: decidir o contacto. O `SECURITY.md` já refere o _private vulnerability reporting_, que tem de estar activo (secção 1).
+ - Gitleaks na CI: opcional, além do _secret scanning_ (avaliar depois do deploy).
+ 
+ ## 3. Fluxo de trabalho
+diff --git a/docs/runbooks/versoes-e-seguranca.md b/docs/runbooks/versoes-e-seguranca.md
+index 39775c9..7e4cc98 100644
+--- a/docs/runbooks/versoes-e-seguranca.md
++++ b/docs/runbooks/versoes-e-seguranca.md
+@@ -7,12 +7,12 @@ pesquisa na semana do deploy.
+ 
+ ## 1. Runtime e ferramentas
+ 
+-| Componente | Em uso                               | Estado em 2026-11-20                                                                                                                                                                                     | Recomendação                                                                                                                    |
+-| ---------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+-| Node.js    | `.nvmrc` = `24`; `engines >=24`      | 24: _Maintenance LTS_ (suporte activo terminou em 20-10-2026; segurança até 30-04-2028), última **24.22.3**. 26: _Active LTS_ até 27-10-2027, segurança até 30-04-2029, última **26.13.1**. 25 já é EOL. | Fixar `NODE_VERSION` no Render para **>= 24.22.3** (aviso de segurança de 11-11-2026). Decidir se se arranca já em 26 (ver §4). |
+-| pnpm       | 10 (`packageManager: pnpm@10.18.0`)  | pnpm 11 existe: `minimumReleaseAge` de 1 dia por omissão, `strictDepBuilds`, `allowBuilds`; exige Node >= 22; configuração migra do `.npmrc` para `pnpm-workspace.yaml`.                                 | Manter 10 até ao deploy; migrar depois, com o codemod `pnpm-v10-to-v11`, num bloco próprio.                                     |
+-| PostgreSQL | `postgres:16-alpine` (dev e CI)      | 16.16 é a última 16 (12-11-2026); 14 chegou ao fim de vida; **19 sai a 19-11-2026**. Neon suporta 14 a 18.                                                                                               | Escolher **17 ou 18** na Neon para um projecto novo e alinhar o `docker-compose.yml` e a CI com essa versão. Não adoptar 19 já. |
+-| Redis      | `redis:7-alpine` (dev e CI); Upstash | **Não pesquisado.**                                                                                                                                                                                      | Verificar a versão suportada pela Upstash e o aviso de segurança do Redis antes do deploy.                                      |
++| Componente | Em uso                                  | Estado em 2026-11-20                                                                                                                                                                                     | Recomendação                                                                                                                    |
++| ---------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
++| Node.js    | `.nvmrc` = `24`; `engines >=24`         | 24: _Maintenance LTS_ (suporte activo terminou em 20-10-2026; segurança até 30-04-2028), última **24.22.3**. 26: _Active LTS_ até 27-10-2027, segurança até 30-04-2029, última **26.13.1**. 25 já é EOL. | Fixar `NODE_VERSION` no Render para **>= 24.22.3** (aviso de segurança de 11-11-2026). Decidir se se arranca já em 26 (ver §4). |
++| pnpm       | 10 (`packageManager: pnpm@10.18.0`)     | pnpm 11 existe: `minimumReleaseAge` de 1 dia por omissão, `strictDepBuilds`, `allowBuilds`; exige Node >= 22; configuração migra do `.npmrc` para `pnpm-workspace.yaml`.                                 | Manter 10 até ao deploy; migrar depois, com o codemod `pnpm-v10-to-v11`, num bloco próprio.                                     |
++| PostgreSQL | `postgres:17-alpine` (dev e CI; era 16) | 16.16 é a última 16 (12-11-2026); 14 chegou ao fim de vida; **19 sai a 19-11-2026**. Neon suporta 14 a 18.                                                                                               | **Decidido: 17** na Neon, com `docker-compose.yml` e CI alinhados. Não adoptar 19 já.                                           |
++| Redis      | `redis:7-alpine` (dev e CI); Upstash    | **Não pesquisado.**                                                                                                                                                                                      | Verificar a versão suportada pela Upstash e o aviso de segurança do Redis antes do deploy.                                      |
+ 
+ ### Node 24.22.3 — o que corrige (11-11-2026)
+ 

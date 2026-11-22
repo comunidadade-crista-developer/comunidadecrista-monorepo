@@ -26,6 +26,7 @@ como foi planeado):
 | -------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | Palavra-passe mínima de 6 (T2.3)             | 8 a 128 caracteres (`password-policy.ts`)                                                     |
 | Login: 5 por 15 min por IP+utilizador (T2.4) | Três baldes: IP+utilizador (5), IP (30) e conta (20) por 15 min                               |
+| Postgres 16 local e no CI (T0.4)             | Postgres 17, alinhado com a Neon (RB-e)                                                       |
 | Testcontainers no CI (§2)                    | Postgres e Redis como _service containers_ do GitHub Actions                                  |
 | Refresh de uso único estrito (T2.5)          | Tolerância de 10 s ao reenvio, só após rotação ([ADR-006](Arquitectura/adr/ADR-006.md), RB-b) |
 | Promoção a admin por «CLI/DB» (T6.6)         | `admin:promote` / `admin:demote` ([ADR-015](Arquitectura/adr/ADR-015.md))                     |

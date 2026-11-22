@@ -2,7 +2,7 @@
 
 ## Reportar vulnerabilidades
 
-Envia para **security@<domínio>** (a configurar) ou abre issue privada no GitHub.
+Envia para **seguranca.comunidadecrista@protonmail.com** ou usa o [reporte privado de vulnerabilidades](../../security/advisories/new) do GitHub.
 
 Não divulgues publicamente antes de haver correção.
 

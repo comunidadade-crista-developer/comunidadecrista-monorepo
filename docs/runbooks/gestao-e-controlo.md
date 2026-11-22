@@ -16,14 +16,14 @@ Complementa [deploy-backend](deploy-backend.md) e os runbooks por serviço.
 
 ## 2. Controlo de acessos
 
-| Conta / sistema          | Dono     | 2FA                                              | Notas                                                     |
-| ------------------------ | -------- | ------------------------------------------------ | --------------------------------------------------------- |
-| GitHub                   | operador | chave de segurança ou _app_ + códigos de recurso | Ver [servico-github](servico-github.md).                  |
-| Render                   | operador | idem                                             | Quem altera variáveis lê todos os segredos da API.        |
-| Neon                     | operador | idem                                             | Dono do projecto = dono da base de dados.                 |
-| Upstash                  | operador | idem                                             |                                                           |
-| Cloudflare               | operador | idem                                             | Só o Pages (frontend); a API fica fora até haver domínio. |
-| Gestor de palavras-passe | operador | chave de segurança                               | Cofre de todos os segredos e códigos de recurso.          |
+| Conta / sistema     | Dono     | 2FA                                              | Notas                                                     |
+| ------------------- | -------- | ------------------------------------------------ | --------------------------------------------------------- |
+| GitHub              | operador | chave de segurança ou _app_ + códigos de recurso | Ver [servico-github](servico-github.md).                  |
+| Render              | operador | idem                                             | Quem altera variáveis lê todos os segredos da API.        |
+| Neon                | operador | idem                                             | Dono do projecto = dono da base de dados.                 |
+| Upstash             | operador | idem                                             |                                                           |
+| Cloudflare          | operador | idem                                             | Só o Pages (frontend); a API fica fora até haver domínio. |
+| Proton Pass (cofre) | operador | chave de segurança ou _app_                      | Cofre de todos os segredos e códigos de recurso.          |
 
 Regras:
 
