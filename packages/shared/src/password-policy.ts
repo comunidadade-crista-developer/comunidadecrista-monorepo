@@ -6,7 +6,6 @@
  */
 
 export const PASSWORD_MIN_LENGTH = 8;
-// O máximo só impede entradas gigantes no Argon2; não é um limite «de segurança».
 export const PASSWORD_MAX_LENGTH = 128;
 
 // Só o nome de utilizador com este tamanho (ou mais) é procurado DENTRO da palavra-passe;
@@ -210,9 +209,6 @@ const COMMON_PASSWORDS: ReadonlySet<string> = new Set([
   "saotome",
   "timorleste",
   "africa123",
-  "frelimo",
-  "frelimo123",
-  "renamo",
   "eusoumocambicano",
   "mocambicano",
   "mocambicana",
@@ -468,7 +464,15 @@ export function normalizeForPolicy(value: string): string {
 export function isCommonPassword(password: string): boolean {
   const normalized = normalizeForPolicy(password);
   if (COMMON_PASSWORDS.has(normalized)) return true;
-  const base = normalized.replace(/[^a-z]+$/u, "");
+  // Corta do fim tudo o que não é a-z. Ciclo linear em vez de `/[^a-z]+$/u`, que é quadrática
+  // em longas sequências (CodeQL js/polynomial-redos); o resultado é idêntico.
+  let end = normalized.length;
+  while (end > 0) {
+    const code = normalized.charCodeAt(end - 1);
+    if (code >= 97 && code <= 122) break;
+    end--;
+  }
+  const base = normalized.slice(0, end);
   return base.length >= 4 && base !== normalized && COMMON_PASSWORDS.has(base);
 }
 

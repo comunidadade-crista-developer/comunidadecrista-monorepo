@@ -19,7 +19,7 @@ sozinho a partir daqui (ver [servico-render](servico-render.md)): o deploy é ma
 
 ## 2. Ficheiros a preencher
 
-- `SECURITY.md`: **feito**, com `seguranca.comunidadecrista@protonmail.com` (Proton Mail). Falta o `CODE_OF_CONDUCT.md`, que ainda tem «conduct@<domínio> (a configurar)»: decidir o contacto. O `SECURITY.md` já refere o _private vulnerability reporting_, que tem de estar activo (secção 1).
+- `SECURITY.md`: **feito**, com `seguranca.comunidadecrista@protonmail.com` (Proton Mail). O `CODE_OF_CONDUCT.md` usa o mesmo contacto (RB-f). O `SECURITY.md` já refere o _private vulnerability reporting_, que tem de estar activo (secção 1).
 - Gitleaks na CI: opcional, além do _secret scanning_ (avaliar depois do deploy).
 
 ## 3. Fluxo de trabalho

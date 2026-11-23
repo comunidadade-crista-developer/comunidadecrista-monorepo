@@ -98,9 +98,14 @@ export async function postsRoutes(
       const { gospelCardId, category, filter, cursor, limit } = request.query;
 
       try {
+        // CodeQL js/user-controlled-bypass: falso positivo. `filter` só escolhe QUE lista devolver;
+        // a autorização é a verificação seguinte (`viewerId` vem do token, nunca do pedido).
         if (filter === "liked") {
           if (!viewerId) return sendError(reply, 401, "missing_token");
           const result = await posts.list({
+            // CodeQL js/user-controlled-bypass: falso positivo. `filter`/`cursor` só decidem se esta é a
+            // primeira página do feed; a consulta é sempre limitada ao `viewerId` do token, por isso
+            // ninguém vê posts em revisão de outro autor, qualquer que seja o valor enviado.
             filter: "liked",
             viewerId,
             limit,

@@ -221,3 +221,20 @@ describe("RecoverResetRequest", () => {
     ).toBe(false);
   });
 });
+
+describe("isCommonPassword: tempo linear em entradas longas (CodeQL js/polynomial-redos)", () => {
+  it("sequências longas de símbolos ou dígitos não bloqueiam e dão o resultado certo", () => {
+    const n = 200_000;
+    const t0 = performance.now();
+    expect(isCommonPassword("`".repeat(n))).toBe(false);
+    expect(isCommonPassword("password" + "1".repeat(n))).toBe(true);
+    expect(isCommonPassword("a" + "9".repeat(n))).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  it("a «base» continua a ignorar só o que vem no fim", () => {
+    expect(isCommonPassword("password!!!")).toBe(true);
+    expect(isCommonPassword("1password")).toBe(false);
+    expect(isCommonPassword("pass123")).toBe(false);
+  });
+});

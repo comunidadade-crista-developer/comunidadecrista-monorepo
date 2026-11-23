@@ -32,3 +32,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 | RB-c  | [Revisão do backend](RB-revisao-backend.md) e [versões para o deploy](../runbooks/versoes-e-seguranca.md) | Feito  |
 | RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
 | RB-e  | [Postgres 17 e contacto de segurança](RB-e-postgres17.md)                                                 | Feito  |
+| RB-f  | [CI, CodeQL e build do web](RB-f-ci-codeql-build-web.md)                                                  | Feito  |

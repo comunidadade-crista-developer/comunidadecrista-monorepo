@@ -345,6 +345,9 @@ export async function authRoutes(
       const sentinel = await password.getSentinelHash();
 
       let ok: boolean;
+      // CodeQL js/user-controlled-bypass: falso positivo. `body.mode` só escolhe o método de
+      // recuperação (código ou perguntas); ambos verificam sempre um hash (o sentinela quando o
+      // utilizador não existe, para igualar tempos) e o resultado decide o 401 logo abaixo.
       if (body.mode === "code") {
         ok = await recovery.verifyCode(
           user?.recoveryCodeHash ?? sentinel,

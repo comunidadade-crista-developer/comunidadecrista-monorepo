@@ -12,4 +12,4 @@ Primeira etapa do [plano de deploy](../runbooks/deploy-backend.md) (Etapa 1).
 **Não validado aqui**: o ambiente de desenvolvimento só tem Postgres 16. As migrações usam SQL standard e `citext`; a
 primeira CI em 17 é a confirmação.
 
-**Pendente**: contacto do `CODE_OF_CONDUCT.md` («conduct@<domínio>», ainda por decidir).
+O contacto do `CODE_OF_CONDUCT.md` ficou resolvido em [RB-f](RB-f-ci-codeql-build-web.md).

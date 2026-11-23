@@ -41,6 +41,16 @@ as notas de «Updating» do anúncio.
 
 Notas:
 
+- **Risco aceite — `minimatch` (GHSA-g3hv-75wg-m249, moderada, DoS por amplificação de _globparts_,
+  intervalo >=7.0.0 <11.0.1).** Aparece em `typescript-eslint > @typescript-eslint/typescript-estree >
+minimatch`: só ferramentas de desenvolvimento (lint), nunca no runtime nem no bundle, e abaixo do
+  limiar `high` da CI. Não se força uma _override_ para >=11.0.1 sem a poder testar (compatibilidade
+  com o `typescript-estree`). Acompanhar: aceitar o PR do Dependabot que actualize `typescript-eslint`
+  e reavaliar na revisão da semana do deploy. Decidido em 2026-11-23.
+- **Navegadores do web (RB-f).** `build.target` = `es2020`, `chrome80`, `edge80`, `firefox78`,
+  `safari14.1`. O esbuild 0.28 não compila destructuring para Safari <= 14.0 (iOS <= 14.4), por isso
+  iPhones que não passem de iOS 12–14.4 (iPhone 5s/6) ficam sem suporte; iPhone 6s e posteriores
+  (iOS 15) funcionam. Cobri-los exigiria `@vitejs/plugin-legacy` (bundle maior): decisão adiada.
 - O `trustProxy` já usa função por causa do CVE-2026-16732 (ver `resumo-seguranca.md`).
 - Os majors pendentes listados em `resumo-seguranca.md` (`@fastify/cors` 11, `pino` 10, `react` 19,
   `vite` 8, etc.) não têm vulnerabilidade associada; actualizar um de cada vez, depois do deploy.
