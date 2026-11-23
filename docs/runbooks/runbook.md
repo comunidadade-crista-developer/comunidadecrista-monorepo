@@ -2,8 +2,20 @@
 
 ## Ambientes
 
-- **Local**: docker-compose (Postgres 16 + Redis 7) + `pnpm dev`
+- **Local**: docker-compose (Postgres 17 + Redis 7) + `pnpm dev`
 - **Produção**: Cloudflare Pages (web) + Render free (API) + Neon (Postgres) + Upstash (Redis)
+
+### Actualizar o Postgres local (16 → 17)
+
+O volume de dados de uma versão **não abre** noutra versão maior: com a imagem nova o contentor não arranca. Em desenvolvimento
+recria-se o volume (apaga os dados locais):
+
+```
+docker compose down -v
+docker compose up -d
+pnpm --filter @comunidade/api db:migrate
+pnpm --filter @comunidade/api db:seed
+```
 
 ## Deploy
 

@@ -1,0 +1,212 @@
+diff --git a/CODE_OF_CONDUCT.md b/CODE_OF_CONDUCT.md
+index 1c5f4db..fa9c0ef 100644
+--- a/CODE_OF_CONDUCT.md
++++ b/CODE_OF_CONDUCT.md
+@@ -4,4 +4,4 @@ Este projeto segue o [Contributor Covenant v2.1](https://www.contributor-covenan
+ 
+ Resumo: trata todos com respeito. Não são tolerados assédio, discriminação, ataques pessoais ou conteúdo que viole a doutrina cristã historicamente partilhada pelas igrejas evangélicas.
+ 
+-Reporta problemas para **conduct@<domínio>** (a configurar).
++Reporta problemas para **seguranca.comunidadecrista@protonmail.com** (o mesmo contacto do [SECURITY.md](SECURITY.md); indica no assunto «Código de Conduta»).
+diff --git a/apps/api/src/routes/auth.ts b/apps/api/src/routes/auth.ts
+index 053a510..eaabaa0 100644
+--- a/apps/api/src/routes/auth.ts
++++ b/apps/api/src/routes/auth.ts
+@@ -345,6 +345,9 @@ export async function authRoutes(
+       const sentinel = await password.getSentinelHash();
+ 
+       let ok: boolean;
++      // CodeQL js/user-controlled-bypass: falso positivo. `body.mode` só escolhe o método de
++      // recuperação (código ou perguntas); ambos verificam sempre um hash (o sentinela quando o
++      // utilizador não existe, para igualar tempos) e o resultado decide o 401 logo abaixo.
+       if (body.mode === "code") {
+         ok = await recovery.verifyCode(
+           user?.recoveryCodeHash ?? sentinel,
+diff --git a/apps/api/test/password-policy.test.ts b/apps/api/test/password-policy.test.ts
+index 8305e5d..670038f 100644
+--- a/apps/api/test/password-policy.test.ts
++++ b/apps/api/test/password-policy.test.ts
+@@ -221,3 +221,20 @@ describe("RecoverResetRequest", () => {
+     ).toBe(false);
+   });
+ });
++
++describe("isCommonPassword: tempo linear em entradas longas (CodeQL js/polynomial-redos)", () => {
++  it("sequências longas de símbolos ou dígitos não bloqueiam e dão o resultado certo", () => {
++    const n = 200_000;
++    const t0 = performance.now();
++    expect(isCommonPassword("`".repeat(n))).toBe(false);
++    expect(isCommonPassword("password" + "1".repeat(n))).toBe(true);
++    expect(isCommonPassword("a" + "9".repeat(n))).toBe(false);
++    expect(performance.now() - t0).toBeLessThan(500);
++  });
++
++  it("a «base» continua a ignorar só o que vem no fim", () => {
++    expect(isCommonPassword("password!!!")).toBe(true);
++    expect(isCommonPassword("1password")).toBe(false);
++    expect(isCommonPassword("pass123")).toBe(false);
++  });
++});
+diff --git a/apps/api/test/shared/reserved-usernames.test.ts b/apps/api/test/shared/reserved-usernames.test.ts
+index 5eb3baa..78a03a1 100644
+--- a/apps/api/test/shared/reserved-usernames.test.ts
++++ b/apps/api/test/shared/reserved-usernames.test.ts
+@@ -83,3 +83,14 @@ describe("schemas de username", () => {
+     expect(Username.safeParse("admin").success).toBe(true);
+   });
+ });
++
++describe("isReservedUsername: tempo linear em entradas longas (CodeQL js/polynomial-redos)", () => {
++  it("sequências longas de dígitos não bloqueiam e dão o resultado certo", () => {
++    const n = 200_000;
++    const t0 = performance.now();
++    expect(isReservedUsername("admin" + "9".repeat(n))).toBe(true);
++    expect(isReservedUsername("9".repeat(n) + "admin")).toBe(true);
++    expect(isReservedUsername("9".repeat(n))).toBe(false);
++    expect(performance.now() - t0).toBeLessThan(500);
++  });
++});
+diff --git a/apps/web/vite.config.ts b/apps/web/vite.config.ts
+index 715caa0..2edb7ab 100644
+--- a/apps/web/vite.config.ts
++++ b/apps/web/vite.config.ts
+@@ -3,6 +3,12 @@ import { defineConfig } from "vite";
+ 
+ export default defineConfig({
+   plugins: [react()],
++  build: {
++    // O alvo por omissão do Vite 6 inclui `safari14`, que o esbuild 0.28 já não consegue compilar
++    // (destructuring em Safari <= 14.0, iOS <= 14.4). `safari14.1` (iOS 14.5+, iPhone 6s e
++    // posteriores) é o mínimo que compila; os outros valores abrangem Android antigo.
++    target: ["es2020", "chrome80", "edge80", "firefox78", "safari14.1"],
++  },
+   server: {
+     port: 5173,
+     proxy: {
+diff --git a/docs/registos/RB-e-postgres17.md b/docs/registos/RB-e-postgres17.md
+index 5b06b0b..934b8f9 100644
+--- a/docs/registos/RB-e-postgres17.md
++++ b/docs/registos/RB-e-postgres17.md
+@@ -12,4 +12,4 @@ Primeira etapa do [plano de deploy](../runbooks/deploy-backend.md) (Etapa 1).
+ **Não validado aqui**: o ambiente de desenvolvimento só tem Postgres 16. As migrações usam SQL standard e `citext`; a
+ primeira CI em 17 é a confirmação.
+ 
+-**Pendente**: contacto do `CODE_OF_CONDUCT.md` («conduct@<domínio>», ainda por decidir).
++O contacto do `CODE_OF_CONDUCT.md` ficou resolvido em [RB-f](RB-f-ci-codeql-build-web.md).
+diff --git a/docs/registos/RB-f-ci-codeql-build-web.md b/docs/registos/RB-f-ci-codeql-build-web.md
+new file mode 100644
+index 0000000..586f869
+--- /dev/null
++++ b/docs/registos/RB-f-ci-codeql-build-web.md
+@@ -0,0 +1,20 @@
++# RB-f — CI, CodeQL e build do web
++
++Resultado da verificação no GitHub após a RB-e.
++
++- **Build do `apps/web` falhava na CI.** O alvo por omissão do Vite 6 inclui `safari14`; o `esbuild`
++  0.28.2 (forçado pela _override_ do `pnpm-workspace.yaml`) não compila o destructuring do `zod`
++  para esse alvo. Testado com o esbuild: `safari14` e `ios14` falham, `safari14.1`/`ios14.5` passam.
++  Fix: `build.target` explícito em `apps/web/vite.config.ts`
++  (`es2020`, `chrome80`, `edge80`, `firefox78`, `safari14.1`), para manter iPhones antigos
++  (iOS 14.5+). Limite e alternativa em `versoes-e-seguranca.md`.
++- **CodeQL #2 e #3 (`js/polynomial-redos`).** `/\d+$/` e `/[^a-z]+$/u` substituídas por ciclos
++  lineares com resultado idêntico; testes com entradas de 200 000 caracteres.
++- **CodeQL #1, #4, #5, #6 (`js/user-controlled-bypass`).** Falsos positivos: o valor do pedido só
++  escolhe o ramo; a autorização vem do token (`viewerId`) e da base de dados. Comentários no código
++  e _dismiss_ no GitHub como «False positive».
++- **`pnpm audit` — `minimatch` (moderada, só dev).** Risco aceite e documentado.
++- **`CODE_OF_CONDUCT.md`** passa a usar `seguranca.comunidadecrista@protonmail.com`.
++
++**Não validado aqui**: o `vite build` completo (sem `pnpm install` neste ambiente); só o esbuild
++isolado. A primeira CI confirma.
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index 1d306dd..c007d3d 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -32,3 +32,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-c  | [Revisão do backend](RB-revisao-backend.md) e [versões para o deploy](../runbooks/versoes-e-seguranca.md) | Feito  |
+ | RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
+ | RB-e  | [Postgres 17 e contacto de segurança](RB-e-postgres17.md)                                                 | Feito  |
++| RB-f  | [CI, CodeQL e build do web](RB-f-ci-codeql-build-web.md)                                                  | Feito  |
+diff --git a/docs/runbooks/servico-github.md b/docs/runbooks/servico-github.md
+index 97f105e..f6b5b0e 100644
+--- a/docs/runbooks/servico-github.md
++++ b/docs/runbooks/servico-github.md
+@@ -19,7 +19,7 @@ sozinho a partir daqui (ver [servico-render](servico-render.md)): o deploy é ma
+ 
+ ## 2. Ficheiros a preencher
+ 
+-- `SECURITY.md`: **feito**, com `seguranca.comunidadecrista@protonmail.com` (Proton Mail). Falta o `CODE_OF_CONDUCT.md`, que ainda tem «conduct@<domínio> (a configurar)»: decidir o contacto. O `SECURITY.md` já refere o _private vulnerability reporting_, que tem de estar activo (secção 1).
++- `SECURITY.md`: **feito**, com `seguranca.comunidadecrista@protonmail.com` (Proton Mail). O `CODE_OF_CONDUCT.md` usa o mesmo contacto (RB-f). O `SECURITY.md` já refere o _private vulnerability reporting_, que tem de estar activo (secção 1).
+ - Gitleaks na CI: opcional, além do _secret scanning_ (avaliar depois do deploy).
+ 
+ ## 3. Fluxo de trabalho
+diff --git a/docs/runbooks/versoes-e-seguranca.md b/docs/runbooks/versoes-e-seguranca.md
+index 7e4cc98..feaca63 100644
+--- a/docs/runbooks/versoes-e-seguranca.md
++++ b/docs/runbooks/versoes-e-seguranca.md
+@@ -41,6 +41,16 @@ as notas de «Updating» do anúncio.
+ 
+ Notas:
+ 
++- **Risco aceite — `minimatch` (GHSA-g3hv-75wg-m249, moderada, DoS por amplificação de _globparts_,
++  intervalo >=7.0.0 <11.0.1).** Aparece em `typescript-eslint > @typescript-eslint/typescript-estree >
++minimatch`: só ferramentas de desenvolvimento (lint), nunca no runtime nem no bundle, e abaixo do
++  limiar `high` da CI. Não se força uma _override_ para >=11.0.1 sem a poder testar (compatibilidade
++  com o `typescript-estree`). Acompanhar: aceitar o PR do Dependabot que actualize `typescript-eslint`
++  e reavaliar na revisão da semana do deploy. Decidido em 2026-11-23.
++- **Navegadores do web (RB-f).** `build.target` = `es2020`, `chrome80`, `edge80`, `firefox78`,
++  `safari14.1`. O esbuild 0.28 não compila destructuring para Safari <= 14.0 (iOS <= 14.4), por isso
++  iPhones que não passem de iOS 12–14.4 (iPhone 5s/6) ficam sem suporte; iPhone 6s e posteriores
++  (iOS 15) funcionam. Cobri-los exigiria `@vitejs/plugin-legacy` (bundle maior): decisão adiada.
+ - O `trustProxy` já usa função por causa do CVE-2026-16732 (ver `resumo-seguranca.md`).
+ - Os majors pendentes listados em `resumo-seguranca.md` (`@fastify/cors` 11, `pino` 10, `react` 19,
+   `vite` 8, etc.) não têm vulnerabilidade associada; actualizar um de cada vez, depois do deploy.
+diff --git a/packages/shared/src/password-policy.ts b/packages/shared/src/password-policy.ts
+index 85ba62c..77b2d9c 100644
+--- a/packages/shared/src/password-policy.ts
++++ b/packages/shared/src/password-policy.ts
+@@ -468,7 +468,15 @@ export function normalizeForPolicy(value: string): string {
+ export function isCommonPassword(password: string): boolean {
+   const normalized = normalizeForPolicy(password);
+   if (COMMON_PASSWORDS.has(normalized)) return true;
+-  const base = normalized.replace(/[^a-z]+$/u, "");
++  // Corta do fim tudo o que não é a-z. Ciclo linear em vez de `/[^a-z]+$/u`, que é quadrática
++  // em longas sequências (CodeQL js/polynomial-redos); o resultado é idêntico.
++  let end = normalized.length;
++  while (end > 0) {
++    const code = normalized.charCodeAt(end - 1);
++    if (code >= 97 && code <= 122) break;
++    end--;
++  }
++  const base = normalized.slice(0, end);
+   return base.length >= 4 && base !== normalized && COMMON_PASSWORDS.has(base);
+ }
+ 
+diff --git a/packages/shared/src/reserved-usernames.ts b/packages/shared/src/reserved-usernames.ts
+index 982f0bd..0d82a03 100644
+--- a/packages/shared/src/reserved-usernames.ts
++++ b/packages/shared/src/reserved-usernames.ts
+@@ -111,8 +111,21 @@ function squash(value: string): string {
+     .replace(/[^a-z0-9]/g, "");
+ }
+ 
++function isAsciiDigit(code: number): boolean {
++  return code >= 48 && code <= 57;
++}
++
++/**
++ * Remove os dígitos ASCII do início e do fim. Ciclo linear em vez de `/^\d+/` e `/\d+$/`: a
++ * expressão ancorada no fim é quadrática em longas sequências de dígitos (CodeQL
++ * js/polynomial-redos). O resultado é idêntico.
++ */
+ function stripEdgeDigits(value: string): string {
+-  return value.replace(/^\d+/, "").replace(/\d+$/, "");
++  let start = 0;
++  let end = value.length;
++  while (start < end && isAsciiDigit(value.charCodeAt(start))) start++;
++  while (end > start && isAsciiDigit(value.charCodeAt(end - 1))) end--;
++  return value.slice(start, end);
+ }
+ 
+ function leet(value: string, one: "i" | "l"): string {

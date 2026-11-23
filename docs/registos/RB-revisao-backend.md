@@ -26,7 +26,7 @@ entre a documentação e o código.
 | 9   | Baixa     | Sem mínimos de argon2 em produção; `index.ts` registava `err`                                                                                                 | Corrigido (RB-a)                                                         |
 | 10  | Info      | Access token de 15 min continua válido depois do logout                                                                                                       | Aceite (ADR-006); `requireAdmin` revalida na BD                          |
 | 11  | Info      | Bloqueio por conta no login permite negar o acesso a uma conta alvo (compromisso conhecido do rate limit por conta)                                           | Aceite; mitigado pelos baldes por IP e pelo balde por conta mais folgado |
-| 12  | Info      | `SECURITY.md` com contacto «a configurar»; sem _secret scanning_ activo                                                                                       | Pendente (antes do deploy)                                               |
+| 12  | Info      | `SECURITY.md` com contacto «a configurar» (resolvido na RB-e); sem _secret scanning_ activo                                                                   | Pendente (antes do deploy)                                               |
 | 13  | Info      | Faltavam testes: registo e refresh concorrentes, `/health/deep`, limites                                                                                      | Cobertos em RB-a/RB-b; limitador com Redis em baixo continua por cobrir  |
 
 ## 3. Decisões

@@ -7,12 +7,12 @@ pesquisa na semana do deploy.
 
 ## 1. Runtime e ferramentas
 
-| Componente | Em uso                               | Estado em 2026-11-20                                                                                                                                                                                     | Recomendação                                                                                                                    |
-| ---------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Node.js    | `.nvmrc` = `24`; `engines >=24`      | 24: _Maintenance LTS_ (suporte activo terminou em 20-10-2026; segurança até 30-04-2028), última **24.22.3**. 26: _Active LTS_ até 27-10-2027, segurança até 30-04-2029, última **26.13.1**. 25 já é EOL. | Fixar `NODE_VERSION` no Render para **>= 24.22.3** (aviso de segurança de 11-11-2026). Decidir se se arranca já em 26 (ver §4). |
-| pnpm       | 10 (`packageManager: pnpm@10.18.0`)  | pnpm 11 existe: `minimumReleaseAge` de 1 dia por omissão, `strictDepBuilds`, `allowBuilds`; exige Node >= 22; configuração migra do `.npmrc` para `pnpm-workspace.yaml`.                                 | Manter 10 até ao deploy; migrar depois, com o codemod `pnpm-v10-to-v11`, num bloco próprio.                                     |
-| PostgreSQL | `postgres:16-alpine` (dev e CI)      | 16.16 é a última 16 (12-11-2026); 14 chegou ao fim de vida; **19 sai a 19-11-2026**. Neon suporta 14 a 18.                                                                                               | Escolher **17 ou 18** na Neon para um projecto novo e alinhar o `docker-compose.yml` e a CI com essa versão. Não adoptar 19 já. |
-| Redis      | `redis:7-alpine` (dev e CI); Upstash | **Não pesquisado.**                                                                                                                                                                                      | Verificar a versão suportada pela Upstash e o aviso de segurança do Redis antes do deploy.                                      |
+| Componente | Em uso                                  | Estado em 2026-11-20                                                                                                                                                                                     | Recomendação                                                                                                                    |
+| ---------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js    | `.nvmrc` = `24`; `engines >=24`         | 24: _Maintenance LTS_ (suporte activo terminou em 20-10-2026; segurança até 30-04-2028), última **24.22.3**. 26: _Active LTS_ até 27-10-2027, segurança até 30-04-2029, última **26.13.1**. 25 já é EOL. | Fixar `NODE_VERSION` no Render para **>= 24.22.3** (aviso de segurança de 11-11-2026). Decidir se se arranca já em 26 (ver §4). |
+| pnpm       | 10 (`packageManager: pnpm@10.18.0`)     | pnpm 11 existe: `minimumReleaseAge` de 1 dia por omissão, `strictDepBuilds`, `allowBuilds`; exige Node >= 22; configuração migra do `.npmrc` para `pnpm-workspace.yaml`.                                 | Manter 10 até ao deploy; migrar depois, com o codemod `pnpm-v10-to-v11`, num bloco próprio.                                     |
+| PostgreSQL | `postgres:17-alpine` (dev e CI; era 16) | 16.16 é a última 16 (12-11-2026); 14 chegou ao fim de vida; **19 sai a 19-11-2026**. Neon suporta 14 a 18.                                                                                               | **Decidido: 17** na Neon, com `docker-compose.yml` e CI alinhados. Não adoptar 19 já.                                           |
+| Redis      | `redis:7-alpine` (dev e CI); Upstash    | **Não pesquisado.**                                                                                                                                                                                      | Verificar a versão suportada pela Upstash e o aviso de segurança do Redis antes do deploy.                                      |
 
 ### Node 24.22.3 — o que corrige (11-11-2026)
 
@@ -41,6 +41,16 @@ as notas de «Updating» do anúncio.
 
 Notas:
 
+- **Risco aceite — `minimatch` (GHSA-g3hv-75wg-m249, moderada, DoS por amplificação de _globparts_,
+  intervalo >=7.0.0 <11.0.1).** Aparece em `typescript-eslint > @typescript-eslint/typescript-estree >
+minimatch`: só ferramentas de desenvolvimento (lint), nunca no runtime nem no bundle, e abaixo do
+  limiar `high` da CI. Não se força uma _override_ para >=11.0.1 sem a poder testar (compatibilidade
+  com o `typescript-estree`). Acompanhar: aceitar o PR do Dependabot que actualize `typescript-eslint`
+  e reavaliar na revisão da semana do deploy. Decidido em 2026-11-23.
+- **Navegadores do web (RB-f).** `build.target` = `es2020`, `chrome80`, `edge80`, `firefox78`,
+  `safari14.1`. O esbuild 0.28 não compila destructuring para Safari <= 14.0 (iOS <= 14.4), por isso
+  iPhones que não passem de iOS 12–14.4 (iPhone 5s/6) ficam sem suporte; iPhone 6s e posteriores
+  (iOS 15) funcionam. Cobri-los exigiria `@vitejs/plugin-legacy` (bundle maior): decisão adiada.
 - O `trustProxy` já usa função por causa do CVE-2026-16732 (ver `resumo-seguranca.md`).
 - Os majors pendentes listados em `resumo-seguranca.md` (`@fastify/cors` 11, `pino` 10, `react` 19,
   `vite` 8, etc.) não têm vulnerabilidade associada; actualizar um de cada vez, depois do deploy.

@@ -34,8 +34,9 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 - [x] Domínio, Node, Postgres, região, operação (secção 1).
 - [x] Contas criadas (Neon, Upstash, Render, Cloudflare), ainda **não interligadas**.
-- [ ] Email de suporte e de segurança definido (para o `SECURITY.md`).
-- [ ] Gestor de palavras-passe escolhido (cofre dos segredos).
+- [x] Email de segurança: `seguranca.comunidadecrista@protonmail.com` (no `SECURITY.md`).
+- [x] Gestor de palavras-passe: **Proton Pass** (cofre dos segredos).
+- [ ] Contacto do `CODE_OF_CONDUCT.md` por decidir.
 
 **Saída**: tudo marcado.
 
@@ -43,8 +44,8 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 - [ ] Branch `master` protegida; checks obrigatórios: _Lint, Typecheck, Test, Build_, _Dependency audit_ e _CodeQL_.
 - [ ] _Secret scanning_, _push protection_, _Dependabot alerts_ e _private vulnerability reporting_ activos.
-- [ ] `SECURITY.md` com o contacto real.
-- [ ] **Bloco de alinhamento a Postgres 17** (`docker-compose.yml` e CI): _precisa de autorização_; obriga a recriar o volume local (`docker compose down -v`).
+- [x] **Alinhamento a Postgres 17** (`docker-compose.yml` e CI): obriga a recriar o volume local (runbook «Actualizar o Postgres local»); a CI confirma as migrações em 17.
+- [x] `SECURITY.md` com o contacto real.
 - [ ] CI verde em `dev` e `master`; `pnpm audit` sem resultados.
 - [ ] Teste local do build de produção: `pnpm build` e `node apps/api/dist/index.js` com `NODE_ENV=production` e variáveis de teste.
 

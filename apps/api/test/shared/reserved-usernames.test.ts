@@ -83,3 +83,14 @@ describe("schemas de username", () => {
     expect(Username.safeParse("admin").success).toBe(true);
   });
 });
+
+describe("isReservedUsername: tempo linear em entradas longas (CodeQL js/polynomial-redos)", () => {
+  it("sequências longas de dígitos não bloqueiam e dão o resultado certo", () => {
+    const n = 200_000;
+    const t0 = performance.now();
+    expect(isReservedUsername("admin" + "9".repeat(n))).toBe(true);
+    expect(isReservedUsername("9".repeat(n) + "admin")).toBe(true);
+    expect(isReservedUsername("9".repeat(n))).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+});

@@ -111,8 +111,21 @@ function squash(value: string): string {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function isAsciiDigit(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
+/**
+ * Remove os dígitos ASCII do início e do fim. Ciclo linear em vez de `/^\d+/` e `/\d+$/`: a
+ * expressão ancorada no fim é quadrática em longas sequências de dígitos (CodeQL
+ * js/polynomial-redos). O resultado é idêntico.
+ */
 function stripEdgeDigits(value: string): string {
-  return value.replace(/^\d+/, "").replace(/\d+$/, "");
+  let start = 0;
+  let end = value.length;
+  while (start < end && isAsciiDigit(value.charCodeAt(start))) start++;
+  while (end > start && isAsciiDigit(value.charCodeAt(end - 1))) end--;
+  return value.slice(start, end);
 }
 
 function leet(value: string, one: "i" | "l"): string {
