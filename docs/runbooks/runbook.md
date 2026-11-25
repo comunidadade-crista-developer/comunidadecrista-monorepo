@@ -38,6 +38,10 @@ O plano completo de deploy, os runbooks por serviço e o plano de gestão estão
 A API **não** migra no arranque: as migrações aplicam-se à mão, **antes** de lançar o código que
 as usa.
 
+0. **Confirmar o destino** antes de migrar, semear ou promover: na consola da Neon, ver a que _branch_
+   pertence o endpoint (`ep-…`) do host da `DATABASE_URL`; com o `psql` na **mesma** string, `\conninfo`
+   e `\dt`. Usar uma só string por ambiente. (Na primeira execução do seed a string apontava para um
+   _branch_ vazio: `relation "gospel_cards" does not exist`, código `42P01`.)
 1. Guardar um ponto de retorno: na Neon, criar um _branch_ (ou anotar o instante para _restore_) antes
    de qualquer migração que apague ou reescreva dados.
 2. Numa máquina com o repositório na versão a lançar e `DATABASE_URL` de produção (ligação directa da

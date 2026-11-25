@@ -1,0 +1,179 @@
+diff --git a/apps/api/src/db/seed.ts b/apps/api/src/db/seed.ts
+index 7cc4534..18dc83c 100644
+--- a/apps/api/src/db/seed.ts
++++ b/apps/api/src/db/seed.ts
+@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
+ import { GospelCardsSeedFile } from "@comunidade/shared";
+ import { createCardsCache } from "../cache/cards-cache.js";
+ import { loadEnv } from "../env.js";
++import { safeErrorFields } from "../errors.js";
+ import {
+   attachRedisErrorLogging,
+   createRedis,
+@@ -63,15 +64,19 @@ try {
+     if (!(await waitUntilReady(redis))) {
+       throw new Error("redis_unavailable");
+     }
+-    const version = await createCardsCache({ redis, cards: repo, logger: log })
+-      .invalidate();
++    const version = await createCardsCache({
++      redis,
++      cards: repo,
++      logger: log,
++    }).invalidate();
+     console.log(`Cache invalidada (versão ${version}).`);
+   }
+ } catch (err) {
+   exitCode = 1;
++  // Só o tipo e o código (SQLSTATE, ETIMEDOUT...): nunca a mensagem, que pode ter host ou dados.
+   console.error(
+     "Seed falhou ou a cache não foi invalidada:",
+-    err instanceof Error ? err.name : typeof err,
++    safeErrorFields(err),
+     "— repete `pnpm db:seed` (é idempotente).",
+   );
+ } finally {
+diff --git a/docs/registos/RB-g-seed-diagnostico-estado-deploy.md b/docs/registos/RB-g-seed-diagnostico-estado-deploy.md
+new file mode 100644
+index 0000000..255fc14
+--- /dev/null
++++ b/docs/registos/RB-g-seed-diagnostico-estado-deploy.md
+@@ -0,0 +1,12 @@
++# RB-g — Diagnóstico do seed e estado do deploy
++
++- `db:seed` passa a registar `safeErrorFields(err)` (tipo, código SQLSTATE ou de rede, causa) em vez de só
++  o nome do erro. Nunca a mensagem. Motivo: o primeiro falhanço mostrava só «Error»; era `42P01`
++  (`relation "gospel_cards" does not exist`) por a `DATABASE_URL` apontar para um _branch_ vazio da Neon.
++- Runbook «Migrações da base de dados»: passo 0, confirmar o destino (`ep-…`, branch, `\conninfo`,
++  `\dt`) antes de migrar, semear ou promover.
++- `deploy-backend.md`: Etapas 0 a 4 fechadas; Etapa 5 em curso (ver o ficheiro).
++- `admin:promote` exige o utilizador já registado; passa a constar assim na Etapa 7.
++
++**Não validado aqui**: o `seed.ts` não tem teste automático (script de arranque); verificado só com
++`prettier`. O `pnpm typecheck` da CI é a confirmação.
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index c007d3d..4a1a7f9 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -33,3 +33,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-d  | [Plano de deploy, runbooks por serviço e gestão](RB-d-plano-deploy.md)                                    | Feito  |
+ | RB-e  | [Postgres 17 e contacto de segurança](RB-e-postgres17.md)                                                 | Feito  |
+ | RB-f  | [CI, CodeQL e build do web](RB-f-ci-codeql-build-web.md)                                                  | Feito  |
++| RB-g  | [Diagnóstico do seed e estado do deploy](RB-g-seed-diagnostico-estado-deploy.md)                          | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index 8f180bf..4723359 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -1,6 +1,6 @@
+ # Plano de deploy do backend
+ 
+-**Estado**: plano aprovado nas decisões (2026-11-20); execução por etapas. Cada etapa tem critério de
++**Estado** (2026-11-24): decisões aprovadas em 2026-11-20; **Etapas 0 a 4 fechadas, Etapa 5 em curso** (API no Render com `/health` e `/health/deep` a 200); execução por etapas. Cada etapa tem critério de
+ saída: só se avança com ele cumprido. Os runbooks por serviço estão ligados em cada etapa; o controlo
+ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+@@ -36,53 +36,57 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ - [x] Contas criadas (Neon, Upstash, Render, Cloudflare), ainda **não interligadas**.
+ - [x] Email de segurança: `seguranca.comunidadecrista@protonmail.com` (no `SECURITY.md`).
+ - [x] Gestor de palavras-passe: **Proton Pass** (cofre dos segredos).
+-- [ ] Contacto do `CODE_OF_CONDUCT.md` por decidir.
++- [x] Contacto do `CODE_OF_CONDUCT.md`: o mesmo email de segurança (RB-f).
+ 
+ **Saída**: tudo marcado.
+ 
+-### Etapa 1 — Repositório pronto ([servico-github](servico-github.md))
++### Etapa 1 — Repositório pronto ([servico-github](servico-github.md)) ✅
+ 
+-- [ ] Branch `master` protegida; checks obrigatórios: _Lint, Typecheck, Test, Build_, _Dependency audit_ e _CodeQL_.
+-- [ ] _Secret scanning_, _push protection_, _Dependabot alerts_ e _private vulnerability reporting_ activos.
++- [x] Branch `master` protegida; checks obrigatórios: _Lint, Typecheck, Test, Build_, _Dependency audit_ e _CodeQL_.
++- [x] _Secret scanning_, _push protection_, _Dependabot alerts_ e _private vulnerability reporting_ activos.
+ - [x] **Alinhamento a Postgres 17** (`docker-compose.yml` e CI): obriga a recriar o volume local (runbook «Actualizar o Postgres local»); a CI confirma as migrações em 17.
+ - [x] `SECURITY.md` com o contacto real.
+-- [ ] CI verde em `dev` e `master`; `pnpm audit` sem resultados.
+-- [ ] Teste local do build de produção: `pnpm build` e `node apps/api/dist/index.js` com `NODE_ENV=production` e variáveis de teste.
++- [x] CI verde em `dev` e `master`; `pnpm audit` sem resultados.
++- [x] Teste local do build de produção: `pnpm build` e `node apps/api/dist/index.js` com `NODE_ENV=production` e variáveis de teste.
+ 
+ **Saída**: o build de produção arranca localmente e a CI está verde.
+ 
+-### Etapa 2 — Dados ([servico-neon](servico-neon.md), [servico-upstash](servico-upstash.md))
++### Etapa 2 — Dados ([servico-neon](servico-neon.md), [servico-upstash](servico-upstash.md)) ✅
+ 
+-- [ ] Neon: projecto em Frankfurt, Postgres 17, _autosuspend_ de 5 min (não se desliga no plano gratuito).
+-- [ ] Neon: roles separados — dono (migrações) e `comunidade_app` (só DML), com os _timeouts_ no role da aplicação.
+-- [ ] Upstash: base de dados em Frankfurt (confirmar disponibilidade na consola), TLS, `rediss://`.
+-- [ ] Guardar as duas _strings_ de ligação da Neon (directa e _pooler_) e a do Redis no cofre.
++- [x] Neon: projecto em Frankfurt, Postgres 17, _autosuspend_ de 5 min (não se desliga no plano gratuito).
++- [x] Neon: roles separados — dono (migrações) e `comunidade_app` (só DML), com os _timeouts_ no role da aplicação.
++- [x] Upstash: base de dados em Frankfurt (confirmar disponibilidade na consola), TLS, `rediss://`.
++- [x] Guardar as duas _strings_ de ligação da Neon (directa e _pooler_) e a do Redis no cofre.
+ 
+ **Saída**: `psql` e `redis-cli` ligam com as credenciais finais; o role da aplicação não consegue criar tabelas.
+ 
+-### Etapa 3 — Segredos ([gestao-e-controlo](gestao-e-controlo.md) §2)
++### Etapa 3 — Segredos ([gestao-e-controlo](gestao-e-controlo.md) §2) ✅
+ 
+-- [ ] Par de chaves JWT: `pnpm --filter @comunidade/api generate-jwt-keys`.
+-- [ ] `IP_HASH_SECRET`: `openssl rand -base64 48`.
+-- [ ] Tabela de variáveis de produção preenchida ([servico-render](servico-render.md) §3), com cópia no cofre.
++- [x] Par de chaves JWT: `pnpm --filter @comunidade/api generate-jwt-keys`.
++- [x] `IP_HASH_SECRET`: `openssl rand -base64 48`.
++- [x] Tabela de variáveis de produção preenchida ([servico-render](servico-render.md) §3), com cópia no cofre.
+ 
+ **Saída**: nenhuma variável obrigatória em falta (a API recusa arrancar sem elas).
+ 
+-### Etapa 4 — Migrar e semear
++### Etapa 4 — Migrar e semear ✅
+ 
+-- [ ] `db:migrate` contra a Neon pela ligação **directa**, como dono (runbook «Migrações da base de dados»).
+-- [ ] Verificar as 8 migrações em `drizzle.__drizzle_migrations` e as tabelas.
+-- [ ] Atribuir os privilégios ao `comunidade_app` ([servico-neon](servico-neon.md) §4).
+-- [ ] `db:seed` com o conteúdo dos _gospel cards_ (conteúdo a fornecer).
++- [x] `db:migrate` contra a Neon pela ligação **directa**, como dono (runbook «Migrações da base de dados»).
++- [x] Verificar as 8 migrações em `drizzle.__drizzle_migrations` e as tabelas.
++- [x] Atribuir os privilégios ao `comunidade_app` ([servico-neon](servico-neon.md) §4).
++- [x] `db:seed` executado (só o card de exemplo; o seed é idempotente).
++- [ ] Conteúdo final dos _gospel cards_ (a fornecer): substituir `seed-data/cards.json` e repetir o seed. **Não bloqueia o deploy.**
+ 
+ **Saída**: esquema e _seed_ verificados por queries; o role da aplicação lê e escreve.
+ 
++**Nota (2026-11-24)**: o primeiro seed falhou por a `DATABASE_URL` apontar para outro _branch_ da Neon (vazio). Passo de confirmação do destino no runbook, «Migrações da base de dados», passo 0.
++
+ ### Etapa 5 — API no Render ([servico-render](servico-render.md))
+ 
+-- [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3`, _health check_ em `/health` e **Auto-Deploy desligado**.
+-- [ ] Variáveis de produção introduzidas (secção 3 do runbook do Render).
++- [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3` (**confirmado no log de build**), _health check_ em `/health` e **Auto-Deploy desligado** (falta confirmar estes dois na consola).
++- [x] Variáveis de produção introduzidas (secção 3 do runbook do Render).
+ - [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (um _script_ de medição é opcional, _precisa de autorização_).
+-- [ ] Primeiro deploy manual; logs de arranque sem avisos inesperados.
++- [x] Primeiro deploy manual: `/health` e `/health/deep` respondem `200` (`db: ok`, `redis: ok`).
++- [ ] Logs sem erros: no primeiro arranque houve `outbox: worker round failed` e `maintenance failed` repetidos (provável `DATABASE_URL` do _branch_ errado, já corrigida); confirmar que desapareceram nos logs seguintes. `HEAD /` e `GET /` a 404 são sondas do Render: normais.
+ 
+ **Saída**: `GET /health` e `GET /health/deep` respondem `200`; nos logs não há erros.
+ 
+@@ -99,7 +103,7 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ - [ ] Registo, login, `GET /auth/me`, refresh, logout, recuperação (código e perguntas).
+ - [ ] Feed, criar partilha, gostar, denunciar, `/sync`.
+-- [ ] Primeiro admin: `admin:promote` a partir da máquina do operador com o `DATABASE_URL` de produção; aprovar e rejeitar uma partilha.
++- [ ] Primeiro admin: **registar primeiro o utilizador pela API de produção**; depois `admin:promote <username>` a partir da máquina do operador com o `DATABASE_URL` de produção (directa, `comunidade_app`; testar a ligação antes, ver `ETIMEDOUT` de 2026-11-24); aprovar e rejeitar uma partilha.
+ - [ ] Limites: provocar um `429` num fluxo seguro.
+ - [ ] Medir comandos Redis por fluxo na consola da Upstash (R3).
+ - [ ] Opcional: _script_ de smoke repetível (_precisa de autorização_).
+diff --git a/docs/runbooks/runbook.md b/docs/runbooks/runbook.md
+index 7860c42..d9c8570 100644
+--- a/docs/runbooks/runbook.md
++++ b/docs/runbooks/runbook.md
+@@ -38,6 +38,10 @@ O plano completo de deploy, os runbooks por serviço e o plano de gestão estão
+ A API **não** migra no arranque: as migrações aplicam-se à mão, **antes** de lançar o código que
+ as usa.
+ 
++0. **Confirmar o destino** antes de migrar, semear ou promover: na consola da Neon, ver a que _branch_
++   pertence o endpoint (`ep-…`) do host da `DATABASE_URL`; com o `psql` na **mesma** string, `\conninfo`
++   e `\dt`. Usar uma só string por ambiente. (Na primeira execução do seed a string apontava para um
++   _branch_ vazio: `relation "gospel_cards" does not exist`, código `42P01`.)
+ 1. Guardar um ponto de retorno: na Neon, criar um _branch_ (ou anotar o instante para _restore_) antes
+    de qualquer migração que apague ou reescreva dados.
+ 2. Numa máquina com o repositório na versão a lançar e `DATABASE_URL` de produção (ligação directa da

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { GospelCardsSeedFile } from "@comunidade/shared";
 import { createCardsCache } from "../cache/cards-cache.js";
 import { loadEnv } from "../env.js";
+import { safeErrorFields } from "../errors.js";
 import {
   attachRedisErrorLogging,
   createRedis,
@@ -57,23 +58,24 @@ try {
   } else {
     attachRedisErrorLogging(redis, log);
     if (!(await waitUntilReady(redis))) {
-      throw new Error("redis_unavailable");
-    }
+       throw new Error("redis_unavailable");
+     }
     const version = await createCardsCache({
       redis,
       cards: repo,
       logger: log,
     }).invalidate();
-    console.log(`Cache invalidada (versão ${version}).`);
-  }
-} catch (err) {
-  exitCode = 1;
-  console.error(
-    "Seed falhou ou a cache não foi invalidada:",
-    err instanceof Error ? err.name : typeof err,
-    "— repete `pnpm db:seed` (é idempotente).",
-  );
-} finally {
+     console.log(`Cache invalidada (versão ${version}).`);
+   }
+ } catch (err) {
+   exitCode = 1;
+  // Só o tipo e o código (SQLSTATE, ETIMEDOUT...): nunca a mensagem, que pode ter host ou dados.
+   console.error(
+     "Seed falhou ou a cache não foi invalidada:",
+    safeErrorFields(err),
+     "— repete `pnpm db:seed` (é idempotente).",
+   );
+ } finally {
   if (redis) await redis.quit().catch(() => {});
   await pool.end().catch(() => {});
 }
