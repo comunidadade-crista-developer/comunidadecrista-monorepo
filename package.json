@@ -23,7 +23,7 @@
     "db:setup": "pnpm --filter @comunidade/api db:migrate && pnpm --filter @comunidade/api db:seed"
   },
   "devDependencies": {
-    "prettier": "^3.4.0",
+    "prettier": "^3.10.1",
     "typescript": "^5.7.0"
   }
 }
