@@ -1,6 +1,6 @@
 # Plano de deploy do backend
 
-**Estado** (2026-11-24): decisões aprovadas em 2026-11-20; **Etapas 0 a 4 fechadas, Etapa 5 em curso** (API no Render com `/health` e `/health/deep` a 200); execução por etapas. Cada etapa tem critério de
+**Estado** (2026-11-25): decisões aprovadas em 2026-11-20; **Etapas 0 a 5 fechadas** (API no Render, logs limpos); **próxima: Etapa 6**; execução por etapas. Cada etapa tem critério de
 saída: só se avança com ele cumprido. Os runbooks por serviço estão ligados em cada etapa; o controlo
 contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
@@ -80,13 +80,16 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 **Nota (2026-11-24)**: o primeiro seed falhou por a `DATABASE_URL` apontar para outro _branch_ da Neon (vazio). Passo de confirmação do destino no runbook, «Migrações da base de dados», passo 0.
 
-### Etapa 5 — API no Render ([servico-render](servico-render.md))
+**Nota (2026-11-25)**: as migrações, as permissões e o seed tinham sido feitos num _branch_ de teste e não no **principal**, que é onde o Render liga. Esta etapa só está cumprida quando as quatro verificações (8 migrações, tabelas, privilégios, `SELECT slug FROM gospel_cards`) passam **no branch da `DATABASE_URL` do Render**. Confirmado no principal em 2026-11-25 (1 card).
 
-- [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3` (**confirmado no log de build**), _health check_ em `/health` e **Auto-Deploy desligado** (falta confirmar estes dois na consola).
+### Etapa 5 — API no Render ([servico-render](servico-render.md)) ✅
+
+- [x] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3` (confirmado no log de build), _health check_ em `/health` e **Auto-Deploy desligado** (confirmados na consola).
 - [x] Variáveis de produção introduzidas (secção 3 do runbook do Render).
-- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (script `benchmark-argon2`, procedimento em [servico-render](servico-render.md) §2.1).
+- [x] **Benchmark do argon2** no CPU do Render (2026-11-25, 1 CPU visível): hash mediana **203 ms** (mín 198 ms), verify mediana 204 ms; **4 em simultâneo: mediana 1490 ms**, máx 1798 ms; RSS 89 MiB. Parâmetros mantidos (19456 KiB, 2 iterações, paralelismo 1). Logins simultâneos enfileiram num só CPU: gatilho de subida se o p95 de login passar de ~3 s com tráfego real (script `benchmark-argon2`, procedimento em [servico-render](servico-render.md) §2.1).
 - [x] Primeiro deploy manual: `/health` e `/health/deep` respondem `200` (`db: ok`, `redis: ok`).
-- [ ] Logs sem erros: no primeiro arranque houve `outbox: worker round failed` e `maintenance failed` repetidos (provável `DATABASE_URL` do _branch_ errado, já corrigida); confirmar que desapareceram nos logs seguintes. `HEAD /` e `GET /` a 404 são sondas do Render: normais.
+- [x] Logs sem erros: o primeiro arranque tinha `outbox: worker round failed` e `maintenance failed` com `errorCode: "42P01"` (tabela inexistente). Causa: o branch principal da Neon, onde o Render liga, não tinha as migrações (tinham corrido num _branch_ de teste); o `/health/deep` deu `ok` porque faz só `SELECT 1`. Resolvido ao migrar o principal; logs de 2026-11-25 limpos (`maintenance done`). `HEAD /` e `GET /` a 404 são sondas do Render: normais.
+- [ ] Adiado (decisão de 2026-11-25): `/health/deep` verificar também que o esquema existe (por exemplo `to_regclass('public.users')`), para apanhar uma base vazia ou do _branch_ errado.
 
 **Saída**: `GET /health` e `GET /health/deep` respondem `200`; nos logs não há erros.
 
