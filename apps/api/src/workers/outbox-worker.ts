@@ -52,15 +52,15 @@ export async function processOutboxBatch(
       result.done += 1;
     } catch (err) {
       result.failed += 1;
-       // Só tipo, nome e código do erro: a mensagem pode trazer dados do utilizador.
-       opts.log?.warn(
-         {
-           eventType: event.eventType,
-           attempts: event.attempts,
+      // Só tipo, nome e código do erro: a mensagem pode trazer dados do utilizador.
+      opts.log?.warn(
+        {
+          eventType: event.eventType,
+          attempts: event.attempts,
           ...safeErrorFields(err),
-         },
-         "outbox: handler failed",
-       );
+        },
+        "outbox: handler failed",
+      );
       await repo.markFailed(
         event.id,
         event.attempts,
@@ -104,9 +104,9 @@ export function startOutboxWorker(args: {
     } catch (err) {
       // Nome, código (SQLSTATE, ETIMEDOUT...) e causa; nunca a mensagem (host, dados).
       log.warn(safeErrorFields(err), "outbox: worker round failed");
-     }
-     schedule(more ? 0 : intervalMs);
-   };
+    }
+    schedule(more ? 0 : intervalMs);
+  };
 
   schedule(intervalMs);
 
