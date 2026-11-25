@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { GospelCardsSeedFile } from "@comunidade/shared";
 import { createCardsCache } from "../cache/cards-cache.js";
 import { loadEnv } from "../env.js";
+import { safeErrorFields } from "../errors.js";
 import {
   attachRedisErrorLogging,
   createRedis,
@@ -68,9 +69,10 @@ try {
   }
 } catch (err) {
   exitCode = 1;
+  // Só o tipo e o código (SQLSTATE, ETIMEDOUT...): nunca a mensagem, que pode ter host ou dados.
   console.error(
     "Seed falhou ou a cache não foi invalidada:",
-    err instanceof Error ? err.name : typeof err,
+    safeErrorFields(err),
     "— repete `pnpm db:seed` (é idempotente).",
   );
 } finally {

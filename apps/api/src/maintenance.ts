@@ -1,5 +1,6 @@
 import type { Database } from "./db/client.js";
 import type { Env } from "./env.js";
+import { safeErrorFields } from "./errors.js";
 import { accountDeletionRepo } from "./repositories/account-deletion.js";
 import { idempotencyKeysRepo, outboxRepo } from "./repositories/outbox.js";
 import { postsRepo } from "./repositories/posts.js";
@@ -97,11 +98,8 @@ export function startMaintenance(args: {
       });
       log.info({ ...summary }, "maintenance done");
     } catch (err) {
-      // Sem a mensagem: pode trazer dados.
-      log.warn(
-        { errorName: err instanceof Error ? err.name : typeof err },
-        "maintenance failed",
-      );
+      // Nome, código (SQLSTATE, ETIMEDOUT...) e causa; nunca a mensagem (pode trazer dados).
+      log.warn(safeErrorFields(err), "maintenance failed");
     } finally {
       running = false;
     }

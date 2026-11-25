@@ -1,0 +1,387 @@
+diff --git a/apps/api/package.json b/apps/api/package.json
+index bc8dd0f..c9d546e 100644
+--- a/apps/api/package.json
++++ b/apps/api/package.json
+@@ -18,6 +18,7 @@
+     "db:seed": "tsx src/db/seed.ts",
+     "db:studio": "drizzle-kit studio",
+     "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts",
++    "benchmark:argon2": "tsx scripts/benchmark-argon2.ts",
+     "admin:promote": "tsx scripts/admin-promote.ts",
+     "admin:demote": "tsx scripts/admin-demote.ts"
+   },
+diff --git a/apps/api/scripts/benchmark-argon2.ts b/apps/api/scripts/benchmark-argon2.ts
+new file mode 100644
+index 0000000..1ba8c63
+--- /dev/null
++++ b/apps/api/scripts/benchmark-argon2.ts
+@@ -0,0 +1,152 @@
++import { randomUUID } from "node:crypto";
++import { availableParallelism, totalmem } from "node:os";
++import { parseArgs } from "node:util";
++import { hash, verify } from "@node-rs/argon2";
++import { loadEnv } from "../src/env.js";
++
++/**
++ * Mede o argon2id com os parâmetros reais (ARGON2_* do ambiente) no CPU onde corre. Serve para a
++ * Etapa 5 do deploy: o Render gratuito não tem shell, por isso corre-se uma vez como início
++ * temporário do serviço (ver docs/runbooks/servico-render.md, «Benchmark do argon2») e lê-se o log.
++ *
++ * Não toca na base de dados nem no Redis e não imprime segredos: usa palavras-passe aleatórias
++ * geradas na hora. Pode testar variantes sem mexer no ambiente:
++ *   --memory-kb=19456 --time-cost=2 --parallelism=1 --rounds=10
++ */
++
++/** Alvo por hash (ms) no CPU de produção. */
++const TARGET_MS = 500;
++/** Mínimos de produção: os mesmos de src/env.ts (a API recusa arrancar abaixo). */
++const MIN_MEMORY_KB = 19_456;
++const MIN_TIME_COST = 2;
++const CONCURRENCY = 4;
++const CONCURRENT_ROUNDS = 2;
++const VERIFY_ROUNDS = 3;
++
++const { values } = parseArgs({
++  options: {
++    "memory-kb": { type: "string" },
++    "time-cost": { type: "string" },
++    parallelism: { type: "string" },
++    rounds: { type: "string" },
++  },
++  strict: true,
++});
++
++function positiveInt(raw: string | undefined, fallback: number, name: string) {
++  if (raw === undefined) return fallback;
++  const n = Number(raw);
++  if (!Number.isInteger(n) || n <= 0) {
++    console.error(`--${name} tem de ser um inteiro positivo.`);
++    process.exit(1);
++  }
++  return n;
++}
++
++const env = loadEnv();
++const opts = {
++  memoryCost: positiveInt(
++    values["memory-kb"],
++    env.ARGON2_MEMORY_KB,
++    "memory-kb",
++  ),
++  timeCost: positiveInt(values["time-cost"], env.ARGON2_TIME_COST, "time-cost"),
++  parallelism: positiveInt(
++    values.parallelism,
++    env.ARGON2_PARALLELISM,
++    "parallelism",
++  ),
++};
++const rounds = positiveInt(values.rounds, 10, "rounds");
++
++async function timed<T>(fn: () => Promise<T>): Promise<{ ms: number; out: T }> {
++  const t0 = performance.now();
++  const out = await fn();
++  return { ms: performance.now() - t0, out };
++}
++
++function stats(samples: number[]) {
++  const sorted = [...samples].sort((a, b) => a - b);
++  const at = (p: number) =>
++    sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] ?? 0;
++  return {
++    min: sorted[0] ?? 0,
++    median: at(0.5),
++    p95: at(0.95),
++    max: sorted[sorted.length - 1] ?? 0,
++  };
++}
++
++const fmt = (ms: number) => `${Math.round(ms)} ms`;
++const line = (label: string, s: ReturnType<typeof stats>) =>
++  console.log(
++    `${label}: mín ${fmt(s.min)} | mediana ${fmt(s.median)} | p95 ${fmt(s.p95)} | máx ${fmt(s.max)}`,
++  );
++
++console.log("== Benchmark do argon2id ==");
++console.log(
++  `Parâmetros: memória ${opts.memoryCost} KiB, iterações ${opts.timeCost}, paralelismo ${opts.parallelism}`,
++);
++console.log(
++  `Máquina: ${availableParallelism()} CPU(s) visíveis, ${Math.round(totalmem() / 1024 / 1024)} MiB de RAM visíveis (o limite real do plano pode ser menor)`,
++);
++if (opts.memoryCost < MIN_MEMORY_KB || opts.timeCost < MIN_TIME_COST) {
++  console.log(
++    `AVISO: abaixo dos mínimos de produção (${MIN_MEMORY_KB} KiB e ${MIN_TIME_COST} iterações): a API recusaria arrancar com estes valores.`,
++  );
++}
++
++// Aquecimento: a primeira chamada paga o carregamento do módulo nativo.
++await hash(randomUUID(), opts);
++
++const hashSamples: number[] = [];
++let sampleHash = "";
++const samplePassword = randomUUID();
++for (let i = 0; i < rounds; i++) {
++  const { ms, out } = await timed(() => hash(samplePassword, opts));
++  hashSamples.push(ms);
++  sampleHash = out;
++}
++line(`hash (sequencial, ${rounds}x)`, stats(hashSamples));
++
++const verifySamples: number[] = [];
++for (let i = 0; i < VERIFY_ROUNDS; i++) {
++  const { ms, out } = await timed(() =>
++    verify(sampleHash, samplePassword, opts),
++  );
++  if (!out) {
++    console.error("ERRO: verify devolveu false para a palavra-passe certa.");
++    process.exit(2);
++  }
++  verifySamples.push(ms);
++}
++line(`verify (sequencial, ${VERIFY_ROUNDS}x)`, stats(verifySamples));
++
++// Vários logins ao mesmo tempo: no CPU partilhado do plano gratuito os hashes enfileiram.
++const concurrentSamples: number[] = [];
++const batchWalls: number[] = [];
++for (let r = 0; r < CONCURRENT_ROUNDS; r++) {
++  const wall = await timed(async () => {
++    const each = await Promise.all(
++      Array.from({ length: CONCURRENCY }, () =>
++        timed(() => hash(randomUUID(), opts)),
++      ),
++    );
++    for (const e of each) concurrentSamples.push(e.ms);
++  });
++  batchWalls.push(wall.ms);
++}
++line(`hash (${CONCURRENCY} em simultâneo, por hash)`, stats(concurrentSamples));
++console.log(
++  `Lote de ${CONCURRENCY} em simultâneo: ${batchWalls.map(fmt).join(", ")} (tempo total de cada lote)`,
++);
++console.log(
++  `Memória do processo (RSS): ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MiB`,
++);
++
++const median = stats(hashSamples).median;
++console.log(
++  median < TARGET_MS
++    ? `RESULTADO: OK, mediana ${fmt(median)} < ${TARGET_MS} ms.`
++    : `RESULTADO: ATENÇÃO, mediana ${fmt(median)} >= ${TARGET_MS} ms. Não baixar dos mínimos de produção: considerar plano com mais CPU.`,
++);
+diff --git a/apps/api/src/maintenance.ts b/apps/api/src/maintenance.ts
+index 8d66cf9..3bcbae3 100644
+--- a/apps/api/src/maintenance.ts
++++ b/apps/api/src/maintenance.ts
+@@ -1,5 +1,6 @@
+ import type { Database } from "./db/client.js";
+ import type { Env } from "./env.js";
++import { safeErrorFields } from "./errors.js";
+ import { accountDeletionRepo } from "./repositories/account-deletion.js";
+ import { idempotencyKeysRepo, outboxRepo } from "./repositories/outbox.js";
+ import { postsRepo } from "./repositories/posts.js";
+@@ -97,11 +98,8 @@ export function startMaintenance(args: {
+       });
+       log.info({ ...summary }, "maintenance done");
+     } catch (err) {
+-      // Sem a mensagem: pode trazer dados.
+-      log.warn(
+-        { errorName: err instanceof Error ? err.name : typeof err },
+-        "maintenance failed",
+-      );
++      // Nome, código (SQLSTATE, ETIMEDOUT...) e causa; nunca a mensagem (pode trazer dados).
++      log.warn(safeErrorFields(err), "maintenance failed");
+     } finally {
+       running = false;
+     }
+diff --git a/apps/api/test/maintenance.test.ts b/apps/api/test/maintenance.test.ts
+index 45762d3..8afbec8 100644
+--- a/apps/api/test/maintenance.test.ts
++++ b/apps/api/test/maintenance.test.ts
+@@ -1,5 +1,13 @@
+ import { eq, sql } from "drizzle-orm";
+-import { afterAll, beforeEach, describe, expect, it } from "vitest";
++import {
++  afterAll,
++  afterEach,
++  beforeEach,
++  describe,
++  expect,
++  it,
++  vi,
++} from "vitest";
+ import {
+   idempotencyKeys,
+   outbox,
+@@ -7,7 +15,7 @@ import {
+   refreshTokens,
+   users,
+ } from "../src/db/schema.js";
+-import { runMaintenance } from "../src/maintenance.js";
++import { runMaintenance, startMaintenance } from "../src/maintenance.js";
+ import { accountDeletionRepo } from "../src/repositories/account-deletion.js";
+ import { idempotencyKeysRepo, outboxRepo } from "../src/repositories/outbox.js";
+ import { refreshTokensRepo } from "../src/repositories/users.js";
+@@ -161,3 +169,45 @@ describe("runMaintenance — posts apagados pelo autor", () => {
+     expect((await db.select().from(posts)).map((p) => p.id)).toEqual([live.id]);
+   });
+ });
++
++describe("startMaintenance: falha registada sem a mensagem", () => {
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it("regista nome e código do erro e não o texto", async () => {
++    vi.useFakeTimers();
++    const secret = "ep-segredo.neon.tech";
++    const failingDb = new Proxy(
++      {},
++      {
++        get() {
++          throw Object.assign(new Error(`connect ETIMEDOUT ${secret}`), {
++            code: "ETIMEDOUT",
++          });
++        },
++      },
++    ) as unknown as Awaited<ReturnType<typeof getTestDb>>;
++    const logged: Record<string, unknown>[] = [];
++
++    const stop = startMaintenance({
++      db: failingDb,
++      env: {
++        ACCOUNT_DELETION_GRACE_DAYS: 30,
++        MAINTENANCE_INTERVAL_MINUTES: 60,
++        POSTS_DELETED_RETENTION_DAYS: 30,
++      },
++      log: {
++        info: () => {},
++        warn: (obj, msg) => {
++          if (msg === "maintenance failed") logged.push(obj);
++        },
++      },
++    });
++    await vi.advanceTimersByTimeAsync(31_000);
++    stop();
++
++    expect(logged[0]).toEqual({ errorName: "Error", errorCode: "ETIMEDOUT" });
++    expect(JSON.stringify(logged[0])).not.toContain(secret);
++  });
++});
+diff --git a/apps/api/test/workers/outbox-worker.test.ts b/apps/api/test/workers/outbox-worker.test.ts
+index b09b3a7..43f6247 100644
+--- a/apps/api/test/workers/outbox-worker.test.ts
++++ b/apps/api/test/workers/outbox-worker.test.ts
+@@ -168,6 +168,38 @@ describe("outbox worker: concorrência e paragem", () => {
+     expect((await statusOf(e.id)).status).toBe("done");
+   });
+ 
++  it("ronda que falha regista nome, código e causa, nunca a mensagem", async () => {
++    const secret = "ep-segredo.neon.tech";
++    const failingDb = new Proxy(
++      {},
++      {
++        get() {
++          throw Object.assign(new Error(`connect ECONNRESET ${secret}`), {
++            code: "ECONNRESET",
++          });
++        },
++      },
++    ) as unknown as Awaited<ReturnType<typeof getTestDb>>;
++    const logged: Record<string, unknown>[] = [];
++
++    const stop = startOutboxWorker({
++      db: failingDb,
++      log: {
++        info: () => {},
++        warn: (obj, msg) => {
++          if (msg === "outbox: worker round failed") logged.push(obj);
++        },
++      },
++      intervalMs: 10,
++      batchSize: 10,
++    });
++    await waitFor(async () => logged.length > 0);
++    await stop();
++
++    expect(logged[0]).toEqual({ errorName: "Error", errorCode: "ECONNRESET" });
++    expect(JSON.stringify(logged[0])).not.toContain(secret);
++  });
++
+   it("depois de stop() o worker já não consome eventos", async () => {
+     const db = await getTestDb();
+     const stop = startOutboxWorker({
+diff --git a/docs/registos/RB-h-logging-worker-benchmark-argon2.md b/docs/registos/RB-h-logging-worker-benchmark-argon2.md
+new file mode 100644
+index 0000000..a9e1ed3
+--- /dev/null
++++ b/docs/registos/RB-h-logging-worker-benchmark-argon2.md
+@@ -0,0 +1,15 @@
++# RB-h — Logging do worker e benchmark do argon2
++
++- `outbox-worker.ts` (ronda falhada e handler falhado) e `maintenance.ts` passam a registar
++  `safeErrorFields(err)`: nome, código (SQLSTATE, `ETIMEDOUT`...) e causa; nunca a mensagem. Antes só
++  saía `errorName: "Error"`, o que escondia a causa dos `worker round failed` e `maintenance failed`
++  vistos no primeiro arranque no Render. Testes novos garantem que o código aparece e que um texto
++  sensível na mensagem não chega ao log.
++- Novo script `apps/api/scripts/benchmark-argon2.ts` (`pnpm --filter @comunidade/api benchmark:argon2`):
++  mede hash e verify sequenciais, 4 hashes em simultâneo e a memória, contra o alvo de 500 ms. Procedimento
++  no Render sem shell em [servico-render](../runbooks/servico-render.md) §2.1.
++
++**Não validado aqui**: o sandbox não instala `@node-rs/argon2`, `vitest` nem corre o `tsc` da API. A lógica do
++benchmark foi exercitada com um _stub_ do argon2 (medições não representativas) e os ficheiros foram
++formatados com `prettier`. O `pnpm typecheck` e o `pnpm test` do utilizador são a confirmação.
++**Por confirmar**: qual dos dois comandos de início temporário funciona no Render.
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index 4a1a7f9..bb675ce 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -34,3 +34,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-e  | [Postgres 17 e contacto de segurança](RB-e-postgres17.md)                                                 | Feito  |
+ | RB-f  | [CI, CodeQL e build do web](RB-f-ci-codeql-build-web.md)                                                  | Feito  |
+ | RB-g  | [Diagnóstico do seed e estado do deploy](RB-g-seed-diagnostico-estado-deploy.md)                          | Feito  |
++| RB-h  | [Logging do worker e benchmark do argon2](RB-h-logging-worker-benchmark-argon2.md)                        | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index 4723359..f353d41 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -84,7 +84,7 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ - [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3` (**confirmado no log de build**), _health check_ em `/health` e **Auto-Deploy desligado** (falta confirmar estes dois na consola).
+ - [x] Variáveis de produção introduzidas (secção 3 do runbook do Render).
+-- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (um _script_ de medição é opcional, _precisa de autorização_).
++- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (script `benchmark-argon2`, procedimento em [servico-render](servico-render.md) §2.1).
+ - [x] Primeiro deploy manual: `/health` e `/health/deep` respondem `200` (`db: ok`, `redis: ok`).
+ - [ ] Logs sem erros: no primeiro arranque houve `outbox: worker round failed` e `maintenance failed` repetidos (provável `DATABASE_URL` do _branch_ errado, já corrigida); confirmar que desapareceram nos logs seguintes. `HEAD /` e `GET /` a 404 são sondas do Render: normais.
+ 
+diff --git a/docs/runbooks/servico-render.md b/docs/runbooks/servico-render.md
+index 37ce37b..54aec7d 100644
+--- a/docs/runbooks/servico-render.md
++++ b/docs/runbooks/servico-render.md
+@@ -31,6 +31,27 @@
+    `.nvmrc` > `engines`; um `.nvmrc` com `24` não indica o _patch_ e serviços novos arrancam com 24.22.1 (anterior ao aviso de
+    segurança de 11-11-2026). Confirmar no log de build: `node -v`. Subir de versão é uma decisão explícita.
+ 
++## 2.1 Benchmark do argon2 (Etapa 5)
++
++O alvo é **menos de 500 ms por hash** no CPU do Render (o plano gratuito tem CPU partilhado e pouca
++memória; o argon2id com 19 MiB e 2 iterações pode demorar bastante mais do que num portátil). O Render
++gratuito não tem shell, por isso o script `apps/api/scripts/benchmark-argon2.ts` corre **uma vez, como
++início temporário** do serviço, e lê-se o resultado nos logs. Não toca na base de dados nem no Redis.
++
++1. Render → Settings → **Start Command** → trocar, temporariamente, por:
++   `apps/api/node_modules/.bin/tsx apps/api/scripts/benchmark-argon2.ts; node apps/api/dist/index.js`
++   (se o `tsx` não existir em execução, alternativa: `pnpm --filter @comunidade/api benchmark:argon2; node apps/api/dist/index.js`;
++   **por confirmar** qual funciona no Render).
++2. **Manual Deploy** e abrir os logs: aparece `== Benchmark do argon2id ==` e, no fim, `RESULTADO: OK` ou
++   `RESULTADO: ATENÇÃO`. O serviço arranca depois do benchmark (pode demorar cerca de um minuto).
++3. **Repor** o Start Command para `node apps/api/dist/index.js` e fazer novo **Manual Deploy**.
++4. Anotar os números (mediana, p95, 4 em simultâneo) no registo da etapa.
++
++Se a mediana for >= 500 ms: **não** baixar `ARGON2_MEMORY_KB` (19456) nem `ARGON2_TIME_COST` (2), são os
++mínimos de produção e a API recusa arrancar abaixo. As opções são aceitar (e registar), ou um plano com mais
++CPU. Para comparar variantes sem mexer no ambiente, o script aceita `--memory-kb`, `--time-cost`,
++`--parallelism` e `--rounds`. Localmente: `pnpm --filter @comunidade/api benchmark:argon2`.
++
+ ## 3. Variáveis de ambiente de produção
+ 
+ Introduzir em Render → Environment; guardar uma cópia **no cofre**. A API recusa arrancar se faltar uma obrigatória.
