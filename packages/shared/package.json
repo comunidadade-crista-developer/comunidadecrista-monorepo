@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@comunidade/config": "workspace:*",
-    "eslint": "^9.16.0",
+    "eslint": "^10.15.0",
     "typescript": "^5.7.0"
   }
 }
