@@ -1,5 +1,13 @@
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   idempotencyKeys,
   outbox,
@@ -7,7 +15,7 @@ import {
   refreshTokens,
   users,
 } from "../src/db/schema.js";
-import { runMaintenance } from "../src/maintenance.js";
+import { runMaintenance, startMaintenance } from "../src/maintenance.js";
 import { accountDeletionRepo } from "../src/repositories/account-deletion.js";
 import { idempotencyKeysRepo, outboxRepo } from "../src/repositories/outbox.js";
 import { refreshTokensRepo } from "../src/repositories/users.js";
@@ -159,5 +167,47 @@ describe("runMaintenance — posts apagados pelo autor", () => {
     });
     expect(second.softDeletedPosts).toBe(1);
     expect((await db.select().from(posts)).map((p) => p.id)).toEqual([live.id]);
+  });
+});
+
+describe("startMaintenance: falha registada sem a mensagem", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("regista nome e código do erro e não o texto", async () => {
+    vi.useFakeTimers();
+    const secret = "ep-segredo.neon.tech";
+    const failingDb = new Proxy(
+      {},
+      {
+        get() {
+          throw Object.assign(new Error(`connect ETIMEDOUT ${secret}`), {
+            code: "ETIMEDOUT",
+          });
+        },
+      },
+    ) as unknown as Awaited<ReturnType<typeof getTestDb>>;
+    const logged: Record<string, unknown>[] = [];
+
+    const stop = startMaintenance({
+      db: failingDb,
+      env: {
+        ACCOUNT_DELETION_GRACE_DAYS: 30,
+        MAINTENANCE_INTERVAL_MINUTES: 60,
+        POSTS_DELETED_RETENTION_DAYS: 30,
+      },
+      log: {
+        info: () => {},
+        warn: (obj, msg) => {
+          if (msg === "maintenance failed") logged.push(obj);
+        },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(31_000);
+    stop();
+
+    expect(logged[0]).toEqual({ errorName: "Error", errorCode: "ETIMEDOUT" });
+    expect(JSON.stringify(logged[0])).not.toContain(secret);
   });
 });

@@ -31,6 +31,27 @@
    `.nvmrc` > `engines`; um `.nvmrc` com `24` não indica o _patch_ e serviços novos arrancam com 24.22.1 (anterior ao aviso de
    segurança de 11-11-2026). Confirmar no log de build: `node -v`. Subir de versão é uma decisão explícita.
 
+## 2.1 Benchmark do argon2 (Etapa 5)
+
+O alvo é **menos de 500 ms por hash** no CPU do Render (o plano gratuito tem CPU partilhado e pouca
+memória; o argon2id com 19 MiB e 2 iterações pode demorar bastante mais do que num portátil). O Render
+gratuito não tem shell, por isso o script `apps/api/scripts/benchmark-argon2.ts` corre **uma vez, como
+início temporário** do serviço, e lê-se o resultado nos logs. Não toca na base de dados nem no Redis.
+
+1. Render → Settings → **Start Command** → trocar, temporariamente, por:
+   `apps/api/node_modules/.bin/tsx apps/api/scripts/benchmark-argon2.ts; node apps/api/dist/index.js`
+   (se o `tsx` não existir em execução, alternativa: `pnpm --filter @comunidade/api benchmark:argon2; node apps/api/dist/index.js`;
+   **por confirmar** qual funciona no Render).
+2. **Manual Deploy** e abrir os logs: aparece `== Benchmark do argon2id ==` e, no fim, `RESULTADO: OK` ou
+   `RESULTADO: ATENÇÃO`. O serviço arranca depois do benchmark (pode demorar cerca de um minuto).
+3. **Repor** o Start Command para `node apps/api/dist/index.js` e fazer novo **Manual Deploy**.
+4. Anotar os números (mediana, p95, 4 em simultâneo) no registo da etapa.
+
+Se a mediana for >= 500 ms: **não** baixar `ARGON2_MEMORY_KB` (19456) nem `ARGON2_TIME_COST` (2), são os
+mínimos de produção e a API recusa arrancar abaixo. As opções são aceitar (e registar), ou um plano com mais
+CPU. Para comparar variantes sem mexer no ambiente, o script aceita `--memory-kb`, `--time-cost`,
+`--parallelism` e `--rounds`. Localmente: `pnpm --filter @comunidade/api benchmark:argon2`.
+
 ## 3. Variáveis de ambiente de produção
 
 Introduzir em Render → Environment; guardar uma cópia **no cofre**. A API recusa arrancar se faltar uma obrigatória.

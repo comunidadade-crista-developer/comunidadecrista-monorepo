@@ -1,5 +1,6 @@
 import type { Database } from "../db/client.js";
 import type { OutboxEvent } from "../db/schema.js";
+import { safeErrorFields } from "../errors.js";
 import { outboxRepo } from "../repositories/outbox.js";
 
 export type OutboxHandler = (event: OutboxEvent) => Promise<void>;
@@ -51,15 +52,15 @@ export async function processOutboxBatch(
       result.done += 1;
     } catch (err) {
       result.failed += 1;
-      // Só tipo e nome do erro: a mensagem pode trazer dados do utilizador.
-      opts.log?.warn(
-        {
-          eventType: event.eventType,
-          attempts: event.attempts,
-          errorName: err instanceof Error ? err.name : typeof err,
-        },
-        "outbox: handler failed",
-      );
+       // Só tipo, nome e código do erro: a mensagem pode trazer dados do utilizador.
+       opts.log?.warn(
+         {
+           eventType: event.eventType,
+           attempts: event.attempts,
+          ...safeErrorFields(err),
+         },
+         "outbox: handler failed",
+       );
       await repo.markFailed(
         event.id,
         event.attempts,
@@ -101,13 +102,11 @@ export function startOutboxWorker(args: {
       // Ronda cheia: provavelmente há mais; continua sem esperar o intervalo.
       more = r.claimed >= batchSize;
     } catch (err) {
-      log.warn(
-        { errorName: err instanceof Error ? err.name : typeof err },
-        "outbox: worker round failed",
-      );
-    }
-    schedule(more ? 0 : intervalMs);
-  };
+      // Nome, código (SQLSTATE, ETIMEDOUT...) e causa; nunca a mensagem (host, dados).
+      log.warn(safeErrorFields(err), "outbox: worker round failed");
+     }
+     schedule(more ? 0 : intervalMs);
+   };
 
   schedule(intervalMs);
 

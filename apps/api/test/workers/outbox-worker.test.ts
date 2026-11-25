@@ -168,6 +168,38 @@ describe("outbox worker: concorrência e paragem", () => {
     expect((await statusOf(e.id)).status).toBe("done");
   });
 
+  it("ronda que falha regista nome, código e causa, nunca a mensagem", async () => {
+    const secret = "ep-segredo.neon.tech";
+    const failingDb = new Proxy(
+      {},
+      {
+        get() {
+          throw Object.assign(new Error(`connect ECONNRESET ${secret}`), {
+            code: "ECONNRESET",
+          });
+        },
+      },
+    ) as unknown as Awaited<ReturnType<typeof getTestDb>>;
+    const logged: Record<string, unknown>[] = [];
+
+    const stop = startOutboxWorker({
+      db: failingDb,
+      log: {
+        info: () => {},
+        warn: (obj, msg) => {
+          if (msg === "outbox: worker round failed") logged.push(obj);
+        },
+      },
+      intervalMs: 10,
+      batchSize: 10,
+    });
+    await waitFor(async () => logged.length > 0);
+    await stop();
+
+    expect(logged[0]).toEqual({ errorName: "Error", errorCode: "ECONNRESET" });
+    expect(JSON.stringify(logged[0])).not.toContain(secret);
+  });
+
   it("depois de stop() o worker já não consome eventos", async () => {
     const db = await getTestDb();
     const stop = startOutboxWorker({

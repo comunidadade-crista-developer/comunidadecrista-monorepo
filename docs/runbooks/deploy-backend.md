@@ -84,7 +84,7 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 - [ ] Serviço criado em Frankfurt, com `NODE_VERSION=24.22.3` (**confirmado no log de build**), _health check_ em `/health` e **Auto-Deploy desligado** (falta confirmar estes dois na consola).
 - [x] Variáveis de produção introduzidas (secção 3 do runbook do Render).
-- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (um _script_ de medição é opcional, _precisa de autorização_).
+- [ ] **Benchmark do argon2** no CPU do Render: alvo < 500 ms por hash; ajustar `ARGON2_*` sem ir abaixo dos mínimos de produção (script `benchmark-argon2`, procedimento em [servico-render](servico-render.md) §2.1).
 - [x] Primeiro deploy manual: `/health` e `/health/deep` respondem `200` (`db: ok`, `redis: ok`).
 - [ ] Logs sem erros: no primeiro arranque houve `outbox: worker round failed` e `maintenance failed` repetidos (provável `DATABASE_URL` do _branch_ errado, já corrigida); confirmar que desapareceram nos logs seguintes. `HEAD /` e `GET /` a 404 são sondas do Render: normais.
 
