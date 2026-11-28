@@ -1,0 +1,59 @@
+diff --git a/docs/registos/RB-k-smoke-script.md b/docs/registos/RB-k-smoke-script.md
+new file mode 100644
+index 0000000..ac975e7
+--- /dev/null
++++ b/docs/registos/RB-k-smoke-script.md
+@@ -0,0 +1,16 @@
++# RB-k — Etapa 7: _script_ de smoke repetível
++
++- **O que é.** `apps/api/scripts/smoke.ts` (`pnpm --filter @comunidade/api smoke --base-url=<URL>`): percorre
++  os fluxos públicos da API em execução só por HTTP (`fetch` do Node 24, sem dependências novas) e valida cada
++  resposta contra os esquemas de `@comunidade/shared`. Cobre registo, login, `/auth/me`, refresh (rotação,
++  tolerância, reutilização), logout, recuperação por código e por perguntas, cards (ETag/304), feed, criar
++  partilha com `Idempotency-Key`, gostar, denunciar, `/sync`, `/sync/bootstrap` e limpeza.
++- **Segurança.** Só `https` (ou `localhost`), sem seguir redireccionamentos, sem credenciais no URL. Segredos
++  aleatórios só em memória; a saída tem apenas `OK`/`FALHA`/`SALTADO`, código HTTP e o código de erro da API.
++- **Contas descartáveis.** Duas por execução (`smoke-<sufixo>-a`/`-b`); no fim apagam-se as partilhas e pede-se
++  o apagamento das contas (`pending_deletion` até ao fim da graça). Limite de registo: 2 execuções por hora e IP.
++  Cada execução gera 2 avisos `token_reuse` esperados nos logs.
++- **Fora do script.** `admin:promote`, aprovar/rejeitar e medir comandos Redis (Etapa 7 do deploy-backend).
++- **Também.** Comentário do CodeQL em `routes/posts.ts` passado para cima do `if` a que se refere.
++- **Validação.** `tsc` estrito e execução completa contra um servidor simulado (51 passos). **Por correr em
++  produção**: o resultado real fecha o item da Etapa 7.
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index f5fc998..f8e91c8 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -37,3 +37,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-h  | [Logging do worker e benchmark do argon2](RB-h-logging-worker-benchmark-argon2.md)                        | Feito  |
+ | RB-i  | [Etapa 5 fechada: Render, benchmark e branch da Neon](RB-i-etapa5-render.md)                              | Feito  |
+ | RB-j  | [Etapa 6: IP real atrás do Render](RB-j-etapa6-ip-real.md)                                                | Feito  |
++| RB-k  | [Etapa 7: _script_ de smoke repetível](RB-k-smoke-script.md)                                              | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index e7790bd..2a17c5f 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -104,12 +104,20 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ ### Etapa 7 — Smoke test funcional
+ 
+-- [ ] Registo, login, `GET /auth/me`, refresh, logout, recuperação (código e perguntas).
+-- [ ] Feed, criar partilha, gostar, denunciar, `/sync`.
++- [ ] _Script_ de smoke repetível (`pnpm --filter @comunidade/api smoke --base-url=https://<serviço>.onrender.com`, ver abaixo): registo, login, `GET /auth/me`, refresh (rotação, tolerância e reutilização), logout, recuperação (código e perguntas), cards (ETag/304), feed, criar partilha (idempotência), gostar, denunciar, `/sync` e `/sync/bootstrap`, limpeza.
+ - [ ] Primeiro admin: **registar primeiro o utilizador pela API de produção**; depois `admin:promote <username>` a partir da máquina do operador com o `DATABASE_URL` de produção (directa, `comunidade_app`; testar a ligação antes, ver `ETIMEDOUT` de 2026-11-24); aprovar e rejeitar uma partilha.
+ - [ ] Limites: provocar um `429` num fluxo seguro.
+ - [ ] Medir comandos Redis por fluxo na consola da Upstash (R3).
+-- [ ] Opcional: _script_ de smoke repetível (_precisa de autorização_).
++
++**Como correr o _script_** (`apps/api/scripts/smoke.ts`, a partir da máquina do operador; não precisa de variáveis do projecto):
++
++- Cria **duas contas descartáveis** (`smoke-<sufixo>-a` e `-b`) na base de produção, percorre os fluxos e, no fim, apaga as partilhas e pede o apagamento das contas (ficam `pending_deletion` até ao fim do período de graça; o _job_ de manutenção purga-as).
++- Só imprime `OK`/`FALHA`/`SALTADO`, o código HTTP e o código de erro da API; nunca palavras-passe, tokens, códigos de recuperação nem corpos de resposta. Os segredos são gerados ao acaso e vivem só em memória.
++- O primeiro passo espera que a API acorde (plano gratuito: até ~1 min; `--wake-timeout-s`). O passo da reutilização do refresh espera a janela de tolerância (`--reuse-grace-s`, 10 s por omissão) e demora cerca de 12 s.
++- `--rate-limit` acrescenta o passo do `429` (esgota o limite de `/gospel-cards`, 30 pedidos por 60 s e por IP, até ao `429` com `Retry-After`); cumpre o item «Limites» sem tocar em fluxos de conta.
++- **Cabem 2 execuções por hora** (registo: 5 por hora e por IP; cada execução usa 2). Cada execução deixa **2 avisos `token_reuse`** nos logs (reutilização propositada e _refresh_ depois do _logout_): não contam para a revisão da Etapa 9 se coincidirem com a hora do smoke.
++- Sai com código `0` só se todos os passos forem `OK`; `FALHA` ou `SALTADO` dão `1`.
++- Fora do _script_ (manual): `admin:promote`, aprovar e rejeitar uma partilha, e medir os comandos Redis na consola da Upstash (anotar o consumo antes e depois de uma execução).
+ 
+ **Saída**: todos os fluxos verdes em produção e o consumo por fluxo anotado.
+ 

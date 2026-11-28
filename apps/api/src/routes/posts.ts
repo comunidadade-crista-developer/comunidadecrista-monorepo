@@ -103,9 +103,6 @@ export async function postsRoutes(
         if (filter === "liked") {
           if (!viewerId) return sendError(reply, 401, "missing_token");
           const result = await posts.list({
-            // CodeQL js/user-controlled-bypass: falso positivo. `filter`/`cursor` só decidem se esta é a
-            // primeira página do feed; a consulta é sempre limitada ao `viewerId` do token, por isso
-            // ninguém vê posts em revisão de outro autor, qualquer que seja o valor enviado.
             filter: "liked",
             viewerId,
             limit,
@@ -129,6 +126,9 @@ export async function postsRoutes(
 
         let items = await decorateForViewer(page, viewerId, db);
 
+        // CodeQL js/user-controlled-bypass: falso positivo. `filter`/`cursor` só decidem se esta é a
+        // primeira página do feed; a consulta é sempre limitada ao `viewerId` do token, por isso
+        // ninguém vê posts em revisão de outro autor, qualquer que seja o valor enviado.
         if (viewerId && filter === "recent" && cursor === undefined) {
           const pending = await posts.findLatestByAuthorInFilter(viewerId, {
             statuses: ["pending_review"],

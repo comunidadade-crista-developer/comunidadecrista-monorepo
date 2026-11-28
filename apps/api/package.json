@@ -19,6 +19,7 @@
     "db:studio": "drizzle-kit studio",
     "generate-jwt-keys": "tsx scripts/generate-jwt-keys.ts",
     "benchmark:argon2": "tsx scripts/benchmark-argon2.ts",
+    "smoke": "tsx scripts/smoke.ts",
     "admin:promote": "tsx scripts/admin-promote.ts",
     "admin:demote": "tsx scripts/admin-demote.ts"
   },

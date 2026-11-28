@@ -1,0 +1,1153 @@
+import { randomBytes, randomInt, randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
+import { parseArgs } from "node:util";
+import {
+  CreatePostResponse,
+  DeepHealthResponse,
+  DeleteAccountResponse,
+  GospelCardListResponse,
+  GospelCardResponse,
+  HealthResponse,
+  LikeResponse,
+  ListPostsResponse,
+  LoginResponse,
+  MeResponse,
+  NewPassword,
+  RecoverResetResponse,
+  RecoverVerifyResponse,
+  RefreshResponse,
+  RegisterResponse,
+  ReportResponse,
+  SyncBootstrapResponse,
+  SyncResponse,
+  containsUsername,
+} from "@comunidade/shared";
+
+/**
+ * Smoke test funcional repetível contra uma API já em execução (Etapa 7 do deploy). Corre na
+ * máquina do operador, só fala HTTP com a API (não toca na base de dados nem no Redis) e não
+ * precisa de variáveis de ambiente do projecto:
+ *
+ *   pnpm --filter @comunidade/api smoke --base-url=https://<serviço>.onrender.com
+ *
+ * Cada execução cria DUAS contas descartáveis (`smoke-<sufixo>-a` e `-b`), percorre os fluxos
+ * públicos e, no fim, apaga as partilhas e pede o apagamento das duas contas (ficam em
+ * `pending_deletion` até ao fim do período de graça e o job de manutenção purga-as).
+ *
+ * Segurança: palavras-passe, respostas e códigos de recuperação são gerados ao acaso, vivem só em
+ * memória e nunca são impressos nem escritos em disco; os tokens também não. Cada passo imprime
+ * apenas OK/FALHA/SALTADO, o código HTTP e, se existir, o código de erro da API (`error`, uma
+ * palavra em minúsculas). Não se imprime nenhum corpo de resposta nem mensagem de excepção.
+ *
+ * Limites a ter em conta: o registo permite 5 por hora e por IP, por isso cabem 2 execuções por
+ * hora (4 contas); e cada execução provoca 2 avisos `token_reuse` nos logs da API (a reutilização
+ * propositada de um refresh token e o refresh depois do logout).
+ */
+
+const HELP = `Uso: pnpm --filter @comunidade/api smoke --base-url=<URL> [opções]
+
+  --base-url=<URL>        URL base da API (ou variável SMOKE_BASE_URL). Só https, excepto localhost.
+  --reuse-grace-s=<n>     Janela de tolerância do refresh (REFRESH_REUSE_GRACE_S da API). Por omissão 10.
+  --wake-timeout-s=<n>    Tempo máximo à espera de a API acordar. Por omissão 120.
+  --rate-limit            Passo extra: esgota o limite de /gospel-cards por IP até ao 429.
+  --rate-limit-max=<n>    Limite configurado na API (RATE_LIMIT_CARDS_MAX). Por omissão 120 (por 60 s).
+  --help                  Mostra esta ajuda.
+`;
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const SAFE_ERROR_CODE = /^[a-z][a-z_]{0,39}$/;
+
+// ---------------------------------------------------------------------------------------------
+// Argumentos
+// ---------------------------------------------------------------------------------------------
+
+function fail(message: string): never {
+  console.error(message);
+  process.exit(2);
+}
+
+function positiveInt(raw: string | undefined, fallback: number, name: string) {
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 600) {
+    fail(`--${name} tem de ser um inteiro entre 0 e 600.`);
+  }
+  return n;
+}
+
+function parseBaseUrl(raw: string | undefined): string {
+  if (!raw) {
+    fail("Falta o URL da API: --base-url=<URL> ou SMOKE_BASE_URL.\n" + HELP);
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return fail("URL inválido em --base-url.");
+  }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) {
+    fail("Só se aceita https (http apenas para localhost).");
+  }
+  if (url.username !== "" || url.password !== "") {
+    fail("O URL não pode ter credenciais.");
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    fail("Usa só a origem da API (sem caminho, query ou fragmento).");
+  }
+  return url.origin;
+}
+
+const { values } = parseArgs({
+  options: {
+    "base-url": { type: "string" },
+    "reuse-grace-s": { type: "string" },
+    "wake-timeout-s": { type: "string" },
+    "rate-limit": { type: "boolean", default: false },
+    "rate-limit-max": { type: "string" },
+    help: { type: "boolean", default: false },
+  },
+  strict: true,
+});
+
+if (values.help) {
+  console.log(HELP);
+  process.exit(0);
+}
+
+const BASE = parseBaseUrl(values["base-url"] ?? process.env["SMOKE_BASE_URL"]);
+const REUSE_GRACE_S = positiveInt(values["reuse-grace-s"], 10, "reuse-grace-s");
+const WAKE_TIMEOUT_S = positiveInt(
+  values["wake-timeout-s"],
+  120,
+  "wake-timeout-s",
+);
+const WITH_RATE_LIMIT = values["rate-limit"] === true;
+const RATE_LIMIT_MAX = positiveInt(
+  values["rate-limit-max"],
+  120,
+  "rate-limit-max",
+);
+
+// ---------------------------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------------------------
+
+interface Reply {
+  status: number;
+  headers: Headers;
+  body: unknown;
+}
+
+interface CallOptions {
+  token?: string | undefined;
+  json?: unknown;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+let stepStatuses: number[] = [];
+
+async function call(
+  method: string,
+  path: string,
+  options: CallOptions = {},
+): Promise<Reply> {
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    "user-agent": "comunidade-smoke/1",
+    ...options.headers,
+  };
+  if (options.token) headers["authorization"] = `Bearer ${options.token}`;
+  let body: string | undefined;
+  if (options.json !== undefined) {
+    headers["content-type"] = "application/json";
+    body = JSON.stringify(options.json);
+  }
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers,
+    ...(body !== undefined ? { body } : {}),
+    // Nunca seguir redireccionamentos: o Authorization não deve ir para outro destino.
+    redirect: "error",
+    signal: AbortSignal.timeout(options.timeoutMs ?? REQUEST_TIMEOUT_MS),
+  });
+  let parsed: unknown;
+  const text = await res.text();
+  if (text.length > 0) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+  }
+  stepStatuses.push(res.status);
+  return { status: res.status, headers: res.headers, body: parsed };
+}
+
+/** Código de erro da API, só se tiver o formato esperado (nunca texto livre). */
+function apiError(reply: Reply): string | undefined {
+  const body = reply.body;
+  if (typeof body !== "object" || body === null) return undefined;
+  const code = (body as Record<string, unknown>)["error"];
+  return typeof code === "string" && SAFE_ERROR_CODE.test(code)
+    ? code
+    : undefined;
+}
+
+class SmokeError extends Error {}
+
+function expectStatus(reply: Reply, expected: number): void {
+  if (reply.status === expected) return;
+  const code = apiError(reply);
+  throw new SmokeError(
+    `esperado HTTP ${expected}, recebido ${reply.status}${code ? ` (error=${code})` : ""}`,
+  );
+}
+
+function expectError(reply: Reply, status: number, code: string): void {
+  expectStatus(reply, status);
+  const got = apiError(reply);
+  if (got !== code) {
+    throw new SmokeError(`esperado error=${code}, recebido ${got ?? "nenhum"}`);
+  }
+}
+
+interface Parser<T> {
+  safeParse(value: unknown):
+    | { success: true; data: T }
+    | {
+        success: false;
+        error: { issues: ReadonlyArray<{ path: ReadonlyArray<PropertyKey> }> };
+      };
+}
+
+/** Valida a resposta contra o esquema partilhado; em caso de erro só diz QUE campos falharam. */
+function parse<T>(schema: Parser<T>, reply: Reply): T {
+  const result = schema.safeParse(reply.body);
+  if (result.success) return result.data;
+  const fields = result.error.issues
+    .slice(0, 5)
+    .map((i) => i.path.map(String).join(".") || "(raiz)")
+    .join(", ");
+  throw new SmokeError(`resposta fora do contrato (campos: ${fields})`);
+}
+
+function check(condition: boolean, message: string): void {
+  if (!condition) throw new SmokeError(message);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Passos
+// ---------------------------------------------------------------------------------------------
+
+const tally = { ok: 0, fail: 0, skipped: 0 };
+let stepNumber = 0;
+
+function failureReason(err: unknown): string {
+  if (err instanceof SmokeError) return err.message;
+  const name = err instanceof Error ? err.name : typeof err;
+  const cause =
+    err instanceof Error && typeof err.cause === "object" && err.cause !== null
+      ? (err.cause as { code?: unknown }).code
+      : undefined;
+  return `erro de rede/execução (${name}${typeof cause === "string" ? `, ${cause}` : ""})`;
+}
+
+function httpLabel(): string {
+  if (stepStatuses.length === 0) return "";
+  if (stepStatuses.length > 6) {
+    const last = stepStatuses[stepStatuses.length - 1];
+    return ` [${stepStatuses.length} pedidos, último HTTP ${last}]`;
+  }
+  return ` [HTTP ${stepStatuses.join(",")}]`;
+}
+
+async function step(
+  name: string,
+  fn: () => Promise<string | void>,
+): Promise<boolean> {
+  stepNumber += 1;
+  const label = `${String(stepNumber).padStart(2, "0")}. ${name}`;
+  stepStatuses = [];
+  try {
+    const note = await fn();
+    tally.ok += 1;
+    console.log(`OK      ${label}${httpLabel()}${note ? ` — ${note}` : ""}`);
+    return true;
+  } catch (err) {
+    tally.fail += 1;
+    console.log(`FALHA   ${label}${httpLabel()} — ${failureReason(err)}`);
+    return false;
+  }
+}
+
+function skipped(name: string, reason: string): void {
+  stepNumber += 1;
+  tally.skipped += 1;
+  console.log(
+    `SALTADO ${String(stepNumber).padStart(2, "0")}. ${name} — ${reason}`,
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Contas descartáveis (só em memória)
+// ---------------------------------------------------------------------------------------------
+
+interface Account {
+  username: string;
+  password: string;
+  answers: { q1: string; q2: string; q3: string };
+  recoveryCode: string | undefined;
+  accessToken: string | undefined;
+  refreshToken: string | undefined;
+  registered: boolean;
+  deletionRequested: boolean;
+}
+
+const suffix = randomBytes(4).toString("hex");
+
+function freshPassword(username: string): string {
+  for (;;) {
+    const candidate = randomBytes(18).toString("base64url");
+    if (
+      NewPassword.safeParse(candidate).success &&
+      !containsUsername(candidate, username)
+    ) {
+      return candidate;
+    }
+  }
+}
+
+function newAccount(tag: "a" | "b"): Account {
+  const username = `smoke-${suffix}-${tag}`;
+  return {
+    username,
+    password: freshPassword(username),
+    answers: {
+      q1: randomBytes(6).toString("hex"),
+      q2: String(randomInt(0, 1000)),
+      q3: randomBytes(6).toString("hex"),
+    },
+    recoveryCode: undefined,
+    accessToken: undefined,
+    refreshToken: undefined,
+    registered: false,
+    deletionRequested: false,
+  };
+}
+
+const A = newAccount("a");
+const B = newAccount("b");
+
+async function register(account: Account): Promise<void> {
+  const reply = await call("POST", "/auth/register", {
+    json: {
+      username: account.username,
+      password: account.password,
+      passwordConfirmation: account.password,
+      securityQ1: account.answers.q1,
+      securityQ2: account.answers.q2,
+      securityQ3: account.answers.q3,
+    },
+  });
+  expectStatus(reply, 201);
+  const data = parse(RegisterResponse, reply);
+  check(
+    data.user.username === account.username,
+    "username devolvido diferente",
+  );
+  check(data.user.role === "user", "papel inicial deveria ser user");
+  account.registered = true;
+  account.accessToken = data.accessToken;
+  account.refreshToken = data.refreshToken;
+  account.recoveryCode = data.recoveryCode;
+}
+
+async function login(account: Account): Promise<LoginResponse> {
+  const reply = await call("POST", "/auth/login", {
+    json: { username: account.username, password: account.password },
+  });
+  expectStatus(reply, 200);
+  const data = parse(LoginResponse, reply);
+  account.accessToken = data.accessToken;
+  account.refreshToken = data.refreshToken;
+  return data;
+}
+
+function bearer(account: Account): string {
+  if (!account.accessToken) {
+    throw new SmokeError("sem sessão (passo anterior falhou)");
+  }
+  return account.accessToken;
+}
+
+const SMOKE_PREFIX = "Verificação automática";
+
+function postBody(title: string, gospelCardSlug: string | undefined) {
+  return {
+    category: "entendimento",
+    title: `${SMOKE_PREFIX} ${title}`,
+    content:
+      "Esta partilha foi criada por um teste automático do serviço e é apagada no fim da verificação. Não requer resposta.",
+    ...(gospelCardSlug ? { gospelCardSlug } : {}),
+  };
+}
+
+function idempotencyKey(): string {
+  return `smoke-${randomUUID()}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Execução
+// ---------------------------------------------------------------------------------------------
+
+async function waitForApi(): Promise<void> {
+  const deadline = Date.now() + WAKE_TIMEOUT_S * 1000;
+  let announced = false;
+  for (;;) {
+    try {
+      const reply = await call("GET", "/health", { timeoutMs: 20_000 });
+      if (reply.status === 200) {
+        parse(HealthResponse, reply);
+        stepStatuses = [200];
+        return;
+      }
+    } catch (err) {
+      if (err instanceof SmokeError) throw err;
+      // A API pode estar a acordar (plano gratuito): tenta de novo até ao prazo.
+    }
+    if (!announced) {
+      console.log(
+        "        a aguardar que a API acorde (plano gratuito: até ~1 min)…",
+      );
+      announced = true;
+    }
+    if (Date.now() >= deadline) {
+      throw new SmokeError(`a API não respondeu 200 em ${WAKE_TIMEOUT_S} s`);
+    }
+    await sleep(3000);
+  }
+}
+
+async function main(): Promise<void> {
+  console.log(`Smoke test contra ${new URL(BASE).host}`);
+  console.log(`Contas descartáveis: ${A.username} e ${B.username}\n`);
+
+  const alive = await step("API acordada (GET /health)", waitForApi);
+  if (!alive) return;
+
+  await step("GET /health/deep: base de dados e Redis ok", async () => {
+    const reply = await call("GET", "/health/deep");
+    expectStatus(reply, 200);
+    const data = parse(DeepHealthResponse, reply);
+    check(
+      data.checks.db === "ok" && data.checks.redis === "ok",
+      `db=${data.checks.db}, redis=${data.checks.redis}`,
+    );
+  });
+
+  // --- Registo e sessão ------------------------------------------------------------------
+  await step("registo recusa palavra-passe comum (validação)", async () => {
+    const reply = await call("POST", "/auth/register", {
+      json: {
+        username: `${A.username}-x`,
+        password: "password123",
+        passwordConfirmation: "password123",
+        securityQ1: "x",
+        securityQ2: "1",
+        securityQ3: "x",
+      },
+    });
+    expectStatus(reply, 400);
+  });
+  const registeredA = await step("registo da conta A", () => register(A));
+  const registeredB = await step("registo da conta B", () => register(B));
+
+  if (registeredA) {
+    await step("GET /auth/me sem sessão é recusado", async () => {
+      expectStatus(await call("GET", "/auth/me"), 401);
+    });
+    await step("GET /auth/me com sessão", async () => {
+      const reply = await call("GET", "/auth/me", { token: bearer(A) });
+      expectStatus(reply, 200);
+      const data = parse(MeResponse, reply);
+      check(data.user.username === A.username, "username diferente");
+    });
+    await step("login com palavra-passe errada é recusado", async () => {
+      const reply = await call("POST", "/auth/login", {
+        json: { username: A.username, password: `${A.password}-errada` },
+      });
+      expectError(reply, 401, "invalid_credentials");
+    });
+    await step("login correcto", async () => {
+      await login(A);
+    });
+
+    // --- Refresh: rotação, tolerância e reutilização -------------------------------------
+    let oldRefresh: string | undefined;
+    let newestRefresh: string | undefined;
+    const rotated = await step("refresh roda o token", async () => {
+      oldRefresh = A.refreshToken;
+      const reply = await call("POST", "/auth/refresh", {
+        json: { refreshToken: oldRefresh },
+      });
+      expectStatus(reply, 200);
+      const data = parse(RefreshResponse, reply);
+      check(data.refreshToken !== oldRefresh, "o refresh token não rodou");
+      A.accessToken = data.accessToken;
+      A.refreshToken = data.refreshToken;
+      newestRefresh = data.refreshToken;
+    });
+    if (rotated) {
+      await step(
+        "refresh reenviado dentro da tolerância é aceite",
+        async () => {
+          const reply = await call("POST", "/auth/refresh", {
+            json: { refreshToken: oldRefresh },
+          });
+          expectStatus(reply, 200);
+          const data = parse(RefreshResponse, reply);
+          A.accessToken = data.accessToken;
+          A.refreshToken = data.refreshToken;
+        },
+      );
+      await step(
+        `refresh antigo depois de ${REUSE_GRACE_S} s é reutilização (família revogada)`,
+        async () => {
+          await sleep((REUSE_GRACE_S + 2) * 1000);
+          const reply = await call("POST", "/auth/refresh", {
+            json: { refreshToken: oldRefresh },
+          });
+          expectError(reply, 401, "token_reuse");
+        },
+      );
+      await step("a família revogada já não renova", async () => {
+        const reply = await call("POST", "/auth/refresh", {
+          json: { refreshToken: newestRefresh },
+        });
+        expectStatus(reply, 401);
+      });
+    } else {
+      skipped(
+        "testes de tolerância e reutilização do refresh",
+        "refresh falhou",
+      );
+    }
+
+    // --- Logout --------------------------------------------------------------------------
+    const loggedIn = await step(
+      "novo login para o teste de logout",
+      async () => {
+        await login(A);
+      },
+    );
+    if (loggedIn) {
+      const sessionToken = A.refreshToken;
+      await step("logout termina a sessão", async () => {
+        const reply = await call("POST", "/auth/logout", {
+          json: { refreshToken: sessionToken },
+        });
+        expectStatus(reply, 200);
+      });
+      await step("refresh depois do logout é recusado", async () => {
+        const reply = await call("POST", "/auth/refresh", {
+          json: { refreshToken: sessionToken },
+        });
+        expectStatus(reply, 401);
+      });
+    } else {
+      skipped("logout", "login falhou");
+    }
+
+    // --- Recuperação por código ----------------------------------------------------------
+    await step("recuperação: código errado é recusado", async () => {
+      const reply = await call("POST", "/auth/recover/verify", {
+        json: { mode: "code", username: A.username, code: "ZZZZ-ZZZZ-ZZZZ" },
+      });
+      expectError(reply, 401, "invalid_recovery");
+    });
+    const codeOk = await step(
+      "recuperação por código: palavra-passe nova",
+      async () => {
+        const verify = await call("POST", "/auth/recover/verify", {
+          json: { mode: "code", username: A.username, code: A.recoveryCode },
+        });
+        expectStatus(verify, 200);
+        const session = parse(RecoverVerifyResponse, verify);
+        const newPassword = freshPassword(A.username);
+        const reset = await call("POST", "/auth/recover/reset", {
+          json: {
+            recoverySession: session.recoverySession,
+            newPassword,
+            newPasswordConfirmation: newPassword,
+          },
+        });
+        expectStatus(reset, 200);
+        const data = parse(RecoverResetResponse, reset);
+        check(data.status === "completed", "esperado status=completed");
+        check(
+          data.recoveryCode !== undefined,
+          "faltou o novo código de recuperação",
+        );
+        const oldPassword = A.password;
+        A.password = newPassword;
+        A.recoveryCode = data.recoveryCode;
+        // A palavra-passe antiga deixa de servir.
+        const stale = await call("POST", "/auth/login", {
+          json: { username: A.username, password: oldPassword },
+        });
+        expectStatus(stale, 401);
+      },
+    );
+    if (codeOk) {
+      await step("login com a palavra-passe nova (após o código)", async () => {
+        await login(A);
+      });
+
+      // --- Recuperação por perguntas (efeito atrasado) -----------------------------------
+      await step("recuperação por perguntas fica pendente", async () => {
+        const verify = await call("POST", "/auth/recover/verify", {
+          json: {
+            mode: "questions",
+            username: A.username,
+            answer1: A.answers.q1,
+            answer2: A.answers.q2,
+            answer3: A.answers.q3,
+          },
+        });
+        expectStatus(verify, 200);
+        const session = parse(RecoverVerifyResponse, verify);
+        const pendingPassword = freshPassword(A.username);
+        const reset = await call("POST", "/auth/recover/reset", {
+          json: {
+            recoverySession: session.recoverySession,
+            newPassword: pendingPassword,
+            newPasswordConfirmation: pendingPassword,
+          },
+        });
+        expectStatus(reset, 200);
+        const data = parse(RecoverResetResponse, reset);
+        check(data.status === "pending", "esperado status=pending");
+        check(data.effectiveAt !== undefined, "faltou effectiveAt");
+      });
+      await step(
+        "login com a palavra-passe actual cancela o pedido pendente",
+        async () => {
+          const data = await login(A);
+          check(
+            data.pendingRecoveryCancelled === true,
+            "esperado pendingRecoveryCancelled=true",
+          );
+        },
+      );
+    } else {
+      skipped("recuperação por perguntas", "recuperação por código falhou");
+    }
+  } else {
+    skipped(
+      "passos da conta A (sessão, refresh, logout, recuperação)",
+      "registo falhou",
+    );
+  }
+
+  // --- Cartões do Evangelho ----------------------------------------------------------------
+  let cardSlug: string | undefined;
+  await step("GET /gospel-cards com ETag", async () => {
+    const reply = await call("GET", "/gospel-cards");
+    expectStatus(reply, 200);
+    const data = parse(GospelCardListResponse, reply);
+    check(data.cards.length > 0, "lista de cards vazia (seed em falta?)");
+    cardSlug = data.cards[0]?.slug;
+    const etag = reply.headers.get("etag");
+    check(etag !== null && etag.length > 0, "faltou o cabeçalho ETag");
+    const again = await call("GET", "/gospel-cards", {
+      headers: { "if-none-match": etag ?? "" },
+    });
+    expectStatus(again, 304);
+    return `${data.cards.length} cards; revalidação 304`;
+  });
+  if (cardSlug) {
+    const slug = cardSlug;
+    await step("GET /gospel-cards/:slug", async () => {
+      const reply = await call(
+        "GET",
+        `/gospel-cards/${encodeURIComponent(slug)}`,
+      );
+      expectStatus(reply, 200);
+      const data = parse(GospelCardResponse, reply);
+      check(data.card.slug === slug, "slug diferente");
+    });
+  } else {
+    skipped("GET /gospel-cards/:slug", "sem cards");
+  }
+  await step("GET /gospel-cards/<inexistente> é 404", async () => {
+    expectError(
+      await call("GET", "/gospel-cards/smoke-nao-existe"),
+      404,
+      "not_found",
+    );
+  });
+
+  // --- Feed público ------------------------------------------------------------------------
+  await step("GET /posts (público, recentes)", async () => {
+    const reply = await call("GET", "/posts?filter=recent&limit=5");
+    expectStatus(reply, 200);
+    parse(ListPostsResponse, reply);
+  });
+  await step("GET /posts com cursor inválido é 400", async () => {
+    expectStatus(await call("GET", "/posts?cursor=invalido"), 400);
+  });
+
+  // --- Partilhas ---------------------------------------------------------------------------
+  let postA: string | undefined;
+  let postAStatus: string | undefined;
+  if (registeredA) {
+    const key = idempotencyKey();
+    const bodyA = postBody("A", cardSlug);
+    await step("A cria uma partilha (Idempotency-Key)", async () => {
+      const reply = await call("POST", "/posts", {
+        token: bearer(A),
+        json: bodyA,
+        headers: { "idempotency-key": key },
+      });
+      expectStatus(reply, 201);
+      const data = parse(CreatePostResponse, reply);
+      check(data.post.isMine, "isMine deveria ser true");
+      postA = data.post.id;
+      postAStatus = data.status;
+      return `status=${data.status}`;
+    });
+    if (postA) {
+      await step(
+        "repetir o pedido (mesma chave e corpo) devolve a mesma partilha",
+        async () => {
+          const reply = await call("POST", "/posts", {
+            token: bearer(A),
+            json: bodyA,
+            headers: { "idempotency-key": key },
+          });
+          expectStatus(reply, 200);
+          const data = parse(CreatePostResponse, reply);
+          check(data.post.id === postA, "a repetição criou outra partilha");
+        },
+      );
+      await step("mesma chave com corpo diferente é conflito", async () => {
+        const reply = await call("POST", "/posts", {
+          token: bearer(A),
+          json: postBody("A (outro corpo)", cardSlug),
+          headers: { "idempotency-key": key },
+        });
+        expectError(reply, 409, "idempotency_key_conflict");
+      });
+    }
+    await step("partilha com ligação é recusada", async () => {
+      const reply = await call("POST", "/posts", {
+        token: bearer(A),
+        json: {
+          category: "entendimento",
+          title: `${SMOKE_PREFIX} ligação`,
+          content: "Visita https://exemplo.org para ver mais.",
+        },
+        headers: { "idempotency-key": idempotencyKey() },
+      });
+      expectError(reply, 400, "contains_link");
+    });
+    await step("criar partilha sem sessão é recusado", async () => {
+      const reply = await call("POST", "/posts", {
+        json: bodyA,
+        headers: { "idempotency-key": idempotencyKey() },
+      });
+      expectStatus(reply, 401);
+    });
+  } else {
+    skipped("partilhas da conta A", "registo falhou");
+  }
+
+  const published = postA !== undefined && postAStatus === "published";
+  if (postA && !published) {
+    skipped(
+      "gostar, denunciar e leitura pública",
+      `a partilha ficou em ${postAStatus ?? "estado desconhecido"} (esperado published)`,
+    );
+  }
+
+  // --- Gostar e denunciar (B sobre a partilha de A) -----------------------------------------
+  if (published && postA && registeredB) {
+    const id = postA;
+    await step("GET /posts/:id público", async () => {
+      expectStatus(await call("GET", `/posts/${id}`), 200);
+    });
+    await step(
+      "feed de B mostra a partilha de A, ainda sem gosto",
+      async () => {
+        const reply = await call("GET", "/posts?filter=recent&limit=20", {
+          token: bearer(B),
+        });
+        expectStatus(reply, 200);
+        const data = parse(ListPostsResponse, reply);
+        const found = data.posts.find((p) => p.id === id);
+        check(found !== undefined, "partilha de A não aparece no feed recente");
+        check(
+          found?.isLiked === false && found.isMine === false,
+          "isLiked/isMine inesperados",
+        );
+      },
+    );
+    await step("B gosta (e repetir é idempotente)", async () => {
+      const first = await call("POST", `/posts/${id}/like`, {
+        token: bearer(B),
+      });
+      expectStatus(first, 200);
+      const a = parse(LikeResponse, first);
+      check(a.isLiked && a.likesCount === 1, "esperado likesCount=1");
+      const second = await call("POST", `/posts/${id}/like`, {
+        token: bearer(B),
+      });
+      expectStatus(second, 200);
+      const b = parse(LikeResponse, second);
+      check(
+        b.isLiked && b.likesCount === 1,
+        "o gosto repetido contou duas vezes",
+      );
+    });
+    await step("filtro liked de B inclui a partilha", async () => {
+      const reply = await call("GET", "/posts?filter=liked&limit=20", {
+        token: bearer(B),
+      });
+      expectStatus(reply, 200);
+      const data = parse(ListPostsResponse, reply);
+      check(
+        data.posts.some((p) => p.id === id),
+        "partilha ausente de «liked»",
+      );
+    });
+    await step("B retira o gosto", async () => {
+      const reply = await call("DELETE", `/posts/${id}/like`, {
+        token: bearer(B),
+      });
+      expectStatus(reply, 200);
+      const data = parse(LikeResponse, reply);
+      check(!data.isLiked && data.likesCount === 0, "esperado likesCount=0");
+    });
+    await step(
+      "denúncia sem motivo na categoria «other» é recusada",
+      async () => {
+        const reply = await call("POST", `/posts/${id}/report`, {
+          token: bearer(B),
+          json: { category: "other" },
+        });
+        expectStatus(reply, 400);
+      },
+    );
+    await step("B denuncia (e repetir é duplicado)", async () => {
+      const first = await call("POST", `/posts/${id}/report`, {
+        token: bearer(B),
+        json: { category: "spam" },
+      });
+      expectStatus(first, 200);
+      check(
+        parse(ReportResponse, first).outcome === "created",
+        "esperado created",
+      );
+      const second = await call("POST", `/posts/${id}/report`, {
+        token: bearer(B),
+        json: { category: "spam" },
+      });
+      expectStatus(second, 200);
+      check(
+        parse(ReportResponse, second).outcome === "duplicate",
+        "esperado duplicate",
+      );
+    });
+    await step("A não pode denunciar a própria partilha", async () => {
+      const reply = await call("POST", `/posts/${id}/report`, {
+        token: bearer(A),
+        json: { category: "spam" },
+      });
+      expectError(reply, 400, "own_post");
+    });
+    await step("B retira a denúncia", async () => {
+      expectStatus(
+        await call("DELETE", `/posts/${id}/report`, { token: bearer(B) }),
+        200,
+      );
+    });
+  } else if (postA && published) {
+    skipped("gostar e denunciar", "registo da conta B falhou");
+  }
+
+  // --- Sincronização (B) ---------------------------------------------------------------------
+  let postB: string | undefined;
+  if (registeredB) {
+    const createKey = idempotencyKey();
+    const bodyB = postBody("B (sync)", cardSlug);
+    const opIds = {
+      like: randomUUID(),
+      likeAgain: randomUUID(),
+      unlike: randomUUID(),
+      create: randomUUID(),
+      missing: randomUUID(),
+    };
+    const createOp = {
+      op_id: opIds.create,
+      idempotency_key: createKey,
+      type: "post.create",
+      payload: bodyB,
+    };
+
+    if (published && postA) {
+      const id = postA;
+      await step(
+        "POST /sync: gostar, repetir, retirar, criar e operação inválida",
+        async () => {
+          const reply = await call("POST", "/sync", {
+            token: bearer(B),
+            json: {
+              operations: [
+                {
+                  op_id: opIds.like,
+                  idempotency_key: idempotencyKey(),
+                  type: "post.like",
+                  payload: { postId: id },
+                },
+                {
+                  op_id: opIds.likeAgain,
+                  idempotency_key: idempotencyKey(),
+                  type: "post.like",
+                  payload: { postId: id },
+                },
+                {
+                  op_id: opIds.unlike,
+                  idempotency_key: idempotencyKey(),
+                  type: "post.unlike",
+                  payload: { postId: id },
+                },
+                createOp,
+                {
+                  op_id: opIds.missing,
+                  idempotency_key: idempotencyKey(),
+                  type: "post.like",
+                  payload: { postId: randomUUID() },
+                },
+              ],
+            },
+          });
+          expectStatus(reply, 200);
+          const data = parse(SyncResponse, reply);
+          const by = (opId: string) =>
+            data.results.find((r) => r.op_id === opId);
+          check(by(opIds.like)?.status === "applied", "like: esperado applied");
+          check(
+            by(opIds.likeAgain)?.status === "duplicate",
+            "like repetido: esperado duplicate",
+          );
+          check(
+            by(opIds.unlike)?.status === "applied",
+            "unlike: esperado applied",
+          );
+          check(
+            by(opIds.create)?.status === "applied",
+            "create: esperado applied",
+          );
+          const missing = by(opIds.missing);
+          check(
+            missing?.status === "rejected" &&
+              missing.error?.code === "not_found",
+            "post inexistente: esperado rejected/not_found",
+          );
+          const created = by(opIds.create)?.result;
+          if (created && "post" in created) postB = created.post.id;
+          check(postB !== undefined, "create sem partilha no resultado");
+        },
+      );
+    } else {
+      await step("POST /sync: criar partilha", async () => {
+        const reply = await call("POST", "/sync", {
+          token: bearer(B),
+          json: { operations: [createOp] },
+        });
+        expectStatus(reply, 200);
+        const data = parse(SyncResponse, reply);
+        const created = data.results.find(
+          (r) => r.op_id === opIds.create,
+        )?.result;
+        if (created && "post" in created) postB = created.post.id;
+        check(postB !== undefined, "create sem partilha no resultado");
+      });
+    }
+
+    if (postB) {
+      const id = postB;
+      await step(
+        "POST /sync: repetir a criação (mesma chave) é duplicate",
+        async () => {
+          const reply = await call("POST", "/sync", {
+            token: bearer(B),
+            json: { operations: [{ ...createOp, op_id: randomUUID() }] },
+          });
+          expectStatus(reply, 200);
+          const data = parse(SyncResponse, reply);
+          check(data.results[0]?.status === "duplicate", "esperado duplicate");
+        },
+      );
+      await step("GET /sync/bootstrap de B", async () => {
+        const reply = await call("GET", "/sync/bootstrap", {
+          token: bearer(B),
+        });
+        expectStatus(reply, 200);
+        const data = parse(SyncBootstrapResponse, reply);
+        check(data.user.username === B.username, "utilizador diferente");
+        check(data.cards.length > 0, "cards em falta");
+        check(
+          data.myPosts.some((p) => p.id === id),
+          "myPosts sem a partilha de B",
+        );
+        check(
+          data.myLikedPostIds.length === 0,
+          "myLikedPostIds deveria estar vazio",
+        );
+      });
+      await step(
+        "POST /sync: apagar a partilha de B (e repetir é duplicate)",
+        async () => {
+          const reply = await call("POST", "/sync", {
+            token: bearer(B),
+            json: {
+              operations: [
+                {
+                  op_id: randomUUID(),
+                  idempotency_key: idempotencyKey(),
+                  type: "post.delete",
+                  payload: { postId: id },
+                },
+                {
+                  op_id: randomUUID(),
+                  idempotency_key: idempotencyKey(),
+                  type: "post.delete",
+                  payload: { postId: id },
+                },
+              ],
+            },
+          });
+          expectStatus(reply, 200);
+          const data = parse(SyncResponse, reply);
+          check(
+            data.results[0]?.status === "applied",
+            "1.º delete: esperado applied",
+          );
+          check(
+            data.results[1]?.status === "duplicate",
+            "2.º delete: esperado duplicate",
+          );
+        },
+      );
+    } else {
+      skipped("restantes passos de /sync", "a criação não devolveu partilha");
+    }
+  } else {
+    skipped("passos de /sync", "registo da conta B falhou");
+  }
+
+  // --- Apagar a partilha de A ----------------------------------------------------------------
+  if (postA && registeredA) {
+    const id = postA;
+    await step("A apaga a sua partilha", async () => {
+      expectStatus(
+        await call("DELETE", `/posts/${id}`, { token: bearer(A) }),
+        200,
+      );
+    });
+    await step("a partilha apagada deixa de existir (404)", async () => {
+      expectError(await call("GET", `/posts/${id}`), 404, "not_found");
+    });
+  }
+
+  // --- Limite de pedidos (opcional) ----------------------------------------------------------
+  if (WITH_RATE_LIMIT) {
+    await step(
+      "limite de /gospel-cards chega ao 429 com Retry-After",
+      async () => {
+        // Em lotes paralelos para caber na janela (a latência de um pedido isolado
+        // impediria chegar ao limite dentro dos 60 s).
+        const BATCH = 20;
+        const total = RATE_LIMIT_MAX + 40;
+        for (let sent = 0; sent < total; sent += BATCH) {
+          const replies = await Promise.all(
+            Array.from({ length: Math.min(BATCH, total - sent) }, () =>
+              call("GET", "/gospel-cards"),
+            ),
+          );
+          for (const reply of replies) {
+            if (reply.status === 429) {
+              const retry = Number(reply.headers.get("retry-after"));
+              check(
+                Number.isInteger(retry) && retry > 0,
+                "429 sem Retry-After válido",
+              );
+              return `429 dentro de ${sent + BATCH} pedidos; Retry-After=${retry} s`;
+            }
+            if (reply.status !== 200 && reply.status !== 304) {
+              expectStatus(reply, 200);
+            }
+          }
+        }
+        throw new SmokeError(
+          `${total} pedidos sem 429 (RATE_LIMIT_CARDS_MAX diferente de ${RATE_LIMIT_MAX}?)`,
+        );
+      },
+    );
+  }
+}
+
+/** Apaga o que o teste criou. Corre sempre, mesmo que passos anteriores tenham falhado. */
+async function cleanup(): Promise<void> {
+  for (const account of [A, B]) {
+    if (!account.registered) continue;
+    const who = account === A ? "A" : "B";
+    await step(`limpeza: pedir o apagamento da conta ${who}`, async () => {
+      // Sessão fresca: os tokens guardados podem ter expirado ou sido revogados.
+      await login(account);
+      const reply = await call("POST", "/users/me/deletion", {
+        token: bearer(account),
+        json: { password: account.password, postsMode: "delete" },
+      });
+      expectStatus(reply, 200);
+      const data = parse(DeleteAccountResponse, reply);
+      account.deletionRequested = true;
+      return `purga prevista em ${data.purgeAt.slice(0, 10)}`;
+    });
+    if (account.deletionRequested) {
+      await step(`conta ${who} em apagamento já não tem sessão`, async () => {
+        expectStatus(
+          await call("GET", "/auth/me", { token: bearer(account) }),
+          401,
+        );
+      });
+    }
+  }
+}
+
+async function run(): Promise<void> {
+  try {
+    await main();
+  } finally {
+    await cleanup();
+  }
+  console.log(
+    `\nResumo: ${tally.ok} OK, ${tally.fail} FALHA, ${tally.skipped} SALTADO.`,
+  );
+  if (tally.fail > 0 || tally.skipped > 0) {
+    console.log(
+      "Smoke INCOMPLETO: ver as linhas FALHA/SALTADO. As contas descartáveis estão identificadas no topo.",
+    );
+    process.exitCode = 1;
+  } else {
+    console.log("Smoke OK: todos os fluxos verdes.");
+  }
+}
+
+run().catch((err: unknown) => {
+  console.error(`Erro inesperado no smoke (${failureReason(err)}).`);
+  process.exit(1);
+});

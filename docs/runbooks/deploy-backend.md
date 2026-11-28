@@ -104,12 +104,20 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 ### Etapa 7 — Smoke test funcional
 
-- [ ] Registo, login, `GET /auth/me`, refresh, logout, recuperação (código e perguntas).
-- [ ] Feed, criar partilha, gostar, denunciar, `/sync`.
+- [ ] _Script_ de smoke repetível (`pnpm --filter @comunidade/api smoke --base-url=https://<serviço>.onrender.com`, ver abaixo): registo, login, `GET /auth/me`, refresh (rotação, tolerância e reutilização), logout, recuperação (código e perguntas), cards (ETag/304), feed, criar partilha (idempotência), gostar, denunciar, `/sync` e `/sync/bootstrap`, limpeza.
 - [ ] Primeiro admin: **registar primeiro o utilizador pela API de produção**; depois `admin:promote <username>` a partir da máquina do operador com o `DATABASE_URL` de produção (directa, `comunidade_app`; testar a ligação antes, ver `ETIMEDOUT` de 2026-11-24); aprovar e rejeitar uma partilha.
 - [ ] Limites: provocar um `429` num fluxo seguro.
 - [ ] Medir comandos Redis por fluxo na consola da Upstash (R3).
-- [ ] Opcional: _script_ de smoke repetível (_precisa de autorização_).
+
+**Como correr o _script_** (`apps/api/scripts/smoke.ts`, a partir da máquina do operador; não precisa de variáveis do projecto):
+
+- Cria **duas contas descartáveis** (`smoke-<sufixo>-a` e `-b`) na base de produção, percorre os fluxos e, no fim, apaga as partilhas e pede o apagamento das contas (ficam `pending_deletion` até ao fim do período de graça; o _job_ de manutenção purga-as).
+- Só imprime `OK`/`FALHA`/`SALTADO`, o código HTTP e o código de erro da API; nunca palavras-passe, tokens, códigos de recuperação nem corpos de resposta. Os segredos são gerados ao acaso e vivem só em memória.
+- O primeiro passo espera que a API acorde (plano gratuito: até ~1 min; `--wake-timeout-s`). O passo da reutilização do refresh espera a janela de tolerância (`--reuse-grace-s`, 10 s por omissão) e demora cerca de 12 s.
+- `--rate-limit` acrescenta o passo do `429` (esgota o limite de `/gospel-cards`, por omissão 120 pedidos por 60 s e por IP, até ao `429` com `Retry-After`; se `RATE_LIMIT_CARDS_MAX` for outro, usar `--rate-limit-max`; ~160 pedidos, uns centenas de comandos Redis); cumpre o item «Limites» sem tocar em fluxos de conta.
+- **Cabem 2 execuções por hora** (registo: 5 por hora e por IP; cada execução usa 2). Cada execução deixa **2 avisos `token_reuse`** nos logs (reutilização propositada e _refresh_ depois do _logout_): não contam para a revisão da Etapa 9 se coincidirem com a hora do smoke.
+- Sai com código `0` só se todos os passos forem `OK`; `FALHA` ou `SALTADO` dão `1`.
+- Fora do _script_ (manual): `admin:promote`, aprovar e rejeitar uma partilha, e medir os comandos Redis na consola da Upstash (anotar o consumo antes e depois de uma execução).
 
 **Saída**: todos os fluxos verdes em produção e o consumo por fluxo anotado.
 

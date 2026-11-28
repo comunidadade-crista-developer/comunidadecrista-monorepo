@@ -1,0 +1,94 @@
+diff --git a/apps/api/scripts/smoke.ts b/apps/api/scripts/smoke.ts
+index af679aa..2cccbe9 100644
+--- a/apps/api/scripts/smoke.ts
++++ b/apps/api/scripts/smoke.ts
+@@ -49,7 +49,8 @@ const HELP = `Uso: pnpm --filter @comunidade/api smoke --base-url=<URL> [opçõe
+   --base-url=<URL>        URL base da API (ou variável SMOKE_BASE_URL). Só https, excepto localhost.
+   --reuse-grace-s=<n>     Janela de tolerância do refresh (REFRESH_REUSE_GRACE_S da API). Por omissão 10.
+   --wake-timeout-s=<n>    Tempo máximo à espera de a API acordar. Por omissão 120.
+-  --rate-limit            Passo extra: esgota o limite de /gospel-cards (30/60 s por IP) até ao 429.
++  --rate-limit            Passo extra: esgota o limite de /gospel-cards por IP até ao 429.
++  --rate-limit-max=<n>    Limite configurado na API (RATE_LIMIT_CARDS_MAX). Por omissão 120 (por 60 s).
+   --help                  Mostra esta ajuda.
+ `;
+ 
+@@ -103,6 +104,7 @@ const { values } = parseArgs({
+     "reuse-grace-s": { type: "string" },
+     "wake-timeout-s": { type: "string" },
+     "rate-limit": { type: "boolean", default: false },
++    "rate-limit-max": { type: "string" },
+     help: { type: "boolean", default: false },
+   },
+   strict: true,
+@@ -121,6 +123,11 @@ const WAKE_TIMEOUT_S = positiveInt(
+   "wake-timeout-s",
+ );
+ const WITH_RATE_LIMIT = values["rate-limit"] === true;
++const RATE_LIMIT_MAX = positiveInt(
++  values["rate-limit-max"],
++  120,
++  "rate-limit-max",
++);
+ 
+ // ---------------------------------------------------------------------------------------------
+ // HTTP
+@@ -1061,21 +1068,33 @@ async function main(): Promise<void> {
+     await step(
+       "limite de /gospel-cards chega ao 429 com Retry-After",
+       async () => {
+-        for (let i = 0; i < 45; i += 1) {
+-          const reply = await call("GET", "/gospel-cards");
+-          if (reply.status === 429) {
+-            const retry = Number(reply.headers.get("retry-after"));
+-            check(
+-              Number.isInteger(retry) && retry > 0,
+-              "429 sem Retry-After válido",
+-            );
+-            return `429 ao pedido ${i + 1}; Retry-After=${retry} s`;
+-          }
+-          if (reply.status !== 200 && reply.status !== 304) {
+-            expectStatus(reply, 200);
++        // Em lotes paralelos para caber na janela (a latência de um pedido isolado
++        // impediria chegar ao limite dentro dos 60 s).
++        const BATCH = 20;
++        const total = RATE_LIMIT_MAX + 40;
++        for (let sent = 0; sent < total; sent += BATCH) {
++          const replies = await Promise.all(
++            Array.from({ length: Math.min(BATCH, total - sent) }, () =>
++              call("GET", "/gospel-cards"),
++            ),
++          );
++          for (const reply of replies) {
++            if (reply.status === 429) {
++              const retry = Number(reply.headers.get("retry-after"));
++              check(
++                Number.isInteger(retry) && retry > 0,
++                "429 sem Retry-After válido",
++              );
++              return `429 dentro de ${sent + BATCH} pedidos; Retry-After=${retry} s`;
++            }
++            if (reply.status !== 200 && reply.status !== 304) {
++              expectStatus(reply, 200);
++            }
+           }
+         }
+-        throw new SmokeError("45 pedidos seguidos sem 429");
++        throw new SmokeError(
++          `${total} pedidos sem 429 (RATE_LIMIT_CARDS_MAX diferente de ${RATE_LIMIT_MAX}?)`,
++        );
+       },
+     );
+   }
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index 2a17c5f..f5e1963 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -114,7 +114,7 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ - Cria **duas contas descartáveis** (`smoke-<sufixo>-a` e `-b`) na base de produção, percorre os fluxos e, no fim, apaga as partilhas e pede o apagamento das contas (ficam `pending_deletion` até ao fim do período de graça; o _job_ de manutenção purga-as).
+ - Só imprime `OK`/`FALHA`/`SALTADO`, o código HTTP e o código de erro da API; nunca palavras-passe, tokens, códigos de recuperação nem corpos de resposta. Os segredos são gerados ao acaso e vivem só em memória.
+ - O primeiro passo espera que a API acorde (plano gratuito: até ~1 min; `--wake-timeout-s`). O passo da reutilização do refresh espera a janela de tolerância (`--reuse-grace-s`, 10 s por omissão) e demora cerca de 12 s.
+-- `--rate-limit` acrescenta o passo do `429` (esgota o limite de `/gospel-cards`, 30 pedidos por 60 s e por IP, até ao `429` com `Retry-After`); cumpre o item «Limites» sem tocar em fluxos de conta.
++- `--rate-limit` acrescenta o passo do `429` (esgota o limite de `/gospel-cards`, por omissão 120 pedidos por 60 s e por IP, até ao `429` com `Retry-After`; se `RATE_LIMIT_CARDS_MAX` for outro, usar `--rate-limit-max`; ~160 pedidos, uns centenas de comandos Redis); cumpre o item «Limites» sem tocar em fluxos de conta.
+ - **Cabem 2 execuções por hora** (registo: 5 por hora e por IP; cada execução usa 2). Cada execução deixa **2 avisos `token_reuse`** nos logs (reutilização propositada e _refresh_ depois do _logout_): não contam para a revisão da Etapa 9 se coincidirem com a hora do smoke.
+ - Sai com código `0` só se todos os passos forem `OK`; `FALHA` ou `SALTADO` dão `1`.
+ - Fora do _script_ (manual): `admin:promote`, aprovar e rejeitar uma partilha, e medir os comandos Redis na consola da Upstash (anotar o consumo antes e depois de uma execução).
