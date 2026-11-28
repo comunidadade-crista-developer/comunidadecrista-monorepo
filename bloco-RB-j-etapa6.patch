@@ -1,0 +1,132 @@
+diff --git a/docs/registos/RB-j-etapa6-ip-real.md b/docs/registos/RB-j-etapa6-ip-real.md
+new file mode 100644
+index 0000000..d997406
+--- /dev/null
++++ b/docs/registos/RB-j-etapa6-ip-real.md
+@@ -0,0 +1,16 @@
++# RB-j — Etapa 6: IP real atrás do Render
++
++- **Problema.** Com `TRUST_PROXY_HOPS=1` o limite por IP não era por cliente: a API via o IP da borda do
++  Cloudflare do Render. As tentativas de um cliente repartiam-se por várias bordas (o 6.º login não dava `429`)
++  e um cliente de outra rede levava `429` por tentativas alheias.
++- **Teste** (2026-11-25, `onrender.com`): com `2` a rede A continuou sem `429`; com **`3`** a rede A deu `401` ×5
++  e `429` à sexta, a rede B (dados móveis) deu `401` e um `X-Forwarded-For: 1.2.3.4` forjado manteve o `429`.
++  Um primeiro teste usou Wi-Fi e cabo do mesmo router, que partilham o IP público: não valia como duas redes.
++- **Decisão.** `TRUST_PROXY=true`, `EDGE_MODE=none`, **`TRUST_PROXY_HOPS=3`**, `CORS_ORIGIN=http://localhost:5173`
++  (sem frontend). Logs de arranque sem aviso de proxy nem erros.
++- **Risco.** O número de saltos depende da infra-estrutura do Render. Repetir o teste se a plataforma mudar, ao
++  acrescentar domínio ou Cloudflare (`EDGE_MODE=cloudflare`) e se o limite parecer global.
++
++**Pendente**: o aviso do `pg` sobre `sslmode` (tratado como `verify-full`, o comportamento mais estrito) aparece
++em cada arranque. Tornar explícito `sslmode=verify-full` na `DATABASE_URL` silencia-o sem mudar o
++comportamento; por validar na Neon antes de alterar o segredo.
+diff --git a/docs/registos/README.md b/docs/registos/README.md
+index f6fd404..f5fc998 100644
+--- a/docs/registos/README.md
++++ b/docs/registos/README.md
+@@ -36,3 +36,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
+ | RB-g  | [Diagnóstico do seed e estado do deploy](RB-g-seed-diagnostico-estado-deploy.md)                          | Feito  |
+ | RB-h  | [Logging do worker e benchmark do argon2](RB-h-logging-worker-benchmark-argon2.md)                        | Feito  |
+ | RB-i  | [Etapa 5 fechada: Render, benchmark e branch da Neon](RB-i-etapa5-render.md)                              | Feito  |
++| RB-j  | [Etapa 6: IP real atrás do Render](RB-j-etapa6-ip-real.md)                                                | Feito  |
+diff --git a/docs/runbooks/deploy-backend.md b/docs/runbooks/deploy-backend.md
+index 344431f..e7790bd 100644
+--- a/docs/runbooks/deploy-backend.md
++++ b/docs/runbooks/deploy-backend.md
+@@ -1,20 +1,20 @@
+ # Plano de deploy do backend
+ 
+-**Estado** (2026-11-25): decisões aprovadas em 2026-11-20; **Etapas 0 a 5 fechadas** (API no Render, logs limpos); **próxima: Etapa 6**; execução por etapas. Cada etapa tem critério de
++**Estado** (2026-11-25): decisões aprovadas em 2026-11-20; **Etapas 0 a 6 fechadas** (API no Render, IP real validado); **próxima: Etapa 7**; execução por etapas. Cada etapa tem critério de
+ saída: só se avança com ele cumprido. Os runbooks por serviço estão ligados em cada etapa; o controlo
+ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ ## 1. Decisões tomadas
+ 
+-| Tema     | Decisão                                                                                                                                                                           |
+-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| Domínio  | **Sem domínio** no arranque. API em `*.onrender.com`; `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS` a validar (Etapa 6). Cloudflare à frente só quando houver domínio. |
+-| Node     | **24.22.3** fixado com `NODE_VERSION` no Render (o Render usa 24.22.1 por omissão em serviços novos, anterior ao aviso de 11-11-2026).                                            |
+-| Postgres | **17** na Neon; `docker-compose.yml` e CI alinhados (bloco próprio, Etapa 1).                                                                                                     |
+-| Região   | **Frankfurt** para Render, Neon e Upstash (uma só região; multi-região fica para quando houver adesão).                                                                           |
+-| Operação | **Um operador** no MVP; o plano de gestão prevê o risco e o crescimento.                                                                                                          |
+-| Branches | `master` = produção; `dev` = integração.                                                                                                                                          |
+-| Frontend | Fora deste plano (Cloudflare Pages, depois).                                                                                                                                      |
++| Tema     | Decisão                                                                                                                                                                               |
++| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Domínio  | **Sem domínio** no arranque. API em `*.onrender.com`; `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=3` (validado na Etapa 6). Cloudflare à frente só quando houver domínio. |
++| Node     | **24.22.3** fixado com `NODE_VERSION` no Render (o Render usa 24.22.1 por omissão em serviços novos, anterior ao aviso de 11-11-2026).                                                |
++| Postgres | **17** na Neon; `docker-compose.yml` e CI alinhados (bloco próprio, Etapa 1).                                                                                                         |
++| Região   | **Frankfurt** para Render, Neon e Upstash (uma só região; multi-região fica para quando houver adesão).                                                                               |
++| Operação | **Um operador** no MVP; o plano de gestão prevê o risco e o crescimento.                                                                                                              |
++| Branches | `master` = produção; `dev` = integração.                                                                                                                                              |
++| Frontend | Fora deste plano (Cloudflare Pages, depois).                                                                                                                                          |
+ 
+ ## 2. Riscos identificados na pesquisa (2026-11-20)
+ 
+@@ -93,14 +93,14 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
+ 
+ **Saída**: `GET /health` e `GET /health/deep` respondem `200`; nos logs não há erros.
+ 
+-### Etapa 6 — Borda e IP real (sem domínio)
++### Etapa 6 — Borda e IP real (sem domínio) ✅
+ 
+-- [ ] `TRUST_PROXY=true` e `EDGE_MODE=none`. Descobrir o número de saltos: ver [servico-render](servico-render.md) §6.
+-- [ ] Teste de duas redes: esgotar um limite (registo) numa rede e confirmar que **outra rede** (dados móveis) não fica bloqueada; confirmar que um `X-Forwarded-For` forjado não contorna o limite.
+-- [ ] `CORS_ORIGIN` com a origem do frontend (ou `http://localhost:5173` só enquanto não há frontend).
+-- [ ] Aviso de arranque de proxy (RB-a) ausente nos logs.
++- [x] `TRUST_PROXY=true` e `EDGE_MODE=none`. Número de saltos descoberto: **`TRUST_PROXY_HOPS=3`** (1 e 2 não chegam; ver [servico-render](servico-render.md) §6).
++- [x] Teste de duas redes (2026-11-25): rede A (cabo) `401` ×5 e `429` à sexta; rede B (dados móveis) `401`; `X-Forwarded-For` forjado a partir de A manteve o `429`.
++- [x] `CORS_ORIGIN=http://localhost:5173` (só enquanto não há frontend; passa à origem real quando houver).
++- [x] Aviso de arranque de proxy (RB-a) ausente nos logs (arranque de 2026-11-25, sem erros).
+ 
+-**Saída**: o limite por IP é por cliente, não global, e não é contornável com cabeçalhos forjados.
++**Saída**: o limite por IP é por cliente, não global, e não é contornável com cabeçalhos forjados. **Repetir o teste** se a plataforma, o domínio ou a borda mudarem.
+ 
+ ### Etapa 7 — Smoke test funcional
+ 
+diff --git a/docs/runbooks/servico-render.md b/docs/runbooks/servico-render.md
+index 54aec7d..6d61b41 100644
+--- a/docs/runbooks/servico-render.md
++++ b/docs/runbooks/servico-render.md
+@@ -69,7 +69,7 @@ Introduzir em Render → Environment; guardar uma cópia **no cofre**. A API rec
+ | `IP_HASH_SECRET`                     | `openssl rand -base64 48`                                                | Obrigatória (≥ 32 caracteres).                         |
+ | `EDGE_MODE`                          | `none`                                                                   | Sem domínio não há Cloudflare à frente.                |
+ | `TRUST_PROXY`                        | `true`                                                                   | Sem isto todos os clientes partilham o IP do proxy.    |
+-| `TRUST_PROXY_HOPS`                   | `1` ou `2` (ver secção 6)                                                | Por omissão 1.                                         |
++| `TRUST_PROXY_HOPS`                   | **`3`** (validado em 2026-11-25, secção 6)                               | Por omissão 1; 1 e 2 não chegam no Render.             |
+ | `DB_POOL_MAX`                        | `5` a `10`                                                               | Uma instância; confirmar o limite de ligações da Neon. |
+ | `ARGON2_*`                           | por omissão (19456 KiB, 2 iterações, 1)                                  | Mínimos de produção; medir o tempo por hash (Etapa 5). |
+ | `OUTBOX_WORKER_INTERVAL_MS`          | `5000` (ver risco R2)                                                    | Alargar se a Neon gastar as CU-horas.                  |
+@@ -102,15 +102,27 @@ A API resolve o IP com `TRUST_PROXY_HOPS` proxies de confiança. O Render docume
+ na prática**:
+ 
+ 1. Arrancar com `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=1`.
+-2. **Duas redes**: da rede A (por exemplo Wi-Fi) fazer 6 logins falhados seguidos com um utilizador que não existe
+-   (`POST /auth/login`, o balde IP+utilizador é de 5 por 15 min): o 6.º tem de dar `429`. Da rede B (dados móveis)
+-   fazer **um** login falhado com o mesmo utilizador: tem de dar `401`. Se der `429`, o IP é partilhado (vê-se o IP do
+-   proxy): subir `TRUST_PROXY_HOPS` para `2` e repetir.
++2. **Duas redes**: da rede A (por exemplo cabo) fazer 6 logins falhados seguidos com um utilizador que não existe
++   (`POST /auth/login`, o balde IP+utilizador é de 5 por 15 min): o 6.º tem de dar `429`. Da rede B (**dados
++   móveis**; Wi-Fi e cabo do mesmo router partilham o IP público e não contam como duas redes) fazer **um** login
++   falhado com o mesmo utilizador: tem de dar `401`. Se A não chegar ao `429`, ou se B der `429`, o IP não é o do
++   cliente (vê-se o da borda do proxy): subir `TRUST_PROXY_HOPS` de um em um (máximo 5) e repetir com **um utilizador
++   novo** em cada ronda (os baldes duram 15 min no Redis e sobrevivem a um redeploy).
+ 3. **Cabeçalho forjado**: com o balde da rede A esgotado, repetir o login a partir de A mudando
+    `X-Forwarded-For: 1.2.3.4`, depois `5.6.7.8`. O `429` tem de manter-se. Se deixar de actuar, há saltos a mais
+    (`TRUST_PROXY_HOPS` demasiado alto): baixar.
+ 4. Registar o valor final neste documento e o resultado do teste.
+ 
++**Resultado (2026-11-25, `onrender.com`, sem domínio):** com `TRUST_PROXY_HOPS=1` a API via o IP da borda do
++Cloudflare do Render (o Render responde com `server: cloudflare` e `cf-ray`): o 6.º login da rede A deu `401`
++(as tentativas repartiam-se por várias bordas) e a rede B levou `429` sem ter tentado antes. Com `2` a rede A continuou sem `429`.
++Com **`3`**: rede A `401` ×5 e `429` à sexta; rede B (dados móveis) `401`; `X-Forwarded-For: 1.2.3.4`
++a partir de A manteve o `429`. Valor final: **`TRUST_PROXY_HOPS=3`**.
++
++O número de saltos depende da infra-estrutura do Render e pode mudar: **repetir este teste** depois de mudanças na
++plataforma, de adicionar um domínio ou Cloudflare próprio (passa a `EDGE_MODE=cloudflare`) e se o limite por IP
++parecer global (muitos `429` a utilizadores sem relação) ou deixar de actuar.
++
+ ## 7. Rollback
+ 
+ 1. Render → **Events/Deploys** → escolher o deploy anterior → **Rollback** (confirmar o nome da opção na consola).

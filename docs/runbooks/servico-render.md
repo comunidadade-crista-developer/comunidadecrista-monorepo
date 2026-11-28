@@ -69,7 +69,7 @@ Introduzir em Render → Environment; guardar uma cópia **no cofre**. A API rec
 | `IP_HASH_SECRET`                     | `openssl rand -base64 48`                                                | Obrigatória (≥ 32 caracteres).                         |
 | `EDGE_MODE`                          | `none`                                                                   | Sem domínio não há Cloudflare à frente.                |
 | `TRUST_PROXY`                        | `true`                                                                   | Sem isto todos os clientes partilham o IP do proxy.    |
-| `TRUST_PROXY_HOPS`                   | `1` ou `2` (ver secção 6)                                                | Por omissão 1.                                         |
+| `TRUST_PROXY_HOPS`                   | **`3`** (validado em 2026-11-25, secção 6)                               | Por omissão 1; 1 e 2 não chegam no Render.             |
 | `DB_POOL_MAX`                        | `5` a `10`                                                               | Uma instância; confirmar o limite de ligações da Neon. |
 | `ARGON2_*`                           | por omissão (19456 KiB, 2 iterações, 1)                                  | Mínimos de produção; medir o tempo por hash (Etapa 5). |
 | `OUTBOX_WORKER_INTERVAL_MS`          | `5000` (ver risco R2)                                                    | Alargar se a Neon gastar as CU-horas.                  |
@@ -102,14 +102,26 @@ A API resolve o IP com `TRUST_PROXY_HOPS` proxies de confiança. O Render docume
 na prática**:
 
 1. Arrancar com `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=1`.
-2. **Duas redes**: da rede A (por exemplo Wi-Fi) fazer 6 logins falhados seguidos com um utilizador que não existe
-   (`POST /auth/login`, o balde IP+utilizador é de 5 por 15 min): o 6.º tem de dar `429`. Da rede B (dados móveis)
-   fazer **um** login falhado com o mesmo utilizador: tem de dar `401`. Se der `429`, o IP é partilhado (vê-se o IP do
-   proxy): subir `TRUST_PROXY_HOPS` para `2` e repetir.
+2. **Duas redes**: da rede A (por exemplo cabo) fazer 6 logins falhados seguidos com um utilizador que não existe
+   (`POST /auth/login`, o balde IP+utilizador é de 5 por 15 min): o 6.º tem de dar `429`. Da rede B (**dados
+   móveis**; Wi-Fi e cabo do mesmo router partilham o IP público e não contam como duas redes) fazer **um** login
+   falhado com o mesmo utilizador: tem de dar `401`. Se A não chegar ao `429`, ou se B der `429`, o IP não é o do
+   cliente (vê-se o da borda do proxy): subir `TRUST_PROXY_HOPS` de um em um (máximo 5) e repetir com **um utilizador
+   novo** em cada ronda (os baldes duram 15 min no Redis e sobrevivem a um redeploy).
 3. **Cabeçalho forjado**: com o balde da rede A esgotado, repetir o login a partir de A mudando
    `X-Forwarded-For: 1.2.3.4`, depois `5.6.7.8`. O `429` tem de manter-se. Se deixar de actuar, há saltos a mais
    (`TRUST_PROXY_HOPS` demasiado alto): baixar.
 4. Registar o valor final neste documento e o resultado do teste.
+
+**Resultado (2026-11-25, `onrender.com`, sem domínio):** com `TRUST_PROXY_HOPS=1` a API via o IP da borda do
+Cloudflare do Render (o Render responde com `server: cloudflare` e `cf-ray`): o 6.º login da rede A deu `401`
+(as tentativas repartiam-se por várias bordas) e a rede B levou `429` sem ter tentado antes. Com `2` a rede A continuou sem `429`.
+Com **`3`**: rede A `401` ×5 e `429` à sexta; rede B (dados móveis) `401`; `X-Forwarded-For: 1.2.3.4`
+a partir de A manteve o `429`. Valor final: **`TRUST_PROXY_HOPS=3`**.
+
+O número de saltos depende da infra-estrutura do Render e pode mudar: **repetir este teste** depois de mudanças na
+plataforma, de adicionar um domínio ou Cloudflare próprio (passa a `EDGE_MODE=cloudflare`) e se o limite por IP
+parecer global (muitos `429` a utilizadores sem relação) ou deixar de actuar.
 
 ## 7. Rollback
 

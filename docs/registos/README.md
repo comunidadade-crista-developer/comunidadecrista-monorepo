@@ -36,3 +36,4 @@ Cada registo segue o modelo abaixo e vive em `docs/registos/<fase>-<assunto>.md`
 | RB-g  | [Diagnóstico do seed e estado do deploy](RB-g-seed-diagnostico-estado-deploy.md)                          | Feito  |
 | RB-h  | [Logging do worker e benchmark do argon2](RB-h-logging-worker-benchmark-argon2.md)                        | Feito  |
 | RB-i  | [Etapa 5 fechada: Render, benchmark e branch da Neon](RB-i-etapa5-render.md)                              | Feito  |
+| RB-j  | [Etapa 6: IP real atrás do Render](RB-j-etapa6-ip-real.md)                                                | Feito  |

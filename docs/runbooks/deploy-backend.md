@@ -1,20 +1,20 @@
 # Plano de deploy do backend
 
-**Estado** (2026-11-25): decisões aprovadas em 2026-11-20; **Etapas 0 a 5 fechadas** (API no Render, logs limpos); **próxima: Etapa 6**; execução por etapas. Cada etapa tem critério de
+**Estado** (2026-11-25): decisões aprovadas em 2026-11-20; **Etapas 0 a 6 fechadas** (API no Render, IP real validado); **próxima: Etapa 7**; execução por etapas. Cada etapa tem critério de
 saída: só se avança com ele cumprido. Os runbooks por serviço estão ligados em cada etapa; o controlo
 contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 ## 1. Decisões tomadas
 
-| Tema     | Decisão                                                                                                                                                                           |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Domínio  | **Sem domínio** no arranque. API em `*.onrender.com`; `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS` a validar (Etapa 6). Cloudflare à frente só quando houver domínio. |
-| Node     | **24.22.3** fixado com `NODE_VERSION` no Render (o Render usa 24.22.1 por omissão em serviços novos, anterior ao aviso de 11-11-2026).                                            |
-| Postgres | **17** na Neon; `docker-compose.yml` e CI alinhados (bloco próprio, Etapa 1).                                                                                                     |
-| Região   | **Frankfurt** para Render, Neon e Upstash (uma só região; multi-região fica para quando houver adesão).                                                                           |
-| Operação | **Um operador** no MVP; o plano de gestão prevê o risco e o crescimento.                                                                                                          |
-| Branches | `master` = produção; `dev` = integração.                                                                                                                                          |
-| Frontend | Fora deste plano (Cloudflare Pages, depois).                                                                                                                                      |
+| Tema     | Decisão                                                                                                                                                                               |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Domínio  | **Sem domínio** no arranque. API em `*.onrender.com`; `EDGE_MODE=none`, `TRUST_PROXY=true`, `TRUST_PROXY_HOPS=3` (validado na Etapa 6). Cloudflare à frente só quando houver domínio. |
+| Node     | **24.22.3** fixado com `NODE_VERSION` no Render (o Render usa 24.22.1 por omissão em serviços novos, anterior ao aviso de 11-11-2026).                                                |
+| Postgres | **17** na Neon; `docker-compose.yml` e CI alinhados (bloco próprio, Etapa 1).                                                                                                         |
+| Região   | **Frankfurt** para Render, Neon e Upstash (uma só região; multi-região fica para quando houver adesão).                                                                               |
+| Operação | **Um operador** no MVP; o plano de gestão prevê o risco e o crescimento.                                                                                                              |
+| Branches | `master` = produção; `dev` = integração.                                                                                                                                              |
+| Frontend | Fora deste plano (Cloudflare Pages, depois).                                                                                                                                          |
 
 ## 2. Riscos identificados na pesquisa (2026-11-20)
 
@@ -93,14 +93,14 @@ contínuo depois do deploy está em [gestao-e-controlo](gestao-e-controlo.md).
 
 **Saída**: `GET /health` e `GET /health/deep` respondem `200`; nos logs não há erros.
 
-### Etapa 6 — Borda e IP real (sem domínio)
+### Etapa 6 — Borda e IP real (sem domínio) ✅
 
-- [ ] `TRUST_PROXY=true` e `EDGE_MODE=none`. Descobrir o número de saltos: ver [servico-render](servico-render.md) §6.
-- [ ] Teste de duas redes: esgotar um limite (registo) numa rede e confirmar que **outra rede** (dados móveis) não fica bloqueada; confirmar que um `X-Forwarded-For` forjado não contorna o limite.
-- [ ] `CORS_ORIGIN` com a origem do frontend (ou `http://localhost:5173` só enquanto não há frontend).
-- [ ] Aviso de arranque de proxy (RB-a) ausente nos logs.
+- [x] `TRUST_PROXY=true` e `EDGE_MODE=none`. Número de saltos descoberto: **`TRUST_PROXY_HOPS=3`** (1 e 2 não chegam; ver [servico-render](servico-render.md) §6).
+- [x] Teste de duas redes (2026-11-25): rede A (cabo) `401` ×5 e `429` à sexta; rede B (dados móveis) `401`; `X-Forwarded-For` forjado a partir de A manteve o `429`.
+- [x] `CORS_ORIGIN=http://localhost:5173` (só enquanto não há frontend; passa à origem real quando houver).
+- [x] Aviso de arranque de proxy (RB-a) ausente nos logs (arranque de 2026-11-25, sem erros).
 
-**Saída**: o limite por IP é por cliente, não global, e não é contornável com cabeçalhos forjados.
+**Saída**: o limite por IP é por cliente, não global, e não é contornável com cabeçalhos forjados. **Repetir o teste** se a plataforma, o domínio ou a borda mudarem.
 
 ### Etapa 7 — Smoke test funcional
 
